@@ -143,6 +143,9 @@ just test
 
 ## Reference repositories
 
+- [vcad](https://github.com/ecto/vcad): modern, ground-up agentic CAD. Learn from
+  its visual inspection feedback: model images from multiple viewpoints alongside
+  structured observations. Use FreeCAD's viewport and APIs, not its replacement kernel.
 - [Autolith](https://github.com/lambda-symbolics/autolith): inspectable live state,
   XDG storage, explicit runtime provenance, and a separation between packaged code
   and local changes. Apply those principles to FreeCAD's native runtime; Python

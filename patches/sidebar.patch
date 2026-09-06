@@ -2863,17 +2863,19 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,143 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
++import base64
++from unittest.mock import patch
 +from pathlib import Path
 +import tempfile
 +
 +import FreeCAD as App
 +import FreeCADGui as Gui
 +from PySide import QtCore, QtWidgets
-+from PySide6 import QtQuickWidgets
++from PySide6 import QtQuickWidgets, QtGui
 +
 +import AnthraciteExecutor
 +import AnthraciteGui  # noqa: F401 - importing registers the dock window
@@ -2953,6 +2955,32 @@
 +        raise AssertionError("Viewport observation did not return an inline PNG.")
 +    if render_result["observation"]["render"]["width"] != 256:
 +        raise AssertionError("Viewport observation metadata is incomplete.")
++    view = Gui.activeDocument().activeView()
++    camera = view.getCamera()
++    multi = AnthraciteExecutor.execute("cad.render_views(width=256, height=192)")
++    assert multi["ok"], multi
++    assert [s["view"] for s in multi["observation"]["renders"]] == [
++        "axonometric", "front", "right", "top"
++    ]
++    assert [s["imageIndex"] for s in multi["observation"]["renders"]] == list(range(4))
++    assert len(multi["images"]) == 4
++    assert len(set(multi["images"])) == 4, "Different viewpoints produced identical images"
++    for data in multi["images"]:
++        image = QtGui.QImage.fromData(base64.b64decode(data.split(",", 1)[1]))
++        assert not image.isNull() and image.width() == 256 and image.height() == 192
++    assert view.getCamera() == camera, "Rendering moved the user's camera"
++    render_view = AnthraciteExecutor._render_view
++    def fail_second(spec):
++        if spec["view"] == "front":
++            raise RuntimeError("Injected second-view failure")
++        return render_view(spec)
++    with patch.object(AnthraciteExecutor, "_render_view", side_effect=fail_second):
++        failed = AnthraciteExecutor.execute(
++            "doc.addObject('Part::Box', 'RenderFailure')\ncad.render_views(width=256, height=192)"
++        )
++    assert not failed["ok"] and failed["rolledBack"], failed
++    assert render_document.getObject("RenderFailure") is None
++    assert view.getCamera() == camera, "Failed rendering moved the user's camera"
 +    Gui.Selection.addSelection(render_document.getObject("RenderBox"), "Face1")
 +    selection_result = AnthraciteExecutor.execute("cad.selection()")
 +    selection = selection_result["result"][0]

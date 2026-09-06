@@ -110,7 +110,7 @@
 +            "Document changes run in a named transaction. On failure, check rolledBack ",
 +            "and requiresInspection; rollback can fail and does not undo external side effects. ",
 +            "Read the returned observation, fix errors, and verify the finished model. ",
-+            "Use cad.render() when a viewport image would materially improve verification."
++            "Use cad.render_views() for axonometric/front/right/top PNGs, or cad.render(view='current') for one image. Images follow observation.renders order (imageIndex/view). Images supplement geometry checks, not topology identification."
 +        )
 +    }
 +
@@ -124,7 +124,7 @@
 +                "cad.selection() describes selected objects, faces, and edges. ",
 +                "The complete source runs as one transaction, recomputes and validates, ",
 +                "then returns result/stdout plus created, changed, and deleted objects. ",
-+                "Call cad.render() to attach a viewport image for visual verification."
++                "Call cad.render_views() for four model views; cad.render_views(['front', 'rear'], width=640, height=480) selects up to six views. cad.render(view='current') attaches one image. The last render request wins; images capture final recomputed state and restore the camera."
 +            ),
 +            "inputSchema": {
 +                "type": "object",
@@ -1182,7 +1182,7 @@
 +            "cad.selection() describes selected objects, faces, and edges. ",
 +            "The complete source runs as one transaction, recomputes and validates, ",
 +            "then returns result/stdout plus created, changed, and deleted objects. ",
-+            "Call cad.render() to attach a viewport image for visual verification."
++            "Call cad.render_views() for four model views; cad.render_views(['front', 'rear'], width=640, height=480) selects up to six views. cad.render(view='current') attaches one image. The last render request wins; images capture final recomputed state and restore the camera."
 +        )
 +    }
 +
@@ -1202,7 +1202,7 @@
 +            "Document changes run in a named transaction. On failure, check rolledBack ",
 +            "and requiresInspection; rollback can fail and does not undo external side effects. ",
 +            "Read the returned observation, fix errors, and verify the finished model. ",
-+            "Use cad.render() when a viewport image would materially improve verification."
++            "Use cad.render_views() for axonometric/front/right/top PNGs, or cad.render(view='current') for one image. Images follow observation.renders order (imageIndex/view). Images supplement geometry checks, not topology identification."
 +        )
 +    }
 +

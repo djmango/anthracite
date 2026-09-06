@@ -67,6 +67,13 @@ Anthracite adds one CAD-specific tool to the selected agent:
 freecad(<ordinary Python source>)
 ```
 
+Inside that tool, `cad.render_views()` attaches axonometric, front, right, and top
+PNG views for visual inspection. Pass a list such as `cad.render_views(["front", "rear"])`
+to choose up to six views. `cad.render(view="current")` captures just one.
+Images describe the final recomputed model, with ordered view metadata; rendering
+restores the user's camera and bounds the combined pixel count and image payload.
+Use images alongside object/geometry checks, never as proof of exact topology.
+
 The model writes normal FreeCAD Python using `App`, `Gui`, workbench modules and a thin `cad`
 helper. Each call runs on the GUI thread inside a named transaction, recomputes and validates the
 document, then commits or rolls back and returns the result, CAD changes and diagnostics.

@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,617 @@
+@@ -0,0 +1,664 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -385,6 +385,28 @@
 +    }
 +
 +
++def _render_views(specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    if not specs:
++        return []
++    if Gui is None or Gui.activeDocument() is None:
++        raise RuntimeError("Viewport rendering requires the FreeCAD GUI.")
++    active_view = Gui.activeDocument().activeView()
++    camera = active_view.getCamera()
++    try:
++        images = []
++        total_bytes = 0
++        for spec in specs:
++            active_view.setCamera(camera)
++            image = _render_view(spec)
++            total_bytes += len(image["dataUrl"])
++            if total_bytes > _MAX_RENDER_BYTES:
++                raise RuntimeError("Combined viewport images exceed the 8 MB payload limit.")
++            images.append(image)
++        return images
++    finally:
++        active_view.setCamera(camera)
++
++
 +def _compile(source: str):
 +    tree = ast.parse(source, filename="<anthracite-freecad>", mode="exec")
 +    if tree.body and isinstance(tree.body[-1], ast.Expr):
@@ -403,6 +425,7 @@
 +        self.doc = doc
 +        self.events: list[dict[str, Any]] = []
 +        self.render_request: dict[str, Any] | None = None
++        self.render_views_request: list[dict[str, Any]] = []
 +
 +    def find(
 +        self,
@@ -466,7 +489,32 @@
 +        """Attach one bounded viewport render to this tool observation."""
 +
 +        self.render_request = _render_spec(width, height, view, fit)
++        self.render_views_request = []
 +        return {"scheduled": True, **self.render_request}
++
++    def render_views(
++        self,
++        views=("axonometric", "front", "right", "top"),
++        *,
++        width: int = 640,
++        height: int = 480,
++        fit: bool = True,
++    ) -> dict[str, Any]:
++        """Attach up to six ordered views of the final model; restore the user's camera.
++
++        Images are paired with observation.renders metadata in the same order.
++        Like render(), the last render request replaces earlier requests in this call.
++        """
++        if not isinstance(views, (list, tuple)) or not 1 <= len(views) <= 6:
++            raise ValueError("views must be a list or tuple of one to six view names.")
++        specs = [_render_spec(width, height, view, fit) for view in views]
++        if len({spec["view"] for spec in specs}) != len(specs):
++            raise ValueError("Render views must be unique.")
++        if sum(spec["width"] * spec["height"] for spec in specs) > _MAX_RENDER_PIXELS:
++            raise ValueError("Combined render area exceeds the pixel limit.")
++        self.render_views_request = specs
++        self.render_request = None
++        return {"scheduled": True, "views": specs}
 +
 +
 +def context_json() -> str:
@@ -540,10 +588,8 @@
 +        doc.recompute()
 +        cad.assert_valid()
 +        after = _document_snapshot(doc)
-+        rendered = (
-+            _render_view(cad.render_request)
-+            if cad.render_request is not None
-+            else None
++        rendered = _render_views(
++            [cad.render_request] if cad.render_request is not None else cad.render_views_request
 +        )
 +        doc.commitTransaction()
 +    except Exception as error:
@@ -590,13 +636,14 @@
 +    _executing_docs.discard(document_name)
 +    observation = _observation(doc, before, after)
 +    images = []
-+    if rendered is not None:
-+        observation["render"] = {
-+            key: value
-+            for key, value in rendered.items()
-+            if key != "dataUrl"
-+        }
-+        images.append(rendered["dataUrl"])
++    if rendered:
++        observation["renders"] = [
++            {"imageIndex": index, **{key: value for key, value in image.items() if key != "dataUrl"}}
++            for index, image in enumerate(rendered)
++        ]
++        if len(rendered) == 1:
++            observation["render"] = observation["renders"][0]
++        images = [image["dataUrl"] for image in rendered]
 +    return {
 +        "ok": True,
 +        "revisionBefore": revision_before,
@@ -620,7 +667,7 @@
 +    )
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthracite.py
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,194 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import unittest
@@ -796,6 +843,21 @@
 +    def test_selection_context_is_empty_without_a_gui_selection(self):
 +        cad = AnthraciteExecutor.Cad(self.doc)
 +        self.assertEqual(cad.selection(), [])
++
++    def test_multiview_requests_are_bounded_and_replace_previous_requests(self):
++        cad = AnthraciteExecutor.Cad(self.doc)
++        cad.render()
++        request = cad.render_views()
++        self.assertEqual([s["view"] for s in request["views"]],
++                         ["axonometric", "front", "right", "top"])
++        self.assertIsNone(cad.render_request)
++        for views in ([], ["front"] * 7, ["front", "front"], ["invented"], "front"):
++            with self.assertRaises(ValueError):
++                cad.render_views(views)
++        with self.assertRaises(ValueError):
++            cad.render_views(width=2048, height=2048)
++        cad.render(view="top")
++        self.assertEqual(cad.render_views_request, [])
 +
 +
 +if __name__ == "__main__":
