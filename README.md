@@ -113,6 +113,15 @@ Anthracite changes are explicit GNU Quilt patches under `patches/`, applied in t
 - Embedded [Turso](https://github.com/tursodatabase/turso) stores conversation events, provider
   thread state and document/session associations outside `.FCStd`. Any future in-document metadata
   must use upstream-supported FreeCAD mechanisms and round-trip safely through unmodified FreeCAD.
+- CAD calls also have durable `operations` records: exact Python, document/thread/tool identity,
+  prepared revision, status, and executor results (changes, validation and errors). FreeCAD sends
+  read-only context; Rust persists the running state before authorizing execution. Revisions are
+  live-document counters, not cross-restart geometry identities.
+- Database migrations and related event writes are transactional. FreeCAD's transaction and the
+  database commit are separate: an unconfirmed outcome is never treated as success or replayed.
+  The runtime exclusively locks its database; on restart, unfinished operations become `unknown`
+  and the sidebar warns that inspection is required. `rejected` means execution was refused,
+  unlike a confirmed `rolled_back` transaction. The `result_json` column retains diagnostics.
 
 Keep new product code concentrated in `src/Mod/Anthracite`. Patch FreeCAD core only for narrow,
 proven integration gaps.

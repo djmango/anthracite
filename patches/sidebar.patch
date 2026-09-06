@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
-@@ -0,0 +1,844 @@
+@@ -0,0 +1,889 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "AgentBridge.h"
@@ -407,7 +407,7 @@
 +        return;
 +    }
 +    const QJsonObject message {
-+        {"protocolVersion", 1},
++        {"protocolVersion", 2},
 +        {"type", type},
 +        {"payload", payload},
 +    };
@@ -513,6 +513,36 @@
 +        sidebar->appendActivity(detail.isEmpty() ? title : tr("%1: %2").arg(title, detail));
 +    }
 +    else if (type == QLatin1String("tool.call")) {
++        // Inspect without executing model code. The runtime must durably acknowledge
++        // this context before sending tool.execute.
++        const PyGILState_STATE state = PyGILState_Ensure();
++        PyObject* module = PyImport_ImportModule("AnthraciteExecutor");
++        PyObject* context = module ? PyObject_CallMethod(module, "context_json", nullptr) : nullptr;
++        const char* encoded = context ? PyUnicode_AsUTF8(context) : nullptr;
++        const QByteArray bytes = encoded ? QByteArray(encoded) : QByteArray();
++        const QString error = encoded ? QString() : pythonError();
++        Py_XDECREF(context);
++        Py_XDECREF(module);
++        PyGILState_Release(state);
++        const auto document = QJsonDocument::fromJson(bytes);
++        if (!document.isObject()) {
++            const QJsonObject rejected {
++                {"ok", false},
++                {"notExecuted", true},
++                {"error", QJsonObject {{"type", "PreflightError"}, {"message", error}}},
++            };
++            send(QStringLiteral("tool.result"), {
++                {"requestId", payload.value("requestId")},
++                {"result", QString::fromUtf8(QJsonDocument(rejected).toJson(QJsonDocument::Compact))},
++                {"success", false},
++            });
++            return;
++        }
++        QJsonObject preparation = payload;
++        preparation.insert("context", document.object());
++        send(QStringLiteral("tool.prepare"), preparation);
++    }
++    else if (type == QLatin1String("tool.execute")) {
 +        runFreeCADTool(payload);
 +    }
 +    else if (type == QLatin1String("request.opened")) {
@@ -555,6 +585,12 @@
 +void AgentBridge::runFreeCADTool(const QJsonObject& payload)
 +{
 +    Q_ASSERT(QThread::currentThread() == qApp->thread());
++    const QString operationId = payload.value("operationId").toString();
++    if (operationId.isEmpty() || executedOperations.contains(operationId)) {
++        fail(tr("Missing or duplicate CAD operation ID; Python was not executed."));
++        return;
++    }
++    executedOperations.insert(operationId);
 +    if (documentSyncPending || documentIdentity() != runtimeDocumentIdentity) {
 +        send(
 +            QStringLiteral("tool.result"),
@@ -563,7 +599,7 @@
 +                {
 +                    "result",
 +                    QStringLiteral(
-+                        R"({"ok":false,"error":{"type":"DocumentContextChanged","message":"The active FreeCAD document changed before this call could run."}})"
++                        R"({"ok":false,"notExecuted":true,"error":{"type":"DocumentContextChanged","message":"The active FreeCAD document changed before this call could run."}})"
 +                    ),
 +                },
 +                {"success", false},
@@ -573,6 +609,15 @@
 +    }
 +    sidebar->updateStatus(tr("Editing"));
 +    sidebar->appendActivity(tr("Running FreeCAD Python"));
++
++    const auto context = payload.value("context").toObject();
++    if (!context.value("revision").isDouble()) {
++        fail(tr("Missing prepared CAD revision; Python was not executed."));
++        return;
++    }
++    if (!documentRevision) {
++        documentRevision = context.value("revision").toInt();
++    }
 +
 +    bool success = false;
 +    QString result
@@ -847,7 +892,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.h
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,106 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_AGENTBRIDGE_H
@@ -858,6 +903,7 @@
 +#include <QHash>
 +#include <QObject>
 +#include <QProcess>
++#include <QSet>
 +#include <QTimer>
 +#include <QVariantMap>
 +
@@ -948,6 +994,7 @@
 +    boost::signals2::scoped_connection savedDocumentConnection;
 +    boost::signals2::scoped_connection deletedDocumentConnection;
 +    std::optional<int> documentRevision;
++    QSet<QString> executedOperations;
 +};
 +}  // namespace AnthraciteGui
 +

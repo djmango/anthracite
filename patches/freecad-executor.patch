@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,601 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -453,12 +453,22 @@
 +        return {"scheduled": True, **self.render_request}
 +
 +
++def context_json() -> str:
++    """Read-only preflight for durable operation preparation; never create a document."""
++    doc = App.ActiveDocument
++    return json.dumps({
++        "documentName": doc.Name if doc else None,
++        "revision": _revisions.get(doc.Name, 0) if doc else 0,
++    })
++
++
 +def execute(source: str, expected_revision: int | None = None) -> dict[str, Any]:
 +    """Execute source once, returning a structured result suitable for an LLM."""
 +
 +    if not isinstance(source, str) or not source.strip():
 +        return {
 +            "ok": False,
++            "notExecuted": True,
 +            "error": {"type": "ValueError", "message": "Python source is empty."},
 +        }
 +
@@ -472,11 +482,13 @@
 +        doc.UndoMode = 1
 +
 +    revision = _revisions.get(document_name, 0)
++    revision_before = revision
 +    if expected_revision is not None and expected_revision != revision:
 +        return {
 +            "ok": False,
 +            "conflict": True,
 +            "revision": revision,
++            "revisionBefore": revision_before,
 +            "error": {
 +                "type": "RevisionConflict",
 +                "message": (
@@ -544,6 +556,7 @@
 +            "ok": False,
 +            "revision": revision,
 +            "rolledBack": rolled_back,
++            "revisionBefore": revision_before,
 +            "requiresInspection": not rolled_back,
 +            "stdout": _bounded(stdout.getvalue()),
 +            "stderr": _bounded(stderr.getvalue()),
@@ -570,6 +583,7 @@
 +        images.append(rendered["dataUrl"])
 +    return {
 +        "ok": True,
++        "revisionBefore": revision_before,
 +        "revision": revision,
 +        "stdout": _bounded(stdout.getvalue()),
 +        "stderr": _bounded(stderr.getvalue()),
@@ -590,10 +604,11 @@
 +    )
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthracite.py
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,157 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import unittest
++import json
 +from types import SimpleNamespace
 +from unittest.mock import patch
 +
@@ -628,6 +643,7 @@
 +
 +        self.assertTrue(result["ok"])
 +        self.assertEqual(result["revision"], 1)
++        self.assertEqual(result["revisionBefore"], 0)
 +        self.assertEqual(result["result"], 42)
 +        self.assertEqual(result["events"], [{"label": "created", "value": "Thing"}])
 +        self.assertEqual(result["observation"]["selection"], [])
@@ -635,6 +651,17 @@
 +            [item["name"] for item in result["observation"]["created"]],
 +            ["Thing"],
 +        )
++
++    def test_preflight_is_read_only_and_stale_preparation_rejects_execution(self):
++        context = json.loads(AnthraciteExecutor.context_json())
++        self.assertEqual(context, {"documentName": self.doc.Name, "revision": 0})
++        AnthraciteExecutor.execute("doc.addObject('App::FeaturePython', 'First')")
++        result = AnthraciteExecutor.execute("doc.addObject('App::FeaturePython', 'Stale')", context["revision"])
++        self.assertTrue(result["conflict"])
++        self.assertIsNone(self.doc.getObject("Stale"))
++        App.closeDocument(self.doc.Name)
++        self.assertEqual(json.loads(AnthraciteExecutor.context_json()), {"documentName": None, "revision": 0})
++        self.assertEqual(len(App.listDocuments()), 0)
 +
 +    def test_exception_rolls_back_entire_tool_call(self):
 +        result = AnthraciteExecutor.execute(

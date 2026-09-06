@@ -2438,7 +2438,7 @@
 +tempfile = "3"
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/main.rs
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,211 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +mod process;
@@ -2510,10 +2510,18 @@
 +                    payload.get("effort").and_then(Value::as_str).unwrap_or(""),
 +                )
 +            }),
++        "tool.prepare" => provider
++            .as_ref()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .and_then(|provider| provider.emitter().prepare_tool(payload)),
 +        "tool.result" => provider
 +            .as_mut()
 +            .ok_or_else(|| "Provider is not running.".to_string())
 +            .and_then(|provider| {
++                provider.emitter().finish_tool(
++                    &payload.get("requestId").cloned().unwrap_or(Value::Null),
++                    payload.get("result").and_then(Value::as_str).unwrap_or(""),
++                )?;
 +                provider.return_tool_result(
 +                    payload.get("requestId").cloned().unwrap_or(Value::Null),
 +                    payload.get("result").and_then(Value::as_str).unwrap_or(""),
@@ -3013,15 +3021,17 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/protocol.rs
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,230 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use serde_json::{Value, json};
++use std::cell::RefCell;
++use std::collections::HashMap;
 +use std::io::{self, Write};
 +
 +use crate::store::Store;
 +
-+pub const VERSION: u64 = 1;
++pub const VERSION: u64 = 2;
 +
 +pub fn message_type(message: &Value) -> &str {
 +    message.get("type").and_then(Value::as_str).unwrap_or("")
@@ -3058,11 +3068,15 @@
 +
 +pub struct Emitter {
 +    store: Store,
++    operations: RefCell<HashMap<String, Value>>,
 +}
 +
 +impl Emitter {
 +    pub fn new(store: Store) -> Self {
-+        let emitter = Self { store };
++        let emitter = Self {
++            store,
++            operations: RefCell::new(HashMap::new()),
++        };
 +        emit_raw("thread.local.ready", emitter.store.summary());
 +        emitter.emit_thread_list();
 +        match emitter.store.history() {
@@ -3077,7 +3091,63 @@
 +            Ok(selection) => emit_raw("model.selection", selection),
 +            Err(error) => emit_warning(format!("Could not load model selection: {error}")),
 +        }
++        // History restoration replaces the timeline; warn only afterward.
++        match emitter.store.unresolved_count() {
++            Ok(count) if count != "0" => emit_warning(format!(
++                "{count} CAD operation(s) have unknown outcomes. Inspect the document and operations table; do not replay their Python."
++            )),
++            Err(error) => emit_warning(error),
++            _ => {}
++        }
 +        emitter
++    }
++
++    pub fn call_tool(&self, mut payload: Value) -> Result<(), String> {
++        let key = payload["requestId"].to_string();
++        if self.operations.borrow().contains_key(&key) {
++            return Err("Duplicate FreeCAD tool request; not executing again".into());
++        }
++        let id = self
++            .store
++            .begin_operation(&payload)
++            .map_err(|e| format!("FreeCAD was not executed: could not persist operation: {e}"))?;
++        payload["operationId"] = json!(id);
++        self.operations.borrow_mut().insert(key, payload.clone());
++        emit_raw("tool.call", payload);
++        Ok(())
++    }
++
++    pub fn prepare_tool(&self, payload: &Value) -> Result<(), String> {
++        let key = payload["requestId"].to_string();
++        let operations = self.operations.borrow();
++        let call = operations.get(&key).ok_or("Unknown FreeCAD operation")?;
++        if call["operationId"] != payload["operationId"] {
++            return Err("Operation ID mismatch".into());
++        }
++        self.store
++            .prepare_operation(call["operationId"].as_str().unwrap(), &payload["context"])
++            .map_err(|e| {
++                format!("FreeCAD was not executed: could not persist running state: {e}")
++            })?;
++        let mut execution = call.clone();
++        execution["context"] = payload["context"].clone();
++        emit_raw("tool.execute", execution);
++        Ok(())
++    }
++
++    pub fn finish_tool(&self, request_id: &Value, result: &str) -> Result<(), String> {
++        let key = request_id.to_string();
++        let operations = self.operations.borrow();
++        let call = operations
++            .get(&key)
++            .ok_or("Unknown FreeCAD operation result")?;
++        let id = call["operationId"].as_str().unwrap();
++        self.store.finish_operation(id, result).map_err(|e| {
++            // If storage is unavailable even this may fail. Exclusive startup
++            // recovery will classify the remaining running row as unknown.
++            let _ = self.store.mark_operation_unknown(id);
++            format!("CAD outcome could not be durably recorded. Inspect the document; do not rerun the Python. Operation {id}: {e}")
++        })
 +    }
 +
 +    pub fn emit(&self, message_type: &str, payload: Value) {
@@ -3139,6 +3209,36 @@
 +    use super::*;
 +
 +    #[test]
++    fn requires_durable_preparation_and_rejects_duplicate_requests() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join("test.db");
++        let store = Store::open(
++            path.to_str().unwrap(),
++            &json!({"sessionKey": "test"}),
++            "codex",
++            None,
++            false,
++        )
++        .unwrap();
++        let emitter = Emitter::new(store);
++        let call = json!({"requestId": 1, "arguments": {"code": "doc.recompute()"}});
++        emitter.call_tool(call.clone()).unwrap();
++        assert!(emitter.call_tool(call).is_err());
++        assert!(emitter.finish_tool(&json!(1), r#"{"ok":true}"#).is_err());
++        let id = emitter.operations.borrow()["1"]["operationId"].clone();
++        let mut preparation =
++            json!({"requestId": 1, "operationId": "wrong", "context": {"revision": 0}});
++        assert!(emitter.prepare_tool(&preparation).is_err());
++        preparation["operationId"] = id;
++        emitter.prepare_tool(&preparation).unwrap();
++        assert!(emitter.prepare_tool(&preparation).is_err());
++        emitter
++            .finish_tool(&json!(1), r#"{"ok":true,"revision":1}"#)
++            .unwrap();
++        assert!(emitter.finish_tool(&json!(1), r#"{"ok":true}"#).is_err());
++    }
++
++    #[test]
 +    fn reads_versioned_host_messages() {
 +        let message = json!({
 +            "protocolVersion": VERSION,
@@ -3154,7 +3254,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/store.rs
-@@ -0,0 +1,805 @@
+@@ -0,0 +1,1232 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use serde_json::{Value, json};
@@ -3229,6 +3329,27 @@
 +);
 +"#;
 +
++const OPERATIONS_MIGRATION: &str = r#"
++CREATE TABLE operations (
++    id TEXT PRIMARY KEY,
++    document_id TEXT NOT NULL REFERENCES documents(id),
++    thread_id TEXT NOT NULL REFERENCES threads(id),
++    provider TEXT NOT NULL,
++    request_id_json TEXT NOT NULL,
++    turn_id TEXT,
++    python_source TEXT NOT NULL,
++    status TEXT NOT NULL,
++    document_context_json TEXT,
++    revision_before INTEGER,
++    revision_after INTEGER,
++    result_json TEXT,
++    created_at_ms INTEGER NOT NULL,
++    updated_at_ms INTEGER NOT NULL
++);
++CREATE INDEX operations_document_created ON operations(document_id, created_at_ms);
++UPDATE anthracite_schema SET version = 2;
++"#;
++
 +fn now_ms() -> i64 {
 +    SystemTime::now()
 +        .duration_since(UNIX_EPOCH)
@@ -3274,6 +3395,8 @@
 +    thread_id: String,
 +    provider: String,
 +    event_log: PathBuf,
++    // One runtime owns this database, including crash recovery. OS releases on exit.
++    _lock: File,
 +}
 +
 +impl Store {
@@ -3294,6 +3417,14 @@
 +            })?;
 +        }
 +
++        let lock = OpenOptions::new()
++            .create(true)
++            .truncate(false)
++            .write(true)
++            .open(path.with_extension("runtime.lock"))
++            .map_err(|e| e.to_string())?;
++        lock.try_lock()
++            .map_err(|e| format!("Anthracite database is already in use: {e}"))?;
 +        let runtime = RuntimeBuilder::new_current_thread()
 +            .build()
 +            .map_err(|error| format!("Could not start Turso runtime: {error}"))?;
@@ -3303,10 +3434,6 @@
 +        let connection = database
 +            .connect()
 +            .map_err(|error| format!("Could not connect to Anthracite Turso database: {error}"))?;
-+        runtime
-+            .block_on(connection.execute_batch(MIGRATION))
-+            .map_err(|error| format!("Could not migrate Anthracite Turso database: {error}"))?;
-+
 +        let mut store = Self {
 +            runtime,
 +            connection,
@@ -3314,10 +3441,218 @@
 +            thread_id: String::new(),
 +            provider: provider.to_owned(),
 +            event_log: path.with_extension("events.jsonl"),
++            _lock: lock,
 +        };
-+        store.document_id = store.resolve_document(document)?;
-+        store.thread_id = store.resolve_thread(requested_thread_id, create_thread)?;
++        store.migrate()?;
++        store.transaction(|| {
++            store
++                .runtime
++                .block_on(store.connection.execute(
++                    "UPDATE operations SET status = 'unknown', updated_at_ms = ?1
++                 WHERE status IN ('pending', 'running')",
++                    params![now_ms()],
++                ))
++                .map_err(|e| e.to_string())?;
++            Ok(())
++        })?;
++        store.document_id = store.transaction(|| store.resolve_document(document))?;
++        store.thread_id =
++            store.transaction(|| store.resolve_thread(requested_thread_id, create_thread))?;
 +        Ok(store)
++    }
++
++    fn transaction<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
++        self.runtime
++            .block_on(self.connection.execute_batch("BEGIN IMMEDIATE"))
++            .map_err(|e| e.to_string())?;
++        let result = action().and_then(|value| {
++            self.runtime
++                .block_on(self.connection.execute_batch("COMMIT"))
++                .map_err(|e| e.to_string())?;
++            Ok(value)
++        });
++        if result.is_err() {
++            self.runtime
++                .block_on(self.connection.execute_batch("ROLLBACK"))
++                .map_err(|e| {
++                    format!(
++                        "Database rollback failed: {e}; original error: {}",
++                        result.as_ref().err().unwrap()
++                    )
++                })?;
++        }
++        result
++    }
++
++    fn migrate(&self) -> Result<(), String> {
++        self.runtime
++            .block_on(self.connection.execute_batch("PRAGMA foreign_keys = ON"))
++            .map_err(|e| e.to_string())?;
++        self.transaction(|| {
++            let exists = self
++                .query_string(
++                    "SELECT name FROM sqlite_master WHERE name = 'anthracite_schema'",
++                    (),
++                )?
++                .is_some();
++            if !exists {
++                self.runtime
++                    .block_on(self.connection.execute_batch(MIGRATION))
++                    .map_err(|e| e.to_string())?;
++            }
++            if self
++                .query_string("SELECT CAST(COUNT(*) AS TEXT) FROM anthracite_schema", ())?
++                .as_deref()
++                != Some("1")
++            {
++                return Err("Invalid Anthracite schema version table".into());
++            }
++            let version = self
++                .query_string("SELECT CAST(version AS TEXT) FROM anthracite_schema", ())?
++                .ok_or("Missing schema version")?;
++            match version.as_str() {
++                "1" => self
++                    .runtime
++                    .block_on(self.connection.execute_batch(OPERATIONS_MIGRATION))
++                    .map_err(|e| e.to_string())?,
++                "2" => {}
++                _ => return Err(format!("Unsupported Anthracite schema version: {version}")),
++            }
++            Ok(())
++        })
++    }
++
++    pub fn begin_operation(&self, payload: &Value) -> Result<String, String> {
++        let code = payload
++            .pointer("/arguments/code")
++            .and_then(Value::as_str)
++            .filter(|code| !code.trim().is_empty())
++            .ok_or("Missing FreeCAD Python source")?;
++        let id = new_id("operation");
++        let mut event = payload.clone();
++        event["operationId"] = json!(id);
++        self.transaction(|| {
++            self.runtime
++                .block_on(self.connection.execute(
++                    "INSERT INTO operations(id, document_id, thread_id, provider, request_id_json,
++                 turn_id, python_source, status, created_at_ms, updated_at_ms)
++                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?8)",
++                    params![
++                        id.clone(),
++                        self.document_id.clone(),
++                        self.thread_id.clone(),
++                        self.provider.clone(),
++                        payload["requestId"].to_string(),
++                        payload["turnId"].as_str(),
++                        code,
++                        now_ms()
++                    ],
++                ))
++                .map_err(|e| e.to_string())?;
++            self.record_inner("tool.call", &event)?;
++            Ok(())
++        })?;
++        self.project("tool.call", &event);
++        Ok(id)
++    }
++
++    pub fn prepare_operation(&self, id: &str, context: &Value) -> Result<(), String> {
++        if !context["revision"]
++            .as_i64()
++            .is_some_and(|revision| revision >= 0)
++        {
++            return Err("Missing or invalid prepared document revision".into());
++        }
++        self.transaction(|| {
++            let status = self.query_string(
++                "SELECT status FROM operations WHERE id = ?1 AND thread_id = ?2",
++                params![id, self.thread_id.clone()],
++            )?;
++            if status.as_deref() != Some("pending") {
++                return Err("Operation is not pending; never replay it".into());
++            }
++            self.runtime
++                .block_on(self.connection.execute(
++                    "UPDATE operations SET status = 'running', revision_before = ?1,
++                 document_context_json = ?2, updated_at_ms = ?3 WHERE id = ?4",
++                    params![
++                        context["revision"].as_i64(),
++                        context.to_string(),
++                        now_ms(),
++                        id
++                    ],
++                ))
++                .map_err(|e| e.to_string())?;
++            Ok(())
++        })
++    }
++
++    pub fn finish_operation(&self, id: &str, result: &str) -> Result<(), String> {
++        let observation: Value =
++            serde_json::from_str(result).map_err(|e| format!("Invalid executor result: {e}"))?;
++        let status = if observation["requiresInspection"] == true {
++            "unknown"
++        } else if observation["ok"] == true {
++            "committed"
++        } else if observation["rolledBack"] == true {
++            "rolled_back"
++        } else if observation["notExecuted"] == true || observation["conflict"] == true {
++            "rejected"
++        } else {
++            "unknown"
++        };
++        self.transaction(|| {
++            let old = self.query_string(
++                "SELECT status FROM operations WHERE id = ?1 AND thread_id = ?2",
++                params![id, self.thread_id.clone()],
++            )?;
++            if !matches!(old.as_deref(), Some("pending" | "running")) {
++                return Err("Operation has already finished or is unknown; never replay it".into());
++            }
++            if old.as_deref() == Some("pending") && matches!(status, "committed" | "rolled_back") {
++                return Err("Unprepared operation cannot have an execution outcome".into());
++            }
++            self.runtime
++                .block_on(self.connection.execute(
++                    "UPDATE operations SET status = ?1, revision_after = ?2, result_json = ?3,
++                 updated_at_ms = ?4, revision_before = COALESCE(?6, revision_before) WHERE id = ?5",
++                    params![
++                        status,
++                        observation["revision"].as_i64(),
++                        result,
++                        now_ms(),
++                        id,
++                        observation["revisionBefore"].as_i64()
++                    ],
++                ))
++                .map_err(|e| e.to_string())?;
++            self.record_inner(
++                "tool.result",
++                &json!({"operationId": id, "status": status, "result": observation}),
++            )?;
++            Ok(())
++        })?;
++        self.project(
++            "tool.result",
++            &json!({"operationId": id, "status": status, "result": observation}),
++        );
++        Ok(())
++    }
++
++    pub fn mark_operation_unknown(&self, id: &str) -> Result<(), String> {
++        self.runtime
++            .block_on(self.connection.execute(
++                "UPDATE operations SET status = 'unknown', updated_at_ms = ?1
++             WHERE id = ?2 AND thread_id = ?3 AND status = 'running'",
++                params![now_ms(), id, self.thread_id.clone()],
++            ))
++            .map_err(|e| e.to_string())?;
++        Ok(())
++    }
++
++    pub fn unresolved_count(&self) -> Result<String, String> {
++        Ok(self.query_string("SELECT CAST(COUNT(*) AS TEXT) FROM operations WHERE document_id = ?1 AND status = 'unknown'",
++            params![self.document_id.clone()])?.unwrap_or_default())
 +    }
 +
 +    fn query_string(
@@ -3660,6 +3995,12 @@
 +    }
 +
 +    pub fn record(&self, event_type: &str, payload: &Value) -> Result<(), String> {
++        self.transaction(|| self.record_inner(event_type, payload))?;
++        self.project(event_type, payload);
++        Ok(())
++    }
++
++    fn record_inner(&self, event_type: &str, payload: &Value) -> Result<(), String> {
 +        let timestamp = now_ms();
 +        let turn_id = payload
 +            .get("turnId")
@@ -3679,6 +4020,30 @@
 +                ],
 +            ))
 +            .map_err(|error| error.to_string())?;
++        if event_type == "content.user"
++            && let Some(text) = payload.get("text").and_then(Value::as_str)
++        {
++            self.runtime
++                .block_on(self.connection.execute(
++                    "UPDATE threads SET title = ?1 WHERE id = ?2 AND title = 'New conversation'",
++                    params![
++                        text.chars().take(80).collect::<String>(),
++                        self.thread_id.clone()
++                    ],
++                ))
++                .map_err(|e| e.to_string())?;
++        }
++        self.runtime
++            .block_on(self.connection.execute(
++                "UPDATE threads SET updated_at_ms = ?1 WHERE id = ?2",
++                params![timestamp, self.thread_id.clone()],
++            ))
++            .map_err(|e| e.to_string())?;
++        Ok(())
++    }
++
++    fn project(&self, event_type: &str, payload: &Value) {
++        let timestamp = now_ms();
 +        // A readable live projection; Turso remains authoritative for recovery.
 +        // Projection failure must not turn a committed event into an apparent failure.
 +        let record = json!({
@@ -3696,31 +4061,15 @@
 +            use std::os::unix::fs::OpenOptionsExt;
 +            options.mode(0o600);
 +        }
-+        if let Err(error) = options.open(&self.event_log).and_then(|mut file| {
-+            file.write_all(format!("{record}\n").as_bytes())
-+        }) {
-+            eprintln!("Anthracite event projection {}: {error}", self.event_log.display());
-+        }
-+        if event_type == "content.user"
-+            && let Some(text) = payload.get("text").and_then(Value::as_str)
++        if let Err(error) = options
++            .open(&self.event_log)
++            .and_then(|mut file| file.write_all(format!("{record}\n").as_bytes()))
 +        {
-+            let title = text.chars().take(80).collect::<String>();
-+            self.runtime
-+                .block_on(self.connection.execute(
-+                    "UPDATE threads
-+                     SET title = ?1
-+                     WHERE id = ?2 AND title = 'New conversation'",
-+                    params![title, self.thread_id.clone()],
-+                ))
-+                .map_err(|error| error.to_string())?;
++            eprintln!(
++                "Anthracite event projection {}: {error}",
++                self.event_log.display()
++            );
 +        }
-+        self.runtime
-+            .block_on(self.connection.execute(
-+                "UPDATE threads SET updated_at_ms = ?1 WHERE id = ?2",
-+                params![now_ms(), self.thread_id.clone()],
-+            ))
-+            .map_err(|error| error.to_string())?;
-+        Ok(())
 +    }
 +
 +    pub fn history(&self) -> Result<Vec<Value>, String> {
@@ -3774,6 +4123,181 @@
 +mod tests {
 +    use super::*;
 +
++    fn open_test_store(path: &Path) -> Store {
++        Store::open(
++            path.to_str().unwrap(),
++            &json!({"sessionKey": "operations-test"}),
++            "codex",
++            None,
++            false,
++        )
++        .unwrap()
++    }
++
++    fn operation_status(store: &Store, id: &str) -> String {
++        store
++            .query_string("SELECT status FROM operations WHERE id = ?1", params![id])
++            .unwrap()
++            .unwrap()
++    }
++
++    #[test]
++    fn operation_lifecycle_preserves_source_context_and_outcomes() {
++        let directory = tempfile::tempdir().unwrap();
++        let store = open_test_store(&directory.path().join("test.db"));
++        for (result, expected) in [
++            (
++                json!({"ok": true, "revision": 5, "observation": {"created": [{"name": "Box"}]}}),
++                "committed",
++            ),
++            (
++                json!({"ok": false, "rolledBack": true, "revision": 4, "error": {"message": "invalid shape"}}),
++                "rolled_back",
++            ),
++            (json!({"ok": false, "requiresInspection": true}), "unknown"),
++            (json!({"ok": false, "notExecuted": true}), "rejected"),
++        ] {
++            let id = store.begin_operation(&json!({"requestId": 1, "turnId": "turn-1", "arguments": {"code": "doc.recompute()"}})).unwrap();
++            assert_eq!(operation_status(&store, &id), "pending");
++            store
++                .prepare_operation(&id, &json!({"revision": 4, "documentName": "Model"}))
++                .unwrap();
++            assert_eq!(operation_status(&store, &id), "running");
++            assert!(
++                store
++                    .prepare_operation(&id, &json!({"revision": 4}))
++                    .is_err()
++            );
++            store.finish_operation(&id, &result.to_string()).unwrap();
++            assert_eq!(operation_status(&store, &id), expected);
++            assert!(store.finish_operation(&id, &result.to_string()).is_err());
++            assert_eq!(
++                store
++                    .query_string(
++                        "SELECT python_source FROM operations WHERE id = ?1",
++                        params![id.clone()]
++                    )
++                    .unwrap()
++                    .unwrap(),
++                "doc.recompute()"
++            );
++            assert_eq!(
++                store
++                    .query_string(
++                        "SELECT result_json FROM operations WHERE id = ?1",
++                        params![id]
++                    )
++                    .unwrap()
++                    .unwrap(),
++                result.to_string()
++            );
++        }
++    }
++
++    #[test]
++    fn exclusive_runtime_ownership_and_restart_leave_no_replayable_operations() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join("test.db");
++        let store = open_test_store(&path);
++        let id = store
++            .begin_operation(
++                &json!({"requestId": "tool-1", "arguments": {"code": "doc.recompute()"}}),
++            )
++            .unwrap();
++        store
++            .prepare_operation(&id, &json!({"revision": 0}))
++            .unwrap();
++        assert!(Store::open(path.to_str().unwrap(), &json!({}), "codex", None, false).is_err());
++        drop(store);
++        let reopened = open_test_store(&path);
++        assert_eq!(operation_status(&reopened, &id), "unknown");
++        assert_eq!(reopened.unresolved_count().unwrap(), "1");
++        assert!(
++            reopened
++                .prepare_operation(&id, &json!({"revision": 0}))
++                .is_err()
++        );
++    }
++
++    #[test]
++    fn operation_and_event_writes_rollback_together_on_failure() {
++        let directory = tempfile::tempdir().unwrap();
++        let store = open_test_store(&directory.path().join("test.db"));
++        let id = store
++            .begin_operation(&json!({"requestId": 1, "arguments": {"code": "doc.recompute()"}}))
++            .unwrap();
++        store
++            .prepare_operation(&id, &json!({"revision": 0}))
++            .unwrap();
++        store
++            .runtime
++            .block_on(store.connection.execute_batch("DROP TABLE events"))
++            .unwrap();
++        assert!(
++            store
++                .finish_operation(&id, r#"{"ok":true,"revision":1}"#)
++                .is_err()
++        );
++        assert_eq!(operation_status(&store, &id), "running");
++        assert!(
++            store
++                .begin_operation(
++                    &json!({"requestId": 2, "arguments": {"code": "must not execute"}})
++                )
++                .is_err()
++        );
++        assert_eq!(
++            store
++                .query_string("SELECT CAST(COUNT(*) AS TEXT) FROM operations", ())
++                .unwrap()
++                .unwrap(),
++            "1"
++        );
++    }
++
++    #[test]
++    fn upgrades_version_one_without_losing_history_and_rejects_future_schema() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join("test.db");
++        // Construct the original schema, then open it through the new migration path.
++        let runtime = RuntimeBuilder::new_current_thread().build().unwrap();
++        runtime.block_on(async {
++            let db = Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
++            let connection = db.connect().unwrap();
++            connection.execute_batch(MIGRATION).await.unwrap();
++            connection.execute("INSERT INTO documents VALUES ('legacy', NULL, 'operations-test', NULL, 'Model', 1, 1)", ()).await.unwrap();
++            connection.execute("INSERT INTO threads VALUES ('legacy-thread', 'legacy', 'codex', 'provider-id', 'Keep me', 0, 1, 1)", ()).await.unwrap();
++            connection.execute("INSERT INTO drafts VALUES ('legacy-thread', 'Keep draft', 1)", ()).await.unwrap();
++        });
++        drop(runtime);
++        let store = open_test_store(&path);
++        assert_eq!(store.local_thread_id(), "legacy-thread");
++        assert_eq!(store.draft().unwrap(), "Keep draft");
++        assert_eq!(store.provider_thread_id().unwrap().unwrap(), "provider-id");
++        assert_eq!(
++            store
++                .query_string("SELECT CAST(version AS TEXT) FROM anthracite_schema", ())
++                .unwrap()
++                .unwrap(),
++            "2"
++        );
++        store
++            .runtime
++            .block_on(
++                store
++                    .connection
++                    .execute_batch("UPDATE anthracite_schema SET version = 99"),
++            )
++            .unwrap();
++        drop(store);
++        assert!(
++            Store::open(path.to_str().unwrap(), &json!({}), "codex", None, false)
++                .err()
++                .unwrap()
++                .contains("Unsupported")
++        );
++    }
++
 +    #[test]
 +    fn persists_trajectory_without_writing_to_the_freecad_document() {
 +        let directory = tempfile::tempdir().unwrap();
@@ -3806,10 +4330,12 @@
 +            .unwrap();
 +        drop(store);
 +
-+        let projection = std::fs::read_to_string(database_path.with_extension("events.jsonl"))
-+            .unwrap();
-+        let records: Vec<Value> = projection.lines()
-+            .map(|line| serde_json::from_str(line).unwrap()).collect();
++        let projection =
++            std::fs::read_to_string(database_path.with_extension("events.jsonl")).unwrap();
++        let records: Vec<Value> = projection
++            .lines()
++            .map(|line| serde_json::from_str(line).unwrap())
++            .collect();
 +        assert_eq!(records.len(), 2);
 +        assert_eq!(records[0]["threadId"], first_thread);
 +        assert_eq!(records[0]["payload"]["text"], "Make a bracket");
@@ -3887,6 +4413,7 @@
 +        .unwrap();
 +
 +        assert_eq!(saved.local_thread_id(), unsaved_thread);
++        drop(saved);
 +
 +        let moved_path = directory.path().join("saved-as.FCStd");
 +        std::fs::write(&moved_path, b"saved-freecad-data").unwrap();

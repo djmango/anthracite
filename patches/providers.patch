@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
-@@ -0,0 +1,976 @@
+@@ -0,0 +1,968 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
@@ -395,14 +395,12 @@
 +                    }))?;
 +                    return Ok(());
 +                }
-+                self.emitter.emit(
-+                    "tool.call",
-+                    json!({
-+                        "requestId": server_id,
-+                        "tool": "freecad",
-+                        "arguments": {"code": code}
-+                    }),
-+                );
++                self.emitter.call_tool(json!({
++                    "requestId": server_id,
++                    "turnId": self.turn_id,
++                    "tool": "freecad",
++                    "arguments": {"code": code}
++                }))?;
 +            }
 +            "item/commandExecution/requestApproval" => {
 +                self.open_approval(server_id, PendingKind::CommandApproval, params);
@@ -690,6 +688,9 @@
 +}
 +
 +impl ProviderAdapter for CodexAdapter {
++    fn emitter(&self) -> &Emitter {
++        &self.emitter
++    }
 +    fn start_turn(&mut self, prompt: &str, model: &str, effort: &str) -> Result<(), String> {
 +        let thread_id = self
 +            .thread_id
@@ -726,15 +727,6 @@
 +        success: bool,
 +        images: &Value,
 +    ) -> Result<(), String> {
-+        self.emitter.record(
-+            "tool.result",
-+            &json!({
-+                "requestId": request_id,
-+                "result": result,
-+                "success": success,
-+                "imageCount": images.as_array().map_or(0, Vec::len)
-+            }),
-+        );
 +        self.send(&json!({
 +            "id": request_id,
 +            "result": {
@@ -979,7 +971,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,59 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +mod codex;
@@ -991,6 +983,7 @@
 +use std::sync::mpsc;
 +
 +pub trait ProviderAdapter {
++    fn emitter(&self) -> &crate::protocol::Emitter;
 +    fn start_turn(&mut self, prompt: &str, model: &str, effort: &str) -> Result<(), String>;
 +    fn return_tool_result(
 +        &mut self,
@@ -1040,7 +1033,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/opencode.rs
-@@ -0,0 +1,874 @@
+@@ -0,0 +1,865 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
@@ -1330,6 +1323,9 @@
 +}
 +
 +impl ProviderAdapter for OpenCodeAdapter {
++    fn emitter(&self) -> &Emitter {
++        &self.emitter
++    }
 +    fn start_turn(&mut self, prompt: &str, model: &str, effort: &str) -> Result<(), String> {
 +        if self.active_turn {
 +            return Err("OpenCode is already running a turn.".to_string());
@@ -1379,15 +1375,6 @@
 +            .pending_tools
 +            .remove(request_id)
 +            .ok_or_else(|| format!("Unknown OpenCode tool request: {request_id}"))?;
-+        self.emitter.record(
-+            "tool.result",
-+            &json!({
-+                "requestId": request_id,
-+                "result": result,
-+                "success": success,
-+                "imageCount": images.as_array().map_or(0, Vec::len)
-+            }),
-+        );
 +        pending
 +            .response
 +            .send(json!({
@@ -1666,14 +1653,11 @@
 +                        response,
 +                    },
 +                );
-+                self.emitter.emit(
-+                    "tool.call",
-+                    json!({
-+                        "requestId": request_id,
-+                        "tool": "freecad",
-+                        "arguments": {"code": code}
-+                    }),
-+                );
++                self.emitter.call_tool(json!({
++                    "requestId": request_id,
++                    "tool": "freecad",
++                    "arguments": {"code": code}
++                }))?;
 +                Ok(())
 +            }
 +            method => response
