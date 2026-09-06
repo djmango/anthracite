@@ -1,7 +1,7 @@
 <h1 align="center">anthracite</h1>
 
 <p align="center">
-  an llm-native freecad soft fork where existing coding agents can work through freecad's real
+  an llm-native freecad fork where existing coding agents can work through freecad's real
   python api.
 </p>
 
@@ -132,23 +132,30 @@ proven integration gaps.
 <summary><strong>development</strong></summary>
 
 With Nix flakes enabled, run `nix develop`, or run `direnv allow` once for automatic
-activation through direnv's `use flake` integration. `flake.lock` pins the native dependency
-definitions. `nix/package.nix` extends nixpkgs' FreeCAD package: OCCT, Qt 6, Python and its
-FreeCAD modules, Coin3D and the remaining native libraries, plus Rust and Qt Quick for Anthracite.
-The Linux development shell inherits this same dependency set. No build or launcher uses Pixi.
+activation through direnv's `use flake` integration. On Linux, `flake.lock` pins the complete
+native dependency set: OCCT, Qt, Python, Coin3D and Rust. The development shell inherits the
+same dependencies as the packaged application.
+
+On macOS, Nix supplies workflow tools, Rust and Pixi. FreeCAD's own `pixi.toml` and
+`pixi.lock`, included in the pinned upstream source, provide the compiler, Qt, Python and
+CAD libraries together. Commands use `pixi run --locked` and FreeCAD's macOS CMake preset.
+The environment lives in ignored `build/src/.pixi`; Homebrew CAD libraries are not used.
+Dependencies normally come as binary packages; our patched FreeCAD and Rust runtime still
+need compiling. Configuration reuses the earlier `build/src/build/debug` build directory.
 
 On Linux, `nix build` builds the pinned FreeCAD commit with every patch in `patches/series`;
 `nix run` launches that application. The flake uses nixpkgs' FreeCAD dependencies and vendors
 the Rust runtime dependencies from the Cargo lockfile in the patch stack.
 `nix build .#patched-source` checks source fetching and ordered patch application independently.
-The full Nix application and native development build currently support Linux. On macOS the
-shell provides patch/compiler tooling, but the complete FreeCAD native dependency port is still
-unfinished. There is no automatic fallback to host libraries. A pin bump also requires updating
-the source hash in `nix/package.nix`.
+`nix build` / `nix run` package the application on Linux only; macOS uses the development
+commands below with FreeCAD's environment. A pin bump also requires updating the source hash in
+`nix/package.nix` and reviewing upstream's Pixi lockfile.
 
 - `nix develop` enters the pinned development environment
-- `just setup` materializes the pinned FreeCAD source
-- `just push` applies the current patch series
+- `just setup` checks tool/source/patch readiness without changing anything
+- `just setup --fix` prepares missing source/submodules and applies remaining patches
+- `just patches-apply` / `just patches-unapply` apply/unapply the full stack
+- `just patch-apply-next` / `just patch-unapply-last` move one patch
 - `just patch-edit sidebar` makes an existing semantic patch current
 - `just patch-new feature-name` creates a new semantic patch when no existing patch owns the change
 - `just patch-add src/path/to/file` adds a path not already owned by the current patch
@@ -165,12 +172,19 @@ test.
 With FreeCAD materialized and the patches applied, configure and build the complete application:
 
 ```sh
-just configure
 just build
+just run
 ```
 
-The development build lives in `build/native`. `just run` launches it without invoking CMake.
-The packaged app and development launcher share `devutils/launch.sh` and these live paths
+The development build lives in `build/src/build/debug` on macOS and `build/native` on Linux.
+`just run` launches it without invoking CMake.
+`just build` prepares compiler/dependency settings and CMake build files automatically,
+then compiles incrementally. There is no separate configure command.
+`just test` runs `tests/runtests.nu`, checking the executor, workbenches, QML reload and durable bridge using an isolated
+profile and a deterministic local provider, without contacting a model service.
+Workflow scripts and test orchestration use Nushell. `tests/` holds the smoke tests;
+assertions executed inside FreeCAD remain Python to use its embedded API directly.
+The packaged app and development launcher share `devutils/launch.nu` and these live paths
 (with the standard XDG defaults when the variables are unset):
 
 - `$XDG_CONFIG_HOME/anthracite`: FreeCAD preferences, dock layout, optional `qml/Main.qml`

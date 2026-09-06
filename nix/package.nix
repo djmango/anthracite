@@ -67,9 +67,9 @@ in {
     postFixup = (old.postFixup or "") + ''
       # Wrap the existing Qt/Python wrapper, preserving its complete native closure.
       mv "$out/bin/FreeCAD" "$out/bin/.anthracite-FreeCAD"
-      makeWrapper ${pkgs.bash}/bin/bash "$out/bin/FreeCAD" \
-        --prefix PATH : ${lib.makeBinPath [ pkgs.coreutils ]} \
-        --add-flags ${../devutils/launch.sh} \
+      makeWrapper ${pkgs.nushell}/bin/nu "$out/bin/FreeCAD" \
+        --add-flags --no-config-file \
+        --add-flags ${../devutils/launch.nu} \
         --add-flags "$out/bin/.anthracite-FreeCAD"
     '';
     meta = old.meta // {

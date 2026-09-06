@@ -28,42 +28,65 @@ Anthracite is a patch-stack soft fork of FreeCAD.
 Do not commit directly inside `build/src`, add it to this repository, or leave
 an implementation only in that ignored tree.
 
-## Patch workflow
+## Working in this repository
 
-Use GNU Quilt through the `justfile`:
+Run commands from the repository root. Workflow scripts are Nushell; test runners
+live in `tests/`, while FreeCAD-embedded assertions remain Python.
+
+### Prepare, build, and run
+
+- `just setup` is read-only: checks tools, the upstream pin, submodules, and the
+  applied patch series. It makes no downloads, installs, or source edits.
+- `just setup --fix` enters the Nix tooling shell if needed, materializes missing
+  source/submodules, and applies remaining patches. It does **not** reset a
+  mismatched checkout, overwrite dirty patch work, configure, or compile.
+- `nix develop` (or direnv) supplies tools for subsequent commands.
+- `just build` prepares/updates CMake settings automatically, then compiles
+  incrementally. `just run` launches without building. No separate configure step.
+- `just test` runs `tests/runtests.nu`: isolated application/executor/bridge
+  tests, no real model calls. Failure logs remain under `build/test-results/`.
+- `just status` shows source changes and patch state.
+- macOS build: `build/src/build/debug`; Linux development build: `build/native`.
+  Linux also supports packaged `nix build` / `nix run`.
+
+### Amend a feature
 
 ```sh
-nix develop               # or automatic activation through direnv
-just doctor
-just setup                # materialize the pinned FreeCAD source
-just push                 # apply the existing series
-just patch-edit sidebar   # select an existing owning patch
-just patch-new feature-name
-just patch-add path/in/freecad  # only when the patch does not own it yet
-
-# Edit and test build/src/path/in/freecad.
-
-just patch-diff
-just patch-refresh
+just patch-edit sidebar       # select the existing owning patch
+just patch-add path/in/freecad # only for files not already owned; BEFORE editing
+# Edit build/src/path/in/freecad.
+just patch-diff               # inspect the whole selected patch
+just patch-refresh            # persist edits in the tracked .patch file
+just patches-apply            # restore the complete stack before building/testing
 just validate
+just build
+just test
 ```
 
-- Run `patch-add` before editing a path not already owned by the current patch.
-  For a new file, add its nonexistent path first and then create it.
-- Make changes in `build/src`, then let `patch-refresh` produce the patch.
-  Do not normally hand-edit generated hunks.
-- Patches describe current features or divergences, not development history.
-  Amend the existing owning patch instead of layering a fix over it.
-- Patch filenames are semantic and unnumbered. Only `patches/series` defines
-  order.
-- Keep each source file owned by one patch where practical. Create a new patch
-  only when no existing patch is the natural owner.
-- `just validate` applies the full series to an isolated checkout and checks
-  patch integrity; it does not replace focused compilation or tests.
-- Do not reset, replace, or delete a dirty `build/src`. Preserve or refresh the
-  current patch work first.
-- A FreeCAD pin bump is deliberate work: pop the series, change the pin,
-  materialize the new base, repair each patch in order, then build and test.
+- Patches describe current features/divergences, not development history.
+  Amend the owner; use `just patch-new feature-name` only for a new concern.
+- Before editing, use `just status` and search patch headers to find the owner:
+  `rg -l '^\+\+\+ b/src/path/to/file$' patches/`. Source Git diffs include the
+  whole applied stack; they are not the changes belonging to the current task.
+- Use the wrappers, not bare Quilt: `quilt-env.nu` supplies the absolute patch
+  path, `--quiltrc -`, and consistent refresh formatting. `.pc/` is Quilt's
+  bookkeeping; never hand-edit or delete it to resolve an error.
+- Keep each file owned by one patch where practical. For new files, register
+  their nonexistent path with `patch-add` before creating them.
+- Edit materialized source and refresh with Quilt; do not normally hand-edit
+  generated patch hunks. Never leave implementation only in ignored `build/src`.
+- After refreshing, inspect the outer repository's patch diff for unrelated
+  changes before handing off. If Quilt refuses a push/pop, inspect and preserve
+  the work; do not force it with `-f` or discard rejects/backups to proceed.
+- Patch names are semantic and unnumbered; only `patches/series` defines order.
+- `patches-apply` / `patches-unapply` apply/unapply the entire remaining stack;
+  `patch-apply-next` / `patch-unapply-last` move one patch. These alter source,
+  not the series order. Preserve/refresh dirty work before moving the stack.
+- `validate-series` checks names/files/order-list integrity; `validate` also
+  applies all patches to an isolated clean checkout. Neither replaces tests.
+- Never reset, replace, or delete a dirty source checkout. An upstream pin bump
+  requires preserving work, unapplying patches, deliberately replacing the base,
+  repairing the series, configuring, building, and testing.
 
 ## Product constraints
 
@@ -96,9 +119,9 @@ just validate
 
 ## Technology boundaries
 
-- Nix owns native build/runtime dependencies: OCCT, Qt, Python and its modules,
-  Rust, and compiler tooling. Keep them explicit in the flake/package definition;
-  do not depend on a Pixi environment or undeclared host libraries.
+- Linux: Nix owns all build/runtime dependencies. macOS: Nix supplies workflow
+  tools, Rust and Pixi; FreeCAD's pinned `pixi.toml`/`pixi.lock` supply the native
+  environment. Use its CMake preset and locked environment, not Homebrew CAD libs.
 - Keep mutable configuration, session state, and local UI overrides under XDG paths.
   Launching or changing a dock must not require rebuilding FreeCAD. Local overrides
   must be identifiable and reloadable; native/executor changes still require checks.

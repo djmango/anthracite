@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,601 @@
+@@ -0,0 +1,617 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -10,11 +10,13 @@
 +import ast
 +import base64
 +import contextlib
++import hashlib
 +import io
 +import json
 +import os
 +import tempfile
 +import traceback
++import zipfile
 +from typing import Any
 +
 +import FreeCAD as App
@@ -184,9 +186,23 @@
 +    properties = {}
 +    for name in obj.PropertiesList:
 +        try:
-+            properties[name] = _value_summary(getattr(obj, name))
++            # Native wrappers may have address-based repr(), and bounded repr
++            # can hide changes. Compare FreeCAD's complete persisted contents.
++            # Hash ZIP members, not the archive's timestamps/compression metadata.
++            content = obj.dumpPropertyContent(name, 0)
++            digest = hashlib.sha256()
++            with zipfile.ZipFile(io.BytesIO(content)) as archive:
++                for member in sorted(archive.namelist()):
++                    data = archive.read(member)
++                    digest.update(member.encode("utf-8"))
++                    digest.update(len(data).to_bytes(8, "big"))
++                    digest.update(data)
++            value = getattr(obj, name)
++            display = _value_summary(value) if isinstance(value, (str, bool, int, float, type(None))) else f"<{type(value).__name__}>"
++            properties[name] = {"value": display, "sha256": digest.hexdigest()}
 +        except Exception as error:
-+            properties[name] = f"<unavailable: {error}>"
++            # Never confirm restoration when a property's content is unknown.
++            raise RuntimeError(f"Cannot inspect {obj.Name}.{name}: {error}") from error
 +
 +    state = []
 +    try:
@@ -604,7 +620,7 @@
 +    )
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthracite.py
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,179 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import unittest
@@ -618,6 +634,28 @@
 +
 +
 +class ExecutorTest(unittest.TestCase):
++    def test_native_properties_have_stable_content_snapshots(self):
++        box = self.doc.addObject("Part::Box", "Box")
++        self.doc.recompute()
++        before = AnthraciteExecutor._object_snapshot(box)
++        self.assertEqual(before, AnthraciteExecutor._object_snapshot(box))
++        result = AnthraciteExecutor.execute(
++            "doc.addObject('Part::Box', 'Temporary')\nraise RuntimeError('abort')"
++        )
++        self.assertTrue(result["rolledBack"], result)
++        self.assertEqual(before, AnthraciteExecutor._object_snapshot(box))
++        box.Length = 27
++        self.doc.recompute()
++        self.assertNotEqual(before["properties"]["Shape"], AnthraciteExecutor._object_snapshot(box)["properties"]["Shape"])
++
++    def test_snapshot_detects_changes_beyond_display_limit(self):
++        obj = self.doc.addObject("App::FeaturePython", "Text")
++        obj.addProperty("App::PropertyString", "Text")
++        obj.Text = "x" * 1000 + "a"
++        before = AnthraciteExecutor._object_snapshot(obj)
++        obj.Text = "x" * 1000 + "b"
++        self.assertNotEqual(before, AnthraciteExecutor._object_snapshot(obj))
++
 +    def setUp(self):
 +        for name in list(App.listDocuments()):
 +            App.closeDocument(name)

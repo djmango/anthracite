@@ -18,8 +18,13 @@
 !.envrc
 !nix/
 !nix/*.nix
-!devutils/quilt-env.sh
-!devutils/launch.sh
+!devutils/quilt-env.nu
+!devutils/launch.nu
+!devutils/native.nu
+!devutils/workflow.nu
+!tests/
+!tests/*.nu
+!tests/*.py
 
 !patches/*.patch
 !patches/**/*.patch
