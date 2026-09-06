@@ -116,6 +116,10 @@ just test
 - Documents persist between calls; invisible Python locals do not.
 - Treat document revisions, internal object names, and topology ambiguity as
   correctness concerns. Never silently guess a changed face or edge.
+- Keep agent observations readable and paged: feature dependencies, parameters,
+  constraints and editability diagnostics, not persistence hashes. Test follow-up
+  parameter edits and native undo/redo, including intervening user edits and reported
+  topology remapping; a valid final solid alone is not sufficient.
 
 ## Technology boundaries
 

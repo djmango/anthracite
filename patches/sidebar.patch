@@ -2863,7 +2863,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,171 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -2981,6 +2981,34 @@
 +    assert not failed["ok"] and failed["rolledBack"], failed
 +    assert render_document.getObject("RenderFailure") is None
 +    assert view.getCamera() == camera, "Failed rendering moved the user's camera"
++    root_count = view.getSceneGraph().getNumChildren()
++    material = render_document.getObject("RenderBox").ViewObject.ShapeColor
++    focus = AnthraciteExecutor.execute(
++        "cad.render(view='front', width=256, height=192, focus='RenderBox', highlight=['RenderBox'], section=('z', 2))"
++    )
++    assert focus["ok"], focus
++    assert len(focus["images"]) == 1
++    assert focus["observation"]["renders"][0]["section"] == ["z", 2.0]
++    assert view.getCamera() == camera
++    assert view.getSceneGraph().getNumChildren() == root_count
++    assert render_document.getObject("RenderBox").ViewObject.ShapeColor == material
++    compare = AnthraciteExecutor.execute(
++        "cad.action('Resize with visual comparison')\ndoc.getObject('RenderBox').Length = 20\n"
++        "cad.render_views(['front', 'top'], width=256, height=192, compare=True)"
++    )
++    assert compare["ok"], compare
++    assert [s["phase"] for s in compare["observation"]["renders"]] == ["before", "before", "after", "after"]
++    assert compare["images"][0] != compare["images"][2]
++    assert view.getCamera() == camera
++    import AnthraciteInspect
++    parametric = AnthraciteExecutor.execute(AnthraciteInspect.guide("partdesign")["code"])
++    assert parametric["ok"], parametric
++    diagram = AnthraciteExecutor.execute("cad.render_sketch('BaseSketch')")
++    assert diagram["ok"], diagram
++    assert diagram["observation"]["renders"][0]["view"] == "sketch-local-XY"
++    assert diagram["observation"]["renders"][0]["constraints"]["degreesOfFreedom"] == 0
++    image = QtGui.QImage.fromData(base64.b64decode(diagram["images"][0].split(",", 1)[1]))
++    assert not image.isNull()
 +    Gui.Selection.addSelection(render_document.getObject("RenderBox"), "Face1")
 +    selection_result = AnthraciteExecutor.execute("cad.selection()")
 +    selection = selection_result["result"][0]

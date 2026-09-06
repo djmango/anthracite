@@ -18,8 +18,8 @@ def main [] {
     let signals = ^nu --no-config-file ($root | path join devutils native.nu) exec python ($root | path join tests signals.py) ($build | path join Mod Anthracite anthracite-runtime) ($root | path join devutils launch.nu) $nu.current-exe | complete
     print $signals.stdout
     if $signals.exit_code != 0 { error make {msg: $signals.stderr} }
-    for test in [[script marker]; [smoke.py ANTHRACITE_GUI_SMOKE_OK] [bridge-smoke.py ANTHRACITE_BRIDGE_SMOKE_OK]] {
-        let result = ^nu --no-config-file ($root | path join devutils native.nu) exec $nu.current-exe --no-config-file ($root | path join devutils launch.nu) ($build | path join bin FreeCAD) ($root | path join tests $test.script) | complete
+    for test in [[script executable marker]; [executor.py FreeCADCmd ANTHRACITE_EXECUTOR_TESTS_OK] [smoke.py FreeCAD ANTHRACITE_GUI_SMOKE_OK] [bridge-smoke.py FreeCAD ANTHRACITE_BRIDGE_SMOKE_OK]] {
+        let result = ^nu --no-config-file ($root | path join devutils native.nu) exec $nu.current-exe --no-config-file ($root | path join devutils launch.nu) ($build | path join bin $test.executable) ($root | path join tests $test.script) | complete
         let output = $result.stdout + $result.stderr
         $output | save ($directory | path join $"($test.script).log")
         print $output

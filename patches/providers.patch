@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
-@@ -0,0 +1,968 @@
+@@ -0,0 +1,985 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
@@ -105,6 +105,23 @@
 +            "Use the freecad tool for CAD inspection and every CAD mutation. ",
 +            "The tool accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
 +            "Prefer parametric, named objects and constraints. Inspect before editing. ",
++            "Start with cad.tree(); use cad.inspect('Name'), cad.sketch('SketchName') and cad.diagnostics() for details. ",
++            "These return paged readable properties, Body/Tip/dependency links, expressions and constraint indices/DoF. ",
++            "Use cad.api(query='PartDesign') or cad.api('Name') to discover installed native types/properties/enums. ",
++            "cad.guide() lists topics: partdesign, edit, expressions, attachments, patterns, repair. For example cad.guide('edit') returns one topic. ",
++            "cad.api(kind='commands', query='PartDesign') lists installed GUI commands; prefer native document APIs when possible. ",
++            "Prefer editing existing feature parameters over replacing solids; preserve intentional relationships and internal names. ",
++            "Warnings about editability are advisory, not permission to invent design intent or fully constrain every sketch. ",
++            "Put cad.action('Meaningful edit name') first, and make one logical edit per call. ",
++            "Use standalone cad.history(), then standalone cad.undo(action='id', revision=N) or cad.redo(action='id', revision=N) with returned values. ",
++            "Never invoke doc.undo/redo or transaction management yourself. History guards refuse intervening user edits. ",
++            "Recovery can restore parameters/geometry while recompute regenerates topology naming tables; if requiresInspection is true, inspect topologyMappingsChanged and acquire fresh references. ",
++            "Standalone cad.checkpoint('label') saves an FCStd copy; cad.checkpoints() lists copies. ",
++            "Standalone cad.restore_checkpoint(checkpoint='id', revision=N) opens a separate recovered document, preserving the original. ",
++            "Read-only helper calls with literal arguments do not advance revisions. Follow nextOffset to avoid overlooking truncated observations. ",
++            "cad.render(view='front', focus='Name', highlight=['Name'], section=('z',5)) frames/highlights/clips temporarily; the section keeps z>=5 mm, without generating a capped solid. ",
++            "cad.render_sketch('SketchName', constraint_offset=0) attaches a local-XY geometry/constraint diagram. ",
++            "cad.render_views(compare=True) attaches before/after images for the edit; its arguments must be literals and refer to objects present before the edit. ",
 +            "Use cad.selection() for selected faces and edges. Treat subelement names as ",
 +            "momentary references and re-inspect after topology-changing edits. ",
 +            "Document changes run in a named transaction. On failure, check rolledBack ",
@@ -1033,7 +1050,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/opencode.rs
-@@ -0,0 +1,865 @@
+@@ -0,0 +1,882 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
@@ -1197,6 +1214,23 @@
 +            "Use the anthracite_freecad MCP tool for CAD inspection and every CAD mutation. ",
 +            "It accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
 +            "Prefer parametric, named objects and constraints. Inspect before editing. ",
++            "Start with cad.tree(); use cad.inspect('Name'), cad.sketch('SketchName') and cad.diagnostics() for details. ",
++            "These return paged readable properties, Body/Tip/dependency links, expressions and constraint indices/DoF. ",
++            "Use cad.api(query='PartDesign') or cad.api('Name') to discover installed native types/properties/enums. ",
++            "cad.guide() lists topics: partdesign, edit, expressions, attachments, patterns, repair. For example cad.guide('edit') returns one topic. ",
++            "cad.api(kind='commands', query='PartDesign') lists installed GUI commands; prefer native document APIs when possible. ",
++            "Prefer editing existing feature parameters over replacing solids; preserve intentional relationships and internal names. ",
++            "Warnings about editability are advisory, not permission to invent design intent or fully constrain every sketch. ",
++            "Put cad.action('Meaningful edit name') first, and make one logical edit per call. ",
++            "Use standalone cad.history(), then standalone cad.undo(action='id', revision=N) or cad.redo(action='id', revision=N) with returned values. ",
++            "Never invoke doc.undo/redo or transaction management yourself. History guards refuse intervening user edits. ",
++            "Recovery can restore parameters/geometry while recompute regenerates topology naming tables; if requiresInspection is true, inspect topologyMappingsChanged and acquire fresh references. ",
++            "Standalone cad.checkpoint('label') saves an FCStd copy; cad.checkpoints() lists copies. ",
++            "Standalone cad.restore_checkpoint(checkpoint='id', revision=N) opens a separate recovered document, preserving the original. ",
++            "Read-only helper calls with literal arguments do not advance revisions. Follow nextOffset to avoid overlooking truncated observations. ",
++            "cad.render(view='front', focus='Name', highlight=['Name'], section=('z',5)) frames/highlights/clips temporarily; the section keeps z>=5 mm, without generating a capped solid. ",
++            "cad.render_sketch('SketchName', constraint_offset=0) attaches a local-XY geometry/constraint diagram. ",
++            "cad.render_views(compare=True) attaches before/after images for the edit; its arguments must be literals and refer to objects present before the edit. ",
 +            "Use cad.selection() for selected faces and edges. Treat subelement names as ",
 +            "momentary references and re-inspect after topology-changing edits. ",
 +            "Document changes run in a named transaction. On failure, check rolledBack ",

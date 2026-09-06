@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,664 @@
+@@ -0,0 +1,1032 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -13,13 +13,17 @@
 +import hashlib
 +import io
 +import json
++import math
 +import os
 +import tempfile
 +import traceback
 +import zipfile
++import uuid
 +from typing import Any
 +
 +import FreeCAD as App
++import AnthraciteInspect as Inspect
++import AnthraciteHistory as History
 +
 +try:
 +    import FreeCADGui as Gui
@@ -42,6 +46,7 @@
 +    name = str(doc.Name)
 +    if name not in _executing_docs:
 +        _revisions[name] = _revisions.get(name, 0) + 1
++        History.invalidate(doc)
 +
 +
 +def _bump_object_revision(obj: Any) -> None:
@@ -71,6 +76,7 @@
 +
 +    def slotDeletedDocument(self, doc):
 +        _revisions.pop(str(doc.Name), None)
++        History.forget(doc)
 +
 +
 +_revision_observer = _RevisionObserver()
@@ -191,15 +197,18 @@
 +            # Hash ZIP members, not the archive's timestamps/compression metadata.
 +            content = obj.dumpPropertyContent(name, 0)
 +            digest = hashlib.sha256()
++            members = {}
 +            with zipfile.ZipFile(io.BytesIO(content)) as archive:
 +                for member in sorted(archive.namelist()):
 +                    data = archive.read(member)
++                    members[member] = hashlib.sha256(data).hexdigest()
 +                    digest.update(member.encode("utf-8"))
 +                    digest.update(len(data).to_bytes(8, "big"))
 +                    digest.update(data)
 +            value = getattr(obj, name)
-+            display = _value_summary(value) if isinstance(value, (str, bool, int, float, type(None))) else f"<{type(value).__name__}>"
-+            properties[name] = {"value": display, "sha256": digest.hexdigest()}
++            display = Inspect.value(value)
++            properties[name] = {"type": obj.getTypeIdOfProperty(name), "value": display,
++                                "sha256": digest.hexdigest(), "members": members}
 +        except Exception as error:
 +            # Never confirm restoration when a property's content is unknown.
 +            raise RuntimeError(f"Cannot inspect {obj.Name}.{name}: {error}") from error
@@ -255,6 +264,12 @@
 +                "label": after[name]["label"],
 +                "type": after[name]["type"],
 +                "properties": _changed_properties(before[name], after[name]),
++                "parameterChanges": {
++                    key: {"before": before[name]["properties"].get(key, {}).get("value"),
++                          "after": after[name]["properties"].get(key, {}).get("value")}
++                    for key in _changed_properties(before[name], after[name])
++                    if key not in ("Shape", "ShapeMaterial")
++                },
 +                "shape": after[name]["shape"],
 +                "state": after[name]["state"],
 +            }
@@ -273,6 +288,14 @@
 +            }
 +        )
 +
++    editability = Inspect.diagnostics(doc)
++    if any(item["type"] in ("Part::Feature", "PartDesign::Feature") for item in created):
++        removed = [name for name in before_names - after_names
++                   if before[name]["type"].startswith(("PartDesign::", "Sketcher::"))]
++        if removed:
++            editability["warnings"].append({"code": "feature-history-replaced", "severity": "warning",
++                                           "objects": sorted(removed)[:100],
++                                           "message": "Native features were removed while an opaque shape was created. Confirm that losing editability was intended."})
 +    return {
 +        "document": str(doc.Name),
 +        "workbench": _active_workbench(),
@@ -281,6 +304,8 @@
 +        "deleted": sorted(before_names - after_names),
 +        "changed": changed,
 +        "objectCount": len(after),
++        "tree": Inspect.tree(doc),
++        "editability": editability,
 +    }
 +
 +
@@ -341,6 +366,8 @@
 +
 +
 +def _render_view(spec: dict[str, Any]) -> dict[str, Any]:
++    if "sketch" in spec:
++        return _render_sketch(spec)
 +    if Gui is None or Gui.activeDocument() is None:
 +        raise RuntimeError("Viewport rendering requires the FreeCAD GUI.")
 +
@@ -362,7 +389,8 @@
 +    descriptor, path = tempfile.mkstemp(prefix="anthracite-view-", suffix=".png")
 +    os.close(descriptor)
 +    try:
-+        active_view.saveImage(path, spec["width"], spec["height"], "Current")
++        with _visual_scene(active_view, spec):
++            active_view.saveImage(path, spec["width"], spec["height"], "Current")
 +        with open(path, "rb") as image_file:
 +            image = image_file.read(_MAX_RENDER_BYTES + 1)
 +    finally:
@@ -385,6 +413,110 @@
 +    }
 +
 +
++@contextlib.contextmanager
++def _visual_scene(view, spec):
++    """Temporary Coin nodes and camera framing; do not edit document/view properties."""
++    from pivy import coin
++    nodes = []
++    try:
++        if spec.get("focus"):
++            obj = Inspect.resolve(App.ActiveDocument, spec["focus"])
++            if not hasattr(obj, "Shape") or obj.Shape.isNull():
++                raise ValueError("Focus requires an object with non-null native geometry.")
++            bounds = obj.Shape.BoundBox
++            center = bounds.Center
++            extent = max(bounds.DiagonalLength, 0.01)
++            camera = view.getCameraNode()
++            direction = view.getCameraOrientation().multVec(App.Vector(0, 0, 1))
++            distance = extent * 3
++            position = center + direction * distance
++            camera.position.setValue(position.x, position.y, position.z)
++            camera.focalDistance.setValue(distance)
++            camera.nearDistance.setValue(max(0.0001, distance - extent * 2))
++            camera.farDistance.setValue(distance + extent * 2)
++            if hasattr(camera, "height"):
++                camera.height.setValue(extent * 1.2 * max(1, spec["height"] / spec["width"]))
++        highlighted = spec.get("highlight", [])
++        if highlighted:
++            targets = [Inspect.resolve(App.ActiveDocument, name) for name in highlighted]
++            # Include a Body's children, so its Tip is not independently ghosted.
++            names = {obj.Name for obj in targets}
++            for obj in targets:
++                names.update(child.Name for child in getattr(obj, "Group", []))
++            for obj in App.ActiveDocument.Objects:
++                vp = getattr(obj, "ViewObject", None)
++                if vp is None or not hasattr(vp, "RootNode") or not hasattr(obj, "Shape"):
++                    continue
++                material = coin.SoMaterial()
++                material.setOverride(True)
++                material.diffuseColor.setValue(1.0, 0.55, 0.1) if obj.Name in names else material.diffuseColor.setValue(0.7, 0.7, 0.7)
++                material.transparency.setValue(0.0 if obj.Name in names else 0.85)
++                vp.RootNode.insertChild(material, 0)
++                nodes.append((vp.RootNode, material))
++        if spec.get("section"):
++            axis, offset = spec["section"]
++            normal = {"x": (1, 0, 0), "y": (0, 1, 0), "z": (0, 0, 1)}[axis]
++            clip = coin.SoClipPlane()
++            clip.plane.setValue(coin.SbPlane(coin.SbVec3f(*normal), offset))
++            root = view.getSceneGraph()
++            root.insertChild(clip, 0)
++            nodes.append((root, clip))
++        yield
++    finally:
++        for root, node in reversed(nodes):
++            root.removeChild(node)
++
++
++def _render_sketch(spec):
++    from PySide6 import QtCore, QtGui
++    obj = Inspect.resolve(App.ActiveDocument, spec["sketch"])
++    details = Inspect.sketch(obj, spec["constraintOffset"], 12)
++    if obj.GeometryCount > 200:
++        raise ValueError("Sketch diagram is limited to 200 geometry elements.")
++    curves = []
++    for index, geometry in enumerate(obj.Geometry):
++        shape = geometry.toShape()
++        points = shape.discretize(Number=48) if shape.Edges else [v.Point for v in shape.Vertexes]
++        curves.append((index, points, obj.getConstruction(index)))
++    points = [point for _, curve, _ in curves for point in curve]
++    if not points:
++        raise ValueError("Sketch has no drawable geometry.")
++    width, height = spec["width"], spec["height"]
++    xmin, xmax = min(p.x for p in points), max(p.x for p in points)
++    ymin, ymax = min(p.y for p in points), max(p.y for p in points)
++    scale = min((width * 0.58 - 40) / max(xmax - xmin, 0.01), (height - 80) / max(ymax - ymin, 0.01))
++    def pixel(p):
++        return QtCore.QPointF(20 + (p.x - xmin) * scale, height - 35 - (p.y - ymin) * scale)
++    image = QtGui.QImage(width, height, QtGui.QImage.Format_ARGB32)
++    image.fill(QtGui.QColor("white"))
++    painter = QtGui.QPainter(image)
++    try:
++        painter.setRenderHint(QtGui.QPainter.Antialiasing)
++        painter.setPen(QtGui.QColor("black"))
++        painter.drawText(12, 22, f"{obj.Name} — local XY; geometry indices; DoF={obj.DoF}")
++        for index, curve, construction in curves:
++            painter.setPen(QtGui.QPen(QtGui.QColor("#888888" if construction else "#116699"), 2))
++            for start, end in zip(curve, curve[1:]):
++                painter.drawLine(pixel(start), pixel(end))
++            if len(curve) == 1:
++                painter.drawEllipse(pixel(curve[0]), 3, 3)
++            painter.drawText(pixel(curve[len(curve) // 2]), f"g{index}")
++        painter.setPen(QtGui.QColor("black"))
++        x = int(width * 0.6)
++        painter.drawText(x, 45, "Native constraints (indices):")
++        for row, constraint in enumerate(details["constraints"]):
++            text = f"c{constraint['index']} {constraint['name'] or constraint['type']} g{constraint['First']}"
++            painter.drawText(x, 65 + row * 22, text)
++    finally:
++        painter.end()
++    buffer = QtCore.QBuffer()
++    buffer.open(QtCore.QIODevice.WriteOnly)
++    if not image.save(buffer, "PNG"):
++        raise RuntimeError("Could not encode sketch diagram.")
++    return {**spec, "view": "sketch-local-XY", "constraints": details,
++            "mimeType": "image/png", "dataUrl": "data:image/png;base64," + base64.b64encode(bytes(buffer.data())).decode("ascii")}
++
++
 +def _render_views(specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 +    if not specs:
 +        return []
@@ -405,6 +537,24 @@
 +        return images
 +    finally:
 +        active_view.setCamera(camera)
++
++
++def _visual_options(focus, highlight, section):
++    options = {}
++    if focus is not None:
++        if not isinstance(focus, str):
++            raise ValueError("focus must be an internal object name.")
++        options["focus"] = focus
++    if highlight:
++        if not isinstance(highlight, (list, tuple)) or len(highlight) > 20 or not all(isinstance(n, str) for n in highlight):
++            raise ValueError("highlight must contain at most 20 internal object names.")
++        options["highlight"] = list(highlight)
++    if section is not None:
++        if (not isinstance(section, (list, tuple)) or len(section) != 2
++                or section[0] not in ("x", "y", "z") or not math.isfinite(float(section[1]))):
++            raise ValueError("section must be (axis, offset_mm), e.g. ('z', 5); keeps the positive half-space.")
++        options["section"] = [section[0], float(section[1])]
++    return options
 +
 +
 +def _compile(source: str):
@@ -445,12 +595,40 @@
 +
 +    def inspect(self, obj: Any | None = None) -> Any:
 +        if obj is None:
-+            return _document_snapshot(self.doc)
-+        if isinstance(obj, str):
-+            obj = self.doc.getObject(obj)
-+        if obj is None:
-+            return None
-+        return _object_snapshot(obj)
++            return Inspect.tree(self.doc)
++        return Inspect.node(Inspect.resolve(self.doc, obj), detailed=True)
++
++    def tree(self, root=None, offset=0, limit=40):
++        return Inspect.tree(self.doc, root, offset, limit)
++
++    def sketch(self, obj, offset=0, limit=40):
++        return Inspect.sketch(Inspect.resolve(self.doc, obj), offset, limit)
++
++    def api(self, obj=None, query="", offset=0, limit=40, kind="types"):
++        return Inspect.api(self.doc, obj, query, offset, limit, kind)
++
++    def guide(self, topic=None):
++        return Inspect.guide(topic)
++
++    def diagnostics(self, obj=None):
++        return Inspect.diagnostics(self.doc, None if obj is None else [Inspect.resolve(self.doc, obj)])
++
++    def history(self):
++        return History.describe(self.doc, _revisions.get(self.doc.Name, 0))
++
++    def checkpoints(self, offset=0, limit=20):
++        return History.checkpoints(offset, limit)
++
++    def action(self, label):
++        """Put cad.action('Meaningful edit name') first in a mutating call."""
++        return {"label": label}
++
++    def undo(self, *args, **kwargs):
++        raise ValueError("History/checkpoint actions must be the only statement, with literal arguments.")
++
++    redo = undo
++    checkpoint = undo
++    restore_checkpoint = undo
 +
 +    def selected(self) -> list[Any]:
 +        if Gui is None:
@@ -485,10 +663,14 @@
 +        height: int = 720,
 +        view: str = "axonometric",
 +        fit: bool = True,
++        focus=None,
++        highlight=(),
++        section=None,
 +    ) -> dict[str, Any]:
 +        """Attach one bounded viewport render to this tool observation."""
 +
 +        self.render_request = _render_spec(width, height, view, fit)
++        self.render_request.update(_visual_options(focus, highlight, section))
 +        self.render_views_request = []
 +        return {"scheduled": True, **self.render_request}
 +
@@ -499,6 +681,10 @@
 +        width: int = 640,
 +        height: int = 480,
 +        fit: bool = True,
++        focus=None,
++        highlight=(),
++        section=None,
++        compare: bool = False,
 +    ) -> dict[str, Any]:
 +        """Attach up to six ordered views of the final model; restore the user's camera.
 +
@@ -508,13 +694,27 @@
 +        if not isinstance(views, (list, tuple)) or not 1 <= len(views) <= 6:
 +            raise ValueError("views must be a list or tuple of one to six view names.")
 +        specs = [_render_spec(width, height, view, fit) for view in views]
++        options = _visual_options(focus, highlight, section)
++        for spec in specs:
++            spec.update(options)
 +        if len({spec["view"] for spec in specs}) != len(specs):
 +            raise ValueError("Render views must be unique.")
-+        if sum(spec["width"] * spec["height"] for spec in specs) > _MAX_RENDER_PIXELS:
++        if sum(spec["width"] * spec["height"] for spec in specs) * (2 if compare else 1) > _MAX_RENDER_PIXELS:
 +            raise ValueError("Combined render area exceeds the pixel limit.")
 +        self.render_views_request = specs
 +        self.render_request = None
 +        return {"scheduled": True, "views": specs}
++
++    def render_sketch(self, obj, *, width=960, height=480, constraint_offset=0):
++        if width < 640 or height < 400 or constraint_offset < 0:
++            raise ValueError("Sketch diagrams require at least 640x400 pixels and a non-negative constraint offset.")
++        target = Inspect.resolve(self.doc, obj)
++        if not target.isDerivedFrom("Sketcher::SketchObject"):
++            raise ValueError("Expected a Sketcher object.")
++        self.render_request = {**_render_spec(width, height, "current", False),
++                               "sketch": target.Name, "constraintOffset": constraint_offset}
++        self.render_views_request = []
++        return {"scheduled": True, **self.render_request}
 +
 +
 +def context_json() -> str:
@@ -524,6 +724,91 @@
 +        "documentName": doc.Name if doc else None,
 +        "revision": _revisions.get(doc.Name, 0) if doc else 0,
 +    })
++
++
++_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints"}
++_HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint"}
++
++
++def _standalone_helper(tree):
++    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Expr):
++        return None
++    call = tree.body[0].value
++    if (not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute)
++            or not isinstance(call.func.value, ast.Name) or call.func.value.id != "cad"
++            or call.func.attr not in _READ_HELPERS | _HISTORY_HELPERS):
++        return None
++    if any(keyword.arg is None for keyword in call.keywords):
++        return None
++    try:
++        return (call.func.attr, [ast.literal_eval(arg) for arg in call.args],
++                {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords})
++    except (ValueError, TypeError):
++        return None
++
++
++def _history_execute(doc, method, args, kwargs, revision):
++    before = _document_snapshot(doc)
++    if doc.HasPendingTransaction:
++        raise ValueError("Finish or cancel the open native transaction first.")
++    if method == "checkpoint":
++        result = History.checkpoint(doc, *args, **kwargs)
++        return {"ok": True, "revision": revision, "revisionBefore": revision,
++                "result": result, "history": History.describe(doc, revision), "images": []}
++    if method == "restore_checkpoint":
++        if args or set(kwargs) != {"checkpoint", "revision"} or kwargs["revision"] != revision:
++            raise ValueError("Use cad.restore_checkpoint(checkpoint='id', revision=current_revision).")
++        try:
++            result = History.restore(kwargs["checkpoint"])
++        except Exception as error:
++            active = App.ActiveDocument
++            return {"ok": False, "requiresInspection": True,
++                    "revision": _revisions.get(active.Name, 0) if active else 0,
++                    "error": {"type": type(error).__name__, "message": str(error)}}
++        active = App.ActiveDocument
++        return {"ok": True, "revisionBefore": revision,
++                "revision": _revisions.get(active.Name, 0), "result": result,
++                "observation": _observation(active, {}, _document_snapshot(active)), "images": []}
++    if args or set(kwargs) != {"action", "revision"}:
++        raise ValueError("Use cad.undo(action='id', revision=N) or cad.redo(action='id', revision=N).")
++    entry = History.guard(doc, method, kwargs["action"], kwargs["revision"], revision, before)
++    native_before = History.stacks(doc)
++    _executing_docs.add(doc.Name)
++    try:
++        getattr(doc, method)()
++        immediate = _document_snapshot(doc)
++        target = entry["before" if method == "undo" else "after"]
++        if immediate != target:
++            doc.recompute()
++        after = _document_snapshot(doc)
++        target = entry["before" if method == "undo" else "after"]
++        equivalent, remapped = History.equivalent(target, after)
++        if not equivalent:
++            raise RuntimeError("Native history did not restore the recorded parameters and native geometry.")
++        revision += 1
++        _revisions[doc.Name] = revision
++        History.moved(doc, method, revision, after)
++        return {"ok": True, "revisionBefore": revision - 1, "revision": revision,
++                "result": {"operation": method, "action": entry["id"], "label": entry["label"]},
++                "observation": _observation(doc, before, after),
++                "requiresInspection": bool(remapped), "topologyMappingsChanged": remapped,
++                "history": History.describe(doc, revision), "images": []}
++    except Exception as error:
++        restored = False
++        try:
++            if History.stacks(doc) != native_before:
++                getattr(doc, "redo" if method == "undo" else "undo")()
++                if _document_snapshot(doc) != before:
++                    doc.recompute()
++            restored, _ = History.equivalent(before, _document_snapshot(doc))
++        except Exception:
++            pass
++        _revisions[doc.Name] = revision + 1
++        History.invalidate(doc, "History verification failed; inspect the model before further edits.")
++        return {"ok": False, "rolledBack": restored, "requiresInspection": True,
++                "revision": revision + 1, "error": {"type": "HistoryVerificationError", "message": str(error)}}
++    finally:
++        _executing_docs.discard(doc.Name)
 +
 +
 +def execute(source: str, expected_revision: int | None = None) -> dict[str, Any]:
@@ -536,14 +821,29 @@
 +            "error": {"type": "ValueError", "message": "Python source is empty."},
 +        }
 +
++    try:
++        parsed = ast.parse(source)
++        standalone = _standalone_helper(parsed)
++    except Exception as error:
++        return {"ok": False, "notExecuted": True,
++                "error": {"type": type(error).__name__, "message": str(error)}}
 +    doc = App.ActiveDocument
 +    if doc is None:
++        if standalone:
++            method, args, kwargs = standalone
++            try:
++                if method in {"guide", "checkpoints"}:
++                    result = getattr(Cad(None), method)(*args, **kwargs)
++                elif method in {"tree", "inspect"} and not args and not kwargs:
++                    result = {"document": None, "nodes": [], "total": 0, "nextOffset": None}
++                else:
++                    raise ValueError("Open or create a document before using this helper.")
++                return {"ok": True, "readOnly": True, "revision": 0, "result": result, "images": []}
++            except Exception as error:
++                return {"ok": False, "notExecuted": True,
++                        "error": {"type": type(error).__name__, "message": str(error)}}
 +        doc = App.newDocument("Anthracite")
 +    document_name = doc.Name
-+
-+    # Transactions only retain enough state to abort when undo is enabled.
-+    if doc.UndoMode == 0:
-+        doc.UndoMode = 1
 +
 +    revision = _revisions.get(document_name, 0)
 +    revision_before = revision
@@ -562,6 +862,40 @@
 +            },
 +        }
 +
++    try:
++        tree = parsed
++        helper = standalone
++        if helper:
++            method, args, kwargs = helper
++            if method in _HISTORY_HELPERS:
++                return _history_execute(doc, method, args, kwargs, revision)
++            return {"ok": True, "readOnly": True, "revision": revision, "revisionBefore": revision,
++                    "result": getattr(Cad(doc), method)(*args, **kwargs),
++                    "history": History.describe(doc, revision), "images": []}
++        if doc.HasPendingTransaction:
++            raise ValueError("Finish or cancel the open native transaction before agent mutations.")
++        label = "Agent edit"
++        first = tree.body[0]
++        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)
++                and isinstance(first.value.func, ast.Attribute)
++                and isinstance(first.value.func.value, ast.Name)
++                and first.value.func.value.id == "cad" and first.value.func.attr == "action"):
++            label = ast.literal_eval(first.value.args[0])
++            if not isinstance(label, str) or not label.strip() or len(label) > 80:
++                raise ValueError("Action label must contain 1..80 characters.")
++        # Do not let a history helper sneak into an ordinary mutation transaction.
++        for item in ast.walk(tree):
++            if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute):
++                if item.func.attr in _HISTORY_HELPERS:
++                    raise ValueError("History operations must be standalone literal cad calls, not nested in mutations.")
++    except Exception as error:
++        return {"ok": False, "notExecuted": True, "revision": revision,
++                "error": {"type": type(error).__name__, "message": str(error)}}
++
++    # Transactions retain rollback state only when undo is enabled. Do not change
++    # this setting for read-only helpers.
++    if doc.UndoMode == 0:
++        doc.UndoMode = 1
 +    before = _document_snapshot(doc)
 +    stdout = io.StringIO()
 +    stderr = io.StringIO()
@@ -575,9 +909,28 @@
 +        "cad": cad,
 +    }
 +
-+    doc.openTransaction("Anthracite agent")
++    action_id = str(uuid.uuid4())
++    doc.openTransaction(f"Anthracite: {label} [{action_id}]")
 +    _executing_docs.add(document_name)
 +    try:
++        baseline_images = []
++        compare_calls = [item for item in ast.walk(tree)
++                         if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute)
++                         and isinstance(item.func.value, ast.Name) and item.func.value.id == "cad"
++                         and item.func.attr == "render_views"
++                         and any(kw.arg == "compare" for kw in item.keywords)]
++        if len(compare_calls) > 1:
++            raise ValueError("Only one compare render request is allowed per action.")
++        if compare_calls:
++            call = compare_calls[0]
++            if not isinstance(tree.body[-1], ast.Expr) or tree.body[-1].value is not call:
++                raise ValueError("The compare render request must be the final top-level statement.")
++            options = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
++            if options.get("compare"):
++                baseline = Cad(doc)
++                baseline.render_views(*[ast.literal_eval(arg) for arg in call.args], **options)
++                baseline_images = [{**image, "phase": "before", "revision": revision}
++                                   for image in _render_views(baseline.render_views_request)]
 +        code = _compile(source)
 +        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
 +            exec(code, namespace, namespace)
@@ -591,10 +944,17 @@
 +        rendered = _render_views(
 +            [cad.render_request] if cad.render_request is not None else cad.render_views_request
 +        )
++        if baseline_images:
++            rendered = baseline_images + [{**image, "phase": "after"} for image in rendered]
++            if sum(image["width"] * image["height"] for image in rendered) > _MAX_RENDER_PIXELS:
++                raise ValueError("Combined before/after views exceed the pixel limit.")
++            if sum(len(image["dataUrl"]) for image in rendered) > _MAX_RENDER_BYTES:
++                raise ValueError("Combined before/after images exceed the 8 MB payload limit.")
 +        doc.commitTransaction()
 +    except Exception as error:
 +        error_traceback = traceback.format_exc()
 +        rolled_back = False
++        remapped = []
 +        try:
 +            doc.abortTransaction()
 +            doc.recompute()
@@ -605,21 +965,24 @@
 +        try:
 +            after_rollback = _document_snapshot(doc)
 +            observation = _observation(doc, before, after_rollback)
-+            rolled_back = rolled_back and after_rollback == before
++            equivalent, remapped = History.equivalent(before, after_rollback)
++            rolled_back = rolled_back and equivalent
 +        except Exception:
 +            rolled_back = False
 +            observation = None
 +            error_traceback += "\nPost-rollback inspection failure:\n" + traceback.format_exc()
-+        if not rolled_back:
++        if not rolled_back or remapped:
 +            # Invalidate previously issued references when restoration is uncertain.
 +            revision += 1
 +            _revisions[document_name] = revision
++            History.invalidate(doc, "Rollback failed or could not be verified.")
 +        return {
 +            "ok": False,
 +            "revision": revision,
 +            "rolledBack": rolled_back,
 +            "revisionBefore": revision_before,
-+            "requiresInspection": not rolled_back,
++            "requiresInspection": not rolled_back or bool(remapped),
++            "topologyMappingsChanged": remapped,
 +            "stdout": _bounded(stdout.getvalue()),
 +            "stderr": _bounded(stderr.getvalue()),
 +            "error": {
@@ -631,9 +994,12 @@
 +            "events": cad.events,
 +        }
 +
-+    revision += 1
++    changed = before != after
++    revision += int(changed)
 +    _revisions[document_name] = revision
 +    _executing_docs.discard(document_name)
++    if changed:
++        History.record(doc, action_id, label, before, after, revision)
 +    observation = _observation(doc, before, after)
 +    images = []
 +    if rendered:
@@ -654,6 +1020,8 @@
 +        "observation": observation,
 +        "events": cad.events,
 +        "images": images,
++        "action": {"id": action_id, "label": label} if changed else None,
++        "history": History.describe(doc, revision),
 +    }
 +
 +
@@ -667,11 +1035,15 @@
 +    )
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthracite.py
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,322 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import unittest
 +import json
++import tempfile
++import os
++import AnthraciteInspect
++import AnthraciteHistory
 +from types import SimpleNamespace
 +from unittest.mock import patch
 +
@@ -681,6 +1053,130 @@
 +
 +
 +class ExecutorTest(unittest.TestCase):
++    def test_read_helpers_do_not_create_documents_or_change_undo_mode(self):
++        self.doc.UndoMode = 0
++        revision = AnthraciteExecutor._revisions.get(self.doc.Name, 0)
++        self.run_code("cad.tree()")
++        self.assertEqual(self.doc.UndoMode, 0)
++        self.assertEqual(AnthraciteExecutor._revisions.get(self.doc.Name, 0), revision)
++        App.closeDocument(self.doc.Name)
++        self.run_code("cad.tree()")
++        self.run_code("cad.guide()")
++        self.assertIsNone(App.ActiveDocument)
++
++    def test_history_verification_never_ignores_geometry_changes(self):
++        self.run_code("doc.addObject('Part::Box', 'Box')")
++        before = AnthraciteExecutor._document_snapshot(self.doc)
++        self.run_code("doc.getObject('Box').Length = 22")
++        equivalent, _ = AnthraciteHistory.equivalent(before, AnthraciteExecutor._document_snapshot(self.doc))
++        self.assertFalse(equivalent)
++
++    def test_readable_property_paging(self):
++        self.run_code("doc.addObject('Part::Box', 'Box')")
++        result = self.run_code("cad.api('Box', limit=2)")["result"]
++        self.assertEqual(len(result["properties"]), 2)
++        self.assertEqual(result["nextOffset"], 2)
++
++    def test_comparison_cannot_be_hidden_in_unexecuted_code(self):
++        result = AnthraciteExecutor.execute("if False:\n    cad.render_views(compare=True)")
++        self.assertFalse(result["ok"])
++        self.assertTrue(result["rolledBack"])
++        self.assertIn("final top-level statement", result["error"]["message"])
++
++    def run_code(self, source):
++        result = AnthraciteExecutor.execute(source)
++        self.assertTrue(result["ok"], result)
++        return result
++
++    def test_editable_partdesign_followup_and_guarded_history(self):
++        made = self.run_code("cad.action('Create editable pin')\n" + AnthraciteInspect.guide("partdesign")["code"])
++        sketch = self.doc.getObject("BaseSketch")
++        pad = self.doc.getObject("BasePad")
++        self.assertEqual(sketch.DoF, 0)
++        self.assertEqual(self.doc.getObject("Body").Tip.Name, "BasePad")
++        original = pad.Shape.Volume
++        changed = self.run_code("cad.action('Resize pin')\n" + AnthraciteInspect.guide("edit")["code"])
++        self.assertGreater(pad.Shape.Volume, original)
++        volume = pad.Shape.Volume
++        info = self.run_code("cad.inspect('BasePad')")
++        self.assertTrue(info["readOnly"])
++        self.assertEqual(info["revision"], changed["revision"])
++        self.assertEqual(info["result"]["parameters"]["Length"]["value"], 12)
++        self.assertEqual(info["result"]["parameters"]["Profile"][0]["object"], "BaseSketch")
++        history = info["history"]["undo"]
++        undone = self.run_code(f"cad.undo(action={history['action']!r}, revision={history['revision']})")
++        self.assertAlmostEqual(self.doc.getObject("BasePad").Shape.Volume, original)
++        history = undone["history"]["redo"]
++        redone = self.run_code(f"cad.redo(action={history['action']!r}, revision={history['revision']})")
++        self.assertAlmostEqual(self.doc.getObject("BasePad").Shape.Volume, volume)
++        # Intervening user changes are never silently undone, even if the model asks again.
++        self.doc.openTransaction("User edit")
++        self.doc.getObject("BasePad").Length = 15
++        self.doc.recompute()
++        self.doc.commitTransaction()
++        failed = AnthraciteExecutor.execute(f"cad.undo(action={redone['history']['undo']['action']!r}, revision={redone['revision']})")
++        self.assertFalse(failed["ok"])
++        self.assertTrue(failed["notExecuted"])
++        self.assertEqual(self.doc.getObject("BasePad").Length.Value, 15)
++
++    def test_guides_discovery_and_editability(self):
++        self.run_code(AnthraciteInspect.guide("partdesign")["code"])
++        self.run_code(AnthraciteInspect.guide("expressions")["code"])
++        self.assertEqual(self.doc.getObject("BasePad").Length.Value, 10)
++        tree = self.run_code("cad.tree('Body')")["result"]
++        self.assertIn("BasePad", [n["name"] for n in tree["nodes"]])
++        sketch = self.run_code("cad.sketch('BaseSketch')")["result"]
++        self.assertEqual(sketch["degreesOfFreedom"], 0)
++        types = self.run_code("cad.api(query='PartDesign::Pad')")["result"]
++        self.assertIn("PartDesign::Pad", types["objectTypes"])
++        self.run_code("doc.getObject('BaseSketch').delConstraint(0)")
++        warnings = self.run_code("cad.diagnostics('BaseSketch')")["result"]["warnings"]
++        self.assertIn("underconstrained", [w["code"] for w in warnings])
++
++    def test_native_pattern_followup_and_parameter_rollback(self):
++        self.run_code(AnthraciteInspect.guide("partdesign")["code"])
++        self.run_code(AnthraciteInspect.guide("patterns")["code"])
++        pattern = self.doc.getObject("PinPattern")
++        self.assertEqual(pattern.Occurrences, 3)
++        self.assertTrue(pattern.Shape.isValid())
++        self.run_code("doc.getObject('PinPattern').Occurrences = 4")
++        self.assertEqual(pattern.Occurrences, 4)
++        baseline = AnthraciteExecutor._document_snapshot(self.doc)
++        failed = AnthraciteExecutor.execute("doc.getObject('PinPattern').Occurrences = 5\ndoc.recompute()\nraise RuntimeError('cancel')")
++        self.assertFalse(failed["ok"])
++        self.assertTrue(failed["rolledBack"], failed)
++        equivalent, remapped = AnthraciteHistory.equivalent(baseline, AnthraciteExecutor._document_snapshot(self.doc))
++        self.assertTrue(equivalent)
++        self.assertEqual(failed["requiresInspection"], bool(remapped))
++
++    def test_history_rejects_wrong_action_open_transaction_and_nested_undo(self):
++        result = self.run_code("doc.addObject('Part::Box', 'Box')")
++        for source in (f"cad.undo(action='wrong', revision={result['revision']})",
++                       "cad.undo(action='wrong', revision=0)\ndoc.addObject('Part::Box', 'Bad')"):
++            failed = AnthraciteExecutor.execute(source)
++            self.assertFalse(failed["ok"])
++            self.assertTrue(failed["notExecuted"])
++        self.doc.openTransaction("User is editing")
++        self.doc.getObject("Box").Length = 22
++        failed = AnthraciteExecutor.execute("doc.addObject('Part::Box', 'Bad')")
++        self.assertTrue(failed["notExecuted"])
++        self.assertTrue(self.doc.HasPendingTransaction)
++        self.doc.abortTransaction()
++
++    def test_checkpoint_restores_into_separate_document(self):
++        with tempfile.TemporaryDirectory() as state, patch.dict(os.environ, {"XDG_STATE_HOME": state}):
++            self.run_code("doc.addObject('Part::Box', 'Box')")
++            saved = self.run_code("cad.checkpoint('Before resize')")["result"]
++            changed = self.run_code("doc.getObject('Box').Length = 25")
++            original = self.doc
++            recovered = self.run_code(f"cad.restore_checkpoint(checkpoint={saved['id']!r}, revision={changed['revision']})")
++            self.assertNotEqual(recovered["result"]["document"], original.Name)
++            self.assertEqual(original.getObject("Box").Length.Value, 25)
++            self.assertEqual(App.ActiveDocument.getObject("Box").Length.Value, 10)
++            self.assertNotEqual(App.ActiveDocument.FileName, saved["path"])
++            App.closeDocument(App.ActiveDocument.Name)
++            App.setActiveDocument(original.Name)
++
 +    def test_native_properties_have_stable_content_snapshots(self):
 +        box = self.doc.addObject("Part::Box", "Box")
 +        self.doc.recompute()
@@ -790,7 +1286,7 @@
 +        document.abortTransaction()
 +
 +    def test_stale_revision_does_not_execute(self):
-+        first = AnthraciteExecutor.execute("41 + 1")
++        first = AnthraciteExecutor.execute("doc.addObject('App::FeaturePython', 'First')")
 +        stale = AnthraciteExecutor.execute(
 +            "doc.addObject('App::FeaturePython', 'NeverCreated')",
 +            expected_revision=0,
@@ -862,3 +1358,402 @@
 +
 +if __name__ == "__main__":
 +    unittest.main()
+--- /dev/null
++++ b/src/Mod/Anthracite/AnthraciteHistory.py
+@@ -0,0 +1,182 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++"""Guards around FreeCAD's native undo stack and non-destructive document checkpoints."""
++import hashlib
++import json
++import os
++import shutil
++from pathlib import Path
++import uuid
++
++import FreeCAD as App
++
++_states = {}
++
++
++def stacks(doc):
++    return (tuple(doc.UndoNames), tuple(doc.RedoNames))
++
++
++def invalidate(doc, reason="Document was changed outside this agent action."):
++    if doc.Name in _states:
++        _states[doc.Name]["blocked"] = reason
++
++
++def forget(doc):
++    _states.pop(doc.Name, None)
++
++
++def record(doc, action_id, label, before, after, revision):
++    state = _states.get(doc.Name)
++    if state is None or state["blocked"]:
++        state = {"past": [], "future": [], "blocked": None}
++        _states[doc.Name] = state
++    state["past"].append({"id": action_id, "label": label, "before": before, "after": after})
++    state["past"] = state["past"][-20:]
++    state["future"] = []
++    state["stacks"] = stacks(doc)
++    state["revision"] = revision
++
++
++def describe(doc, revision):
++    state = _states.get(doc.Name)
++    reason = None
++    if state is None:
++        reason = "No tracked actions in this open document session."
++    elif state["blocked"]:
++        reason = state["blocked"]
++    elif state["revision"] != revision or state["stacks"] != stacks(doc):
++        reason = "Revision or native undo history changed; refusing to undo intervening edits."
++    if doc.HasPendingTransaction:
++        reason = "A native transaction is open. Finish or cancel that edit first."
++    result = {"document": doc.Name, "revision": revision, "blockedReason": reason,
++              "undo": None, "redo": None, "scope": "Last 20 tracked native actions in this open session"}
++    if state:
++        for direction, key in (("undo", "past"), ("redo", "future")):
++            if state[key] and not reason:
++                entry = state[key][-1]
++                native = list(doc.UndoNames if direction == "undo" else doc.RedoNames)
++                if native and entry["id"] in native[0]:
++                    result[direction] = {"action": entry["id"], "label": entry["label"], "revision": revision}
++    return result
++
++
++def guard(doc, direction, action, expected_revision, revision, snapshot):
++    info = describe(doc, revision)
++    available = info[direction]
++    if expected_revision != revision or not available or available["action"] != action:
++        raise ValueError(info["blockedReason"] or "Action/revision does not match the next recoverable native action.")
++    state = _states[doc.Name]
++    entry = state["past" if direction == "undo" else "future"][-1]
++    if snapshot != entry["after" if direction == "undo" else "before"]:
++        invalidate(doc, "Document contents no longer match the tracked action.")
++        raise ValueError("Document contents changed; history operation was not executed.")
++    return entry
++
++
++def equivalent(expected, actual):
++    """Exact inputs/geometry comparison with explicitly reported map-only regeneration.
++
++    Native recompute can rewrite FreeCAD's *.Map.txt topology naming tables on undo.
++    Only those archive members may differ: native BREP bytes, property XML, values,
++    object membership, shape measurements and recompute state must still match.
++    Never use this to identify an old face/edge in the new revision.
++    """
++    remapped = []
++    if expected.keys() != actual.keys():
++        return False, []
++    for name, old in expected.items():
++        new = actual[name]
++        if {k: v for k, v in old.items() if k != "properties"} != {k: v for k, v in new.items() if k != "properties"}:
++            return False, []
++        if old["properties"].keys() != new["properties"].keys():
++            return False, []
++        for prop, previous in old["properties"].items():
++            current = new["properties"][prop]
++            if previous == current:
++                continue
++            if (previous.get("type") != "Part::PropertyPartShape"
++                    or current.get("type") != previous["type"] or previous["value"] != current["value"]):
++                return False, []
++            members = previous.get("members", {})
++            now = current.get("members", {})
++            if not members or members.keys() != now.keys():
++                return False, []
++            differences = [key for key in members if members[key] != now[key]]
++            if not differences or any(not key.endswith(".Map.txt") for key in differences):
++                return False, []
++            remapped.append({"object": name, "property": prop})
++    return True, remapped
++
++
++def moved(doc, direction, revision, snapshot):
++    state = _states[doc.Name]
++    source, target = ("past", "future") if direction == "undo" else ("future", "past")
++    entry = state[source].pop()
++    entry["before" if direction == "undo" else "after"] = snapshot
++    state[target].append(entry)
++    # Adjacent actions share this boundary; keep their guard fingerprints current.
++    if state[source]:
++        state[source][-1]["after" if direction == "undo" else "before"] = snapshot
++    state["revision"] = revision
++    state["stacks"] = stacks(doc)
++
++
++def _directory():
++    base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
++    if not base.is_absolute():
++        raise ValueError("XDG_STATE_HOME must be absolute.")
++    return base / "anthracite/checkpoints"
++
++
++def checkpoint(doc, label):
++    if not isinstance(label, str) or not label.strip() or len(label) > 120:
++        raise ValueError("Checkpoint label must contain 1..120 characters.")
++    if doc.HasPendingTransaction:
++        raise ValueError("Finish the current native transaction before checkpointing.")
++    directory = _directory()
++    directory.mkdir(parents=True, exist_ok=True)
++    identity = str(uuid.uuid4())
++    target = directory / f"{identity}.FCStd"
++    doc.saveCopy(str(target))
++    with target.open("rb") as content:
++        digest = hashlib.file_digest(content, "sha256").hexdigest()
++    entry = {"id": identity, "label": label, "document": doc.Name,
++             "sourceFile": doc.FileName, "sha256": digest, "path": str(target)}
++    # This is checkpoint provenance, not an alternative session/event database.
++    manifest = directory / f"{identity}.json"
++    with manifest.open("x") as output:
++        json.dump(entry, output)
++    return entry
++
++
++def checkpoints(offset=0, limit=20):
++    if offset < 0 or not 1 <= limit <= 100:
++        raise ValueError("Checkpoint limit must be 1..100; offset must be non-negative.")
++    files = sorted(_directory().glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
++    records = []
++    for path in files[offset:offset + limit]:
++        try:
++            records.append(json.loads(path.read_text()))
++        except (OSError, ValueError) as error:
++            records.append({"id": path.stem, "error": str(error)})
++    return {"checkpoints": records, "nextOffset": offset + limit if offset + limit < len(files) else None}
++
++
++def restore(identity):
++    identity = str(uuid.UUID(identity))
++    directory = _directory()
++    target = directory / f"{identity}.FCStd"
++    info = json.loads((directory / f"{identity}.json").read_text())
++    with target.open("rb") as content:
++        digest = hashlib.file_digest(content, "sha256").hexdigest()
++    if digest != info["sha256"]:
++        raise ValueError("Checkpoint integrity verification failed.")
++    # Copy before opening: later saves must not overwrite the checkpoint itself.
++    recovered = directory / f"recovered-{uuid.uuid4()}.FCStd"
++    with target.open("rb") as content, recovered.open("xb") as output:
++        shutil.copyfileobj(content, output)
++    document = App.openDocument(str(recovered))
++    document.Label = f"Recovered: {info['label']}"
++    App.setActiveDocument(document.Name)
++    return {"document": document.Name, "file": str(recovered),
++            "checkpoint": identity, "originalDocumentPreserved": True}
+--- /dev/null
++++ b/src/Mod/Anthracite/AnthraciteInspect.py
+@@ -0,0 +1,211 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++"""Readable, bounded native CAD observations; never a replacement geometry API."""
++import FreeCAD as App
++
++
++def value(item, depth=0):
++    if depth > 4:
++        return {"truncated": True, "type": type(item).__name__}
++    if item is None or isinstance(item, (bool, int, float)):
++        return item
++    if isinstance(item, str):
++        return item if len(item) <= 1000 else {"text": item[:1000], "truncated": True}
++    if hasattr(item, "Name") and hasattr(item, "Document"):
++        return {"object": item.Name, "document": item.Document.Name}
++    if isinstance(item, (list, tuple)):
++        result = [value(x, depth + 1) for x in item[:100]]
++        if len(item) > 100:
++            result.append({"remaining": len(item) - 100})
++        return result
++    if isinstance(item, App.Units.Quantity):
++        return {"value": item.Value, "unit": str(item.Unit), "display": item.UserString}
++    if isinstance(item, App.Vector):
++        return {"x": item.x, "y": item.y, "z": item.z}
++    if isinstance(item, App.Placement):
++        return {"position": value(item.Base), "quaternion": list(item.Rotation.Q)}
++    if isinstance(item, App.Rotation):
++        return {"quaternion": list(item.Q)}
++    return {"type": type(item).__name__, "details": "Use the native property API for this value"}
++
++
++def resolve(doc, obj):
++    if isinstance(obj, str):
++        obj = doc.getObject(obj)
++    if obj is None or obj.Document is not doc:
++        raise ValueError("Expected an internal object name in the active document.")
++    return obj
++
++
++def properties(obj, names=None, offset=0, limit=40):
++    if not 1 <= limit <= 100 or offset < 0:
++        raise ValueError("Property limit must be 1..100; offset must be non-negative.")
++    names = sorted(obj.PropertiesList) if names is None else list(names)
++    result = {}
++    for name in names[offset:offset + limit]:
++        try:
++            result[name] = {"type": obj.getTypeIdOfProperty(name),
++                            "value": value(getattr(obj, name)),
++                            "description": obj.getDocumentationOfProperty(name)[:1000]}
++            if result[name]["type"] == "App::PropertyEnumeration":
++                result[name]["choices"] = list(obj.getEnumerationsOfProperty(name))
++        except Exception as error:
++            result[name] = {"error": str(error)}
++    return {"properties": result, "total": len(names),
++            "nextOffset": offset + limit if offset + limit < len(names) else None}
++
++
++def sketch(obj, offset=0, limit=40):
++    if not obj.isDerivedFrom("Sketcher::SketchObject"):
++        raise ValueError("Expected a Sketcher object.")
++    if offset < 0 or not 1 <= limit <= 100:
++        raise ValueError("Constraint limit must be 1..100; offset must be non-negative.")
++    constraints = []
++    for index, constraint in enumerate(obj.Constraints[offset:offset + limit], offset):
++        entry = {"index": index, "name": constraint.Name, "type": constraint.Type}
++        for field in ("First", "FirstPos", "Second", "SecondPos", "Third", "ThirdPos", "Value"):
++            entry[field] = value(getattr(constraint, field, None))
++        entry["driving"] = constraint.Driving
++        constraints.append(entry)
++    return {"degreesOfFreedom": obj.DoF,
++            "conflicting": list(obj.ConflictingConstraints),
++            "redundant": list(obj.RedundantConstraints),
++            "constraints": constraints, "constraintCount": obj.ConstraintCount,
++            "nextOffset": offset + limit if offset + limit < obj.ConstraintCount else None,
++            "geometryCount": obj.GeometryCount,
++            "externalGeometry": value(obj.ExternalGeometry)}
++
++
++def node(obj, detailed=False):
++    result = {"name": obj.Name, "label": obj.Label, "type": obj.TypeId,
++              "state": list(obj.State),
++              "dependsOn": [x.Name for x in obj.OutList[:100]], "dependencyCount": len(obj.OutList),
++              "usedBy": [x.Name for x in obj.InList[:100]], "usedByCount": len(obj.InList)}
++    if hasattr(obj, "Group"):
++        result["children"] = [x.Name for x in obj.Group[:100]]
++        result["childCount"] = len(obj.Group)
++    if hasattr(obj, "Tip"):
++        result["tip"] = value(obj.Tip)
++    result["expressions"] = value(obj.ExpressionEngine)
++    important = ("Profile", "BaseFeature", "Support", "MapMode", "AttachmentOffset",
++                 "Length", "Length2", "Width", "Height", "Radius", "Angle", "Type",
++                 "Occurrences", "Originals", "Axis", "Midplane", "Reversed")
++    result["parameters"] = {p: value(getattr(obj, p)) for p in important if p in obj.PropertiesList}
++    if obj.isDerivedFrom("Sketcher::SketchObject"):
++        result["sketch"] = sketch(obj, limit=40 if detailed else 8)
++    if detailed:
++        result.update(properties(obj))
++    return result
++
++
++def tree(doc, root=None, offset=0, limit=40):
++    if offset < 0 or not 1 <= limit <= 100:
++        raise ValueError("Tree limit must be 1..100; offset must be non-negative.")
++    objects = list(doc.Objects)
++    if root is not None:
++        parent = resolve(doc, root)
++        objects = [parent] + list(getattr(parent, "Group", []))
++    def inspect_node(obj):
++        try:
++            return node(obj)
++        except Exception as error:
++            return {"name": obj.Name, "type": obj.TypeId, "inspectionError": str(error)}
++    return {"document": doc.Name, "nodes": [inspect_node(o) for o in objects[offset:offset + limit]],
++            "total": len(objects), "nextOffset": offset + limit if offset + limit < len(objects) else None}
++
++
++def diagnostics(doc, objects=None):
++    warnings = []
++    objects = list(doc.Objects if objects is None else objects)
++    dimensions = {}
++    for obj in objects:
++        def warn(code, message):
++            warnings.append({"object": obj.Name, "code": code, "severity": "warning", "message": message})
++        if obj.TypeId in ("Part::Feature", "PartDesign::Feature") and hasattr(obj, "Shape") and not obj.Shape.isNull():
++            warn("opaque-shape", "No native parametric operation is identified. Imported/static geometry may be intentional.")
++        if obj.isDerivedFrom("Sketcher::SketchObject"):
++            if obj.DoF > 0:
++                warn("underconstrained", f"Sketch has {obj.DoF} remaining degrees of freedom; confirm these are intentional.")
++            if obj.ConflictingConstraints or obj.RedundantConstraints:
++                warn("constraint-conflict", "Inspect conflicting/redundant constraint indices before changing geometry.")
++        for prop in ("Support", "Profile", "Base"):
++            if prop not in obj.PropertiesList:
++                continue
++            linked = repr(value(getattr(obj, prop)))
++            if "Face" in linked or "Edge" in linked:
++                warn("subelement-dependency", f"{prop} references generated topology; re-resolve after topology changes, never guess an index.")
++        if any(s in ("Invalid", "Error") for s in obj.State):
++            warn("recompute-error", "Feature failed; inspect its dependencies and native status.")
++        expressions = {path for path, _ in obj.ExpressionEngine}
++        for prop in ("Length", "Width", "Height", "Radius", "Diameter"):
++            if prop not in obj.PropertiesList or prop in expressions:
++                continue
++            quantity = getattr(obj, prop)
++            if isinstance(quantity, App.Units.Quantity) and quantity.Value > 0:
++                dimensions.setdefault((quantity.Value, str(quantity.Unit)), []).append(f"{obj.Name}.{prop}")
++    for (number, unit), references in dimensions.items():
++        if len(references) > 1:
++            warnings.append({"code": "repeated-dimension", "severity": "info",
++                             "references": references[:20], "value": number, "unit": unit,
++                             "message": "Independent equal dimensions: confirm whether an expression should encode a relationship. Equality alone does not imply design intent."})
++    return {"warnings": warnings[:100], "remaining": max(0, len(warnings) - 100),
++            "note": "Warnings are not proof of bad design; intentional exceptions are allowed."}
++
++
++# Small native examples, returned on demand rather than injected in every prompt.
++GUIDES = {
++    "partdesign": {
++        "purpose": "Create an editable Body with a fully constrained circular sketch and Pad.",
++        "code": "import Part, Sketcher\nbody = doc.addObject('PartDesign::Body', 'Body')\n"
++                "sketch = body.newObject('Sketcher::SketchObject', 'BaseSketch')\n"
++                "sketch.addGeometry(Part.Circle(App.Vector(0,0,0), App.Vector(0,0,1), 10), False)\n"
++                "sketch.addConstraint(Sketcher.Constraint('Coincident', 0, 3, -1, 1))\n"
++                "i = sketch.addConstraint(Sketcher.Constraint('Diameter', 0, 20))\n"
++                "sketch.renameConstraint(i, 'Diameter')\ndoc.recompute()\n"
++                "pad = body.newObject('PartDesign::Pad', 'BasePad')\npad.Profile = sketch\n"
++                "pad.Length = 8\nsketch.Visibility = False\ndoc.recompute()",
++    },
++    "edit": {"purpose": "Edit parameters of existing features; preserve names and dependent features.",
++             "code": "sketch = doc.getObject('BaseSketch')\n"
++                     "sketch.setDatum('Diameter', App.Units.Quantity('24 mm'))\n"
++                     "doc.getObject('BasePad').Length = 12\ndoc.recompute()",
++             "checks": "Inspect Body Tip, downstream errors and sketch degrees of freedom afterward."},
++    "expressions": {"purpose": "Express intended relationships instead of copying dimensions.",
++                    "code": "doc.getObject('BasePad').setExpression('Length', 'BaseSketch.Constraints.Diameter / 2')",
++                    "checks": "Inspect ExpressionEngine and dependencies. Avoid circular references."},
++    "attachments": {"purpose": "Prefer origin planes or explicit datum references when they express intent.",
++                    "checks": "Inspect Support, MapMode and AttachmentOffset. For cross-body references use native ShapeBinder/SubShapeBinder when appropriate. Discover properties on the installed object; don't guess generated face indices."},
++    "patterns": {"purpose": "Prefer a native pattern feature over duplicated independent solids when repetition is intended.",
++                 "code": "body = doc.getObject('Body')\npad = doc.getObject('BasePad')\n"
++                         "pattern = body.newObject('PartDesign::LinearPattern', 'PinPattern')\n"
++                         "pattern.Originals = [pad]\npattern.Direction = (doc.getObject('X_Axis'), [''])\n"
++                         "pattern.Length = 30\npattern.Occurrences = 3\npad.Visibility = False\ndoc.recompute()",
++                 "checks": "Discover installed PartDesign pattern types with cad.api(query='Pattern'). Inspect Originals, Axis/Direction, Occurrences and spacing on the feature. Verify the changed count and downstream recompute."},
++    "repair": {"purpose": "Repair the earliest failing dependency, not the final displayed solid.",
++               "checks": "Use cad.tree(), cad.sketch(name), and cad.inspect(name). Check constraint conflicts/redundancies, Support and expressions; change only the offending input. Recompute and inspect affected downstream features."},
++}
++
++
++def guide(topic=None):
++    if topic is None:
++        return {key: entry["purpose"] for key, entry in GUIDES.items()}
++    if topic not in GUIDES:
++        raise ValueError(f"Unknown guide {topic!r}; available: {', '.join(GUIDES)}")
++    return GUIDES[topic]
++
++
++def api(doc, obj=None, query="", offset=0, limit=40, kind="types"):
++    if obj is not None:
++        return properties(resolve(doc, obj), offset=offset, limit=limit)
++    if offset < 0 or not 1 <= limit <= 100:
++        raise ValueError("API limit must be 1..100; offset must be non-negative.")
++    if kind == "types":
++        available = doc.supportedTypes()
++    elif kind == "commands":
++        import FreeCADGui
++        available = FreeCADGui.listCommands()
++    else:
++        raise ValueError("API kind must be 'types' or 'commands'.")
++    types = sorted(t for t in available if query.lower() in t.lower())
++    return {"objectTypes" if kind == "types" else "commands": types[offset:offset + limit], "total": len(types),
++            "nextOffset": offset + limit if offset + limit < len(types) else None,
++            "note": "Types from loaded native modules. Import the relevant FreeCAD module to discover its types."}

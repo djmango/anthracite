@@ -20,11 +20,13 @@
      value(BUILD_CLOUD)
 --- /dev/null
 +++ b/src/Mod/Anthracite/CMakeLists.txt
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,64 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +set(Anthracite_Scripts
 +    AnthraciteExecutor.py
++    AnthraciteInspect.py
++    AnthraciteHistory.py
 +    Init.py
 +    TestAnthracite.py
 +)

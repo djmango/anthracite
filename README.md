@@ -74,6 +74,44 @@ Images describe the final recomputed model, with ordered view metadata; renderin
 restores the user's camera and bounds the combined pixel count and image payload.
 Use images alongside object/geometry checks, never as proof of exact topology.
 
+The model can inspect an editable feature tree with `cad.tree()` (or scope it to
+`cad.tree("Body")`), readable properties with `cad.inspect("BasePad")`, and native
+constraint indices, names and solver status with `cad.sketch("BaseSketch")`.
+`cad.api(query="PartDesign")` discovers installed types; `cad.api("BasePad")`
+returns property documentation and enum choices. Follow `nextOffset` for paged results.
+`cad.guide()` lists on-demand native examples, and `cad.diagnostics()` reports
+advisory editability warnings, not inferred design requirements.
+
+Start a logical edit with `cad.action("Resize mounting holes")`. Results include
+parameter changes, the feature tree, and guarded native undo/redo availability.
+Call `cad.history()`, then use its returned values in a **standalone**
+`cad.undo(action="id", revision=N)` or `cad.redo(action="id", revision=N)`.
+History is limited to the last 20 tracked actions in the open document session;
+intervening user edits, a changed native history stack, or an open transaction block recovery.
+Read-only helper calls with literal arguments do not create undo entries or advance revisions.
+
+Recovery checks native geometry and persisted parameters. Recompute may regenerate
+FreeCAD's topology naming tables even when BREP geometry is identical; these changes
+are reported in `topologyMappingsChanged` with `requiresInspection: true` and a new
+revision. No old face/edge reference is silently rebound.
+
+For recovery across restarts, standalone `cad.checkpoint("Before redesign")` saves
+a normal `.FCStd` copy plus integrity/provenance metadata under
+`$XDG_STATE_HOME/anthracite/checkpoints`. `cad.checkpoints()` lists them;
+`cad.restore_checkpoint(checkpoint="id", revision=N)` opens a separate recovered
+copy and preserves the original document. Checkpoints are retained until explicitly
+removed; session/event records remain in Turso.
+
+Visual inspection also supports `focus="Name"`, `highlight=["Name"]`, and
+`section=("z", 5)` on viewport renders. Sections clip to the positive half-space
+(here z >= 5 mm); they do not create a capped solid or change the model.
+`cad.render_sketch("BaseSketch")` draws native sketch geometry and constraint labels
+in local XY, including geometry indices and a paged constraint legend.
+`cad.render_views(compare=True)` captures before/after images around the current edit;
+use one such request as the final top-level statement, with literal arguments referring
+to objects that exist before the edit.
+Camera and temporary render styling are restored afterward.
+
 The model writes normal FreeCAD Python using `App`, `Gui`, workbench modules and a thin `cad`
 helper. Each call runs on the GUI thread inside a named transaction, recomputes and validates the
 document, then commits or rolls back and returns the result, CAD changes and diagnostics.

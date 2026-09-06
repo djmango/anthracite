@@ -41,6 +41,20 @@ def provider_fixture():
         elif request == 9002:
             result = json.loads(message["result"]["contentItems"][0]["text"])
             assert not result["ok"] and result["rolledBack"], result
+            send({"id": 9003, "method": "item/tool/call", "params": {
+                "tool": "freecad", "arguments": {"code": "cad.action('Resize bridge box')\ndoc.getObject('BridgeBox').Length = 20"}}})
+        elif request in (9003, 9004):
+            result = json.loads(message["result"]["contentItems"][0]["text"])
+            assert result["ok"], result
+            direction = "undo" if request == 9003 else "redo"
+            entry = result["history"][direction]
+            assert entry, result
+            source = f"cad.{direction}(action={entry['action']!r}, revision={entry['revision']})"
+            send({"id": request + 1, "method": "item/tool/call", "params": {
+                "tool": "freecad", "arguments": {"code": source}}})
+        elif request == 9005:
+            result = json.loads(message["result"]["contentItems"][0]["text"])
+            assert result["ok"], result
             send({"method": "turn/completed", "params": {
                 "turn": {"id": "smoke-turn", "status": "completed"}}})
 
@@ -90,12 +104,12 @@ try:
             lines = text.splitlines()
             results = [record["payload"] for record in map(json.loads, lines)
                        if record["type"] == "tool.result"]
-            if len(results) < 2:
+            if len(results) < 5:
                 return
-            assert [result["status"] for result in results] == ["committed", "rolled_back"], results
+            assert [result["status"] for result in results] == ["committed", "rolled_back", "committed", "committed", "committed"], results
             assert document.getObject("MustRollback") is None
             box = document.getObject("BridgeBox")
-            assert box.Shape.isValid() and abs(box.Shape.Volume - 480) < 1e-6
+            assert box.Shape.isValid() and abs(box.Shape.Volume - 800) < 1e-6
             timer.stop()
             App.closeDocument(document.Name)
             print("ANTHRACITE_BRIDGE_SMOKE_OK", flush=True)
