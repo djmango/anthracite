@@ -32,6 +32,7 @@ def provider_fixture():
             assert result["ok"], result
             send({"id": 9002, "method": "item/tool/call", "params": {
                 "tool": "freecad", "arguments": {"code":
+                    "doc.getObject('BridgeBox').Length = 99\ndoc.recompute()\n"
                     "doc.addObject('Part::Box', 'MustRollback')\nraise RuntimeError('smoke rollback')"}}})
         elif request == 9002:
             result = json.loads(message["result"]["contentItems"][0]["text"])
