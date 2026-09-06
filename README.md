@@ -8,7 +8,10 @@
 <details open>
 <summary><strong>overview</strong></summary>
 
-Anthracite puts a complete agent experience inside FreeCAD.
+Anthracite makes FreeCAD's existing CAD implementation usable through a checked Python executor.
+The kernel, PartDesign features, topology handling, recompute, constraints and assemblies remain
+FreeCAD's responsibility. Model output is fallible code completion; the chat sidebar carries
+requests and observations.
 
 - a native, dockable QML sidebar alongside the 3D viewport
 - existing coding-agent installations instead of a new agent harness
@@ -16,8 +19,8 @@ Anthracite puts a complete agent experience inside FreeCAD.
 - transactional, undoable changes with recompute, validation and structured diagnostics
 
 FreeCAD's normal selection, commands, properties, task panels and viewport remain first class.
-The agent is another powerful way to operate the application, not a replacement for its existing
-interface.
+The document and its native objects are the inspectable state. Generated Python is a proposed
+action, not a declarative or provably correct CAD transform.
 
 </details>
 
@@ -68,6 +71,16 @@ The model writes normal FreeCAD Python using `App`, `Gui`, workbench modules and
 helper. Each call runs on the GUI thread inside a named transaction, recomputes and validates the
 document, then commits or rolls back and returns the result, CAD changes and diagnostics.
 
+Treat the agent as an operator of a checked Python executor. The user supplies design intent
+and constraints; the model must not silently invent missing design requirements. Success is
+established by executor observations and explicit checks, not the model's description. A valid
+shape or successful recompute alone does not establish that a design meets its requirements.
+Python is parsed and compiled, then checked through execution and FreeCAD validation; this is
+not static typechecking. Transactions cover document changes, not arbitrary Python side effects.
+If rollback fails or the observed state is not restored, the result reports that uncertainty
+and advances the revision. Internal object names are stable identifiers; face/edge indices are
+revision-specific references and must be inspected again after topology changes.
+
 The document persists between calls while Python locals do not. Document revisions prevent stale
 writes. Stable internal object names are reported alongside labels and shape summaries.
 
@@ -110,10 +123,21 @@ proven integration gaps.
 <summary><strong>development</strong></summary>
 
 With Nix flakes enabled, run `nix develop`, or run `direnv allow` once for automatic
-activation through direnv's `use flake` integration. `flake.lock` pins the workflow tools;
-FreeCAD's upstream Pixi environment supplies its build dependencies.
+activation through direnv's `use flake` integration. `flake.lock` pins the native dependency
+definitions. `nix/package.nix` extends nixpkgs' FreeCAD package: OCCT, Qt 6, Python and its
+FreeCAD modules, Coin3D and the remaining native libraries, plus Rust and Qt Quick for Anthracite.
+The Linux development shell inherits this same dependency set. No build or launcher uses Pixi.
 
-- `nix develop` enters the pinned Git, Just, Quilt, and Pixi environment
+On Linux, `nix build` builds the pinned FreeCAD commit with every patch in `patches/series`;
+`nix run` launches that application. The flake uses nixpkgs' FreeCAD dependencies and vendors
+the Rust runtime dependencies from the Cargo lockfile in the patch stack.
+`nix build .#patched-source` checks source fetching and ordered patch application independently.
+The full Nix application and native development build currently support Linux. On macOS the
+shell provides patch/compiler tooling, but the complete FreeCAD native dependency port is still
+unfinished. There is no automatic fallback to host libraries. A pin bump also requires updating
+the source hash in `nix/package.nix`.
+
+- `nix develop` enters the pinned development environment
 - `just setup` materializes the pinned FreeCAD source
 - `just push` applies the current patch series
 - `just patch-edit sidebar` makes an existing semantic patch current
@@ -136,15 +160,25 @@ just configure
 just build
 ```
 
-Launch with `just run`; it first performs an incremental full build so a partial developer target
-cannot open a workbenchless FreeCAD. The launcher uses a writable, persistent FreeCAD profile under
-`build/profile`; this avoids read-only or incompatible system FreeCAD profiles while leaving Codex
-and OpenCode authentication and configuration untouched. On the first launch of each bundled
-defaults version, the launcher seeds that profile with Anthracite's workbench, toolbar, dock,
-document, recovery, and window configuration. It preserves the previous profile beside `user.cfg`
-before doing so, and subsequent FreeCAD preference changes remain persistent. Open the Anthracite
-dock, choose Codex or OpenCode in the composer, and use **Configure…** only if Anthracite cannot
-discover the existing executable.
+The development build lives in `build/native`. `just run` launches it without invoking CMake.
+The packaged app and development launcher share `devutils/launch.sh` and these live paths
+(with the standard XDG defaults when the variables are unset):
+
+- `$XDG_CONFIG_HOME/anthracite`: FreeCAD preferences, dock layout, optional `qml/Main.qml`
+- `$XDG_DATA_HOME/anthracite`: FreeCAD user data
+- `$XDG_STATE_HOME/anthracite`: `anthracite.db` and a readable `anthracite.events.jsonl` projection
+- `$XDG_CACHE_HOME/anthracite`: disposable FreeCAD temporary data
+
+Turso is authoritative for sessions; the JSONL projection is for live inspection and is not a
+recovery log. Existing `build/profile` and legacy databases are left untouched. Bundled preferences
+apply only when creating a new profile; updates never replace the user's current dock layout.
+
+To customize the sidebar, place a copy of the bundled `Main.qml` at the config path above and run
+`Gui.runCommand("Anthracite_ReloadSidebar")` in FreeCAD's Python console. Reloading keeps the native
+controller and provider session. Invalid QML leaves the previous view intact and reports errors.
+The sidebar's `anthraciteQmlSource` QObject property identifies the active source. Remove the local
+override and reload to return to the packaged UI. C++/Rust changes require rebuilding; ordinary
+CAD actions, preferences, and QML iteration do not.
 
 </details>
 
@@ -157,6 +191,8 @@ discover the existing executable.
   followed by a useful observation
 - [Helium](https://github.com/imputnet/helium) — pinned upstream, disposable source and an ordered
   patch series
+- [Autolith](https://github.com/lambda-symbolics/autolith) — inspectable live state, XDG paths,
+  explicit runtime provenance, and local changes separate from packaged code
 
 </details>
 

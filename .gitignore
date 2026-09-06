@@ -16,7 +16,10 @@
 !flake.nix
 !flake.lock
 !.envrc
+!nix/
+!nix/*.nix
 !devutils/quilt-env.sh
+!devutils/launch.sh
 
 !patches/*.patch
 !patches/**/*.patch

@@ -1,9 +1,6 @@
-diff --git a/src/Mod/Anthracite/AnthraciteExecutor.py b/src/Mod/Anthracite/AnthraciteExecutor.py
-new file mode 100644
-index 0000000000..307c79262b
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,572 @@
+@@ -0,0 +1,587 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -468,12 +465,13 @@ index 0000000000..307c79262b
 +    doc = App.ActiveDocument
 +    if doc is None:
 +        doc = App.newDocument("Anthracite")
++    document_name = doc.Name
 +
 +    # Transactions only retain enough state to abort when undo is enabled.
 +    if doc.UndoMode == 0:
 +        doc.UndoMode = 1
 +
-+    revision = _revisions.get(doc.Name, 0)
++    revision = _revisions.get(document_name, 0)
 +    if expected_revision is not None and expected_revision != revision:
 +        return {
 +            "ok": False,
@@ -502,13 +500,13 @@ index 0000000000..307c79262b
 +    }
 +
 +    doc.openTransaction("Anthracite agent")
-+    _executing_docs.add(doc.Name)
++    _executing_docs.add(document_name)
 +    try:
 +        code = _compile(source)
 +        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
 +            exec(code, namespace, namespace)
 +
-+        if App.getDocument(doc.Name) is not doc:
++        if App.getDocument(document_name) is not doc:
 +            raise RuntimeError("The active document was closed during the tool call.")
 +
 +        doc.recompute()
@@ -522,17 +520,31 @@ index 0000000000..307c79262b
 +        doc.commitTransaction()
 +    except Exception as error:
 +        error_traceback = traceback.format_exc()
++        rolled_back = False
 +        try:
 +            doc.abortTransaction()
 +            doc.recompute()
++            rolled_back = True
 +        except Exception:
 +            error_traceback += "\nRollback failure:\n" + traceback.format_exc()
-+        _executing_docs.discard(doc.Name)
-+        after_rollback = _document_snapshot(doc)
++        _executing_docs.discard(document_name)
++        try:
++            after_rollback = _document_snapshot(doc)
++            observation = _observation(doc, before, after_rollback)
++            rolled_back = rolled_back and after_rollback == before
++        except Exception:
++            rolled_back = False
++            observation = None
++            error_traceback += "\nPost-rollback inspection failure:\n" + traceback.format_exc()
++        if not rolled_back:
++            # Invalidate previously issued references when restoration is uncertain.
++            revision += 1
++            _revisions[document_name] = revision
 +        return {
 +            "ok": False,
 +            "revision": revision,
-+            "rolledBack": True,
++            "rolledBack": rolled_back,
++            "requiresInspection": not rolled_back,
 +            "stdout": _bounded(stdout.getvalue()),
 +            "stderr": _bounded(stderr.getvalue()),
 +            "error": {
@@ -540,13 +552,13 @@ index 0000000000..307c79262b
 +                "message": str(error),
 +                "traceback": _bounded(error_traceback),
 +            },
-+            "observation": _observation(doc, before, after_rollback),
++            "observation": observation,
 +            "events": cad.events,
 +        }
 +
 +    revision += 1
-+    _revisions[doc.Name] = revision
-+    _executing_docs.discard(doc.Name)
++    _revisions[document_name] = revision
++    _executing_docs.discard(document_name)
 +    observation = _observation(doc, before, after)
 +    images = []
 +    if rendered is not None:
@@ -576,15 +588,14 @@ index 0000000000..307c79262b
 +        ensure_ascii=False,
 +        separators=(",", ":"),
 +    )
-diff --git a/src/Mod/Anthracite/TestAnthracite.py b/src/Mod/Anthracite/TestAnthracite.py
-new file mode 100644
-index 0000000000..ed86774a7f
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthracite.py
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,144 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
 +
 +import FreeCAD as App
 +
@@ -640,6 +651,31 @@ index 0000000000..ed86774a7f
 +        self.assertEqual(result["revision"], 0)
 +        self.assertIsNone(self.doc.getObject("MustDisappear"))
 +        self.assertEqual(result["observation"]["objectCount"], 0)
++
++    def test_failed_rollback_is_reported_and_invalidates_revision(self):
++        document = self.doc
++
++        class FailedRollback:
++            def __getattr__(self, name):
++                return getattr(document, name)
++
++            def abortTransaction(self):
++                raise RuntimeError("deliberate rollback failure")
++
++        proxy = FailedRollback()
++        app = SimpleNamespace(ActiveDocument=proxy, getDocument=lambda name: proxy)
++        with patch.object(AnthraciteExecutor, "App", app):
++            result = AnthraciteExecutor.execute(
++                "doc.addObject('App::FeaturePython', 'Remaining')\n"
++                "raise RuntimeError('deliberate action failure')"
++            )
++        self.assertFalse(result["ok"])
++        self.assertFalse(result["rolledBack"])
++        self.assertTrue(result["requiresInspection"])
++        self.assertEqual(result["revision"], 1)
++        self.assertIn("deliberate rollback failure", result["error"]["traceback"])
++        self.assertIsNotNone(document.getObject("Remaining"))
++        document.abortTransaction()
 +
 +    def test_stale_revision_does_not_execute(self):
 +        first = AnthraciteExecutor.execute("41 + 1")

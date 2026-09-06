@@ -1,9 +1,6 @@
-diff --git a/src/Mod/Anthracite/Gui/AgentBridge.cpp b/src/Mod/Anthracite/Gui/AgentBridge.cpp
-new file mode 100644
-index 0000000000..4d575ae430
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
-@@ -0,0 +1,841 @@
+@@ -0,0 +1,844 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "AgentBridge.h"
@@ -751,8 +748,11 @@ index 0000000000..4d575ae430
 +
 +QString AgentBridge::databasePath() const
 +{
-+    return QDir(QString::fromStdString(App::Application::getUserAppDataDir()))
-+        .filePath(QStringLiteral("Anthracite/anthracite.db"));
++    QString root = qEnvironmentVariable("XDG_STATE_HOME");
++    if (root.isEmpty() || !QDir::isAbsolutePath(root)) {
++        root = QDir::home().filePath(QStringLiteral(".local/state"));
++    }
++    return QDir(root).filePath(QStringLiteral("anthracite/anthracite.db"));
 +}
 +
 +QJsonObject AgentBridge::documentContext()
@@ -845,9 +845,6 @@ index 0000000000..4d575ae430
 +    queuedPrompt.clear();
 +    sidebar->failTurn(message);
 +}
-diff --git a/src/Mod/Anthracite/Gui/AgentBridge.h b/src/Mod/Anthracite/Gui/AgentBridge.h
-new file mode 100644
-index 0000000000..28ea4052c3
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.h
 @@ -0,0 +1,104 @@
@@ -955,9 +952,6 @@ index 0000000000..28ea4052c3
 +}  // namespace AnthraciteGui
 +
 +#endif  // ANTHRACITEGUI_AGENTBRIDGE_H
-diff --git a/src/Mod/Anthracite/Gui/AppAnthraciteGui.cpp b/src/Mod/Anthracite/Gui/AppAnthraciteGui.cpp
-new file mode 100644
-index 0000000000..adb099163d
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AppAnthraciteGui.cpp
 @@ -0,0 +1,62 @@
@@ -1023,12 +1017,9 @@ index 0000000000..adb099163d
 +    Base::Console().log("Loading GUI of Anthracite module... done\n");
 +    PyMOD_Return(module);
 +}
-diff --git a/src/Mod/Anthracite/Gui/CMakeLists.txt b/src/Mod/Anthracite/Gui/CMakeLists.txt
-new file mode 100644
-index 0000000000..5c5a9a5c3a
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,108 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +find_package(
@@ -1136,12 +1127,10 @@ index 0000000000..5c5a9a5c3a
 +
 +install(TARGETS AnthraciteGui DESTINATION ${CMAKE_INSTALL_LIBDIR})
 +install(PROGRAMS ${AnthraciteRuntime_BINARY} DESTINATION Mod/Anthracite)
-diff --git a/src/Mod/Anthracite/Gui/Command.cpp b/src/Mod/Anthracite/Gui/Command.cpp
-new file mode 100644
-index 0000000000..5a08d5c267
++install(FILES Resources/qml/Main.qml DESTINATION Mod/Anthracite/qml)
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Command.cpp
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,62 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include <Gui/Application.h>
@@ -1173,16 +1162,37 @@ index 0000000000..5a08d5c267
 +    return true;
 +}
 +
++DEF_STD_CMD_A(AnthraciteCmdReloadSidebar)
++
++AnthraciteCmdReloadSidebar::AnthraciteCmdReloadSidebar()
++    : Command("Anthracite_ReloadSidebar")
++{
++    sGroup = "Anthracite";
++    sMenuText = QT_TR_NOOP("Reload Anthracite UI");
++    sToolTipText = QT_TR_NOOP("Reload the local QML override while preserving the agent session");
++}
++
++void AnthraciteCmdReloadSidebar::activated(int message)
++{
++    Q_UNUSED(message);
++    AnthraciteGui::ensureSidebar()->reloadUi();
++}
++
++bool AnthraciteCmdReloadSidebar::isActive()
++{
++    return true;
++}
++
 +void CreateAnthraciteCommands()
 +{
 +    auto& commands = Gui::Application::Instance->commandManager();
 +    auto* command = new AnthraciteCmdToggleSidebar();
 +    command->initAction();
 +    commands.addCommand(command);
++    auto* reload = new AnthraciteCmdReloadSidebar();
++    reload->initAction();
++    commands.addCommand(reload);
 +}
-diff --git a/src/Mod/Anthracite/Gui/ConversationModel.cpp b/src/Mod/Anthracite/Gui/ConversationModel.cpp
-new file mode 100644
-index 0000000000..006863a0d9
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/ConversationModel.cpp
 @@ -0,0 +1,99 @@
@@ -1285,9 +1295,6 @@ index 0000000000..006863a0d9
 +    messages.at(static_cast<std::size_t>(planRow)).body = body;
 +    Q_EMIT dataChanged(index(planRow), index(planRow), {BodyRole});
 +}
-diff --git a/src/Mod/Anthracite/Gui/ConversationModel.h b/src/Mod/Anthracite/Gui/ConversationModel.h
-new file mode 100644
-index 0000000000..ddee1acec6
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/ConversationModel.h
 @@ -0,0 +1,52 @@
@@ -1343,9 +1350,6 @@ index 0000000000..ddee1acec6
 +}  // namespace AnthraciteGui
 +
 +#endif  // ANTHRACITEGUI_CONVERSATIONMODEL_H
-diff --git a/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc b/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc
-new file mode 100644
-index 0000000000..322a1fb985
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc
 @@ -0,0 +1,6 @@
@@ -1355,9 +1359,6 @@ index 0000000000..322a1fb985
 +        <file>qml/Main.qml</file>
 +    </qresource>
 +</RCC>
-diff --git a/src/Mod/Anthracite/Gui/Resources/qml/Main.qml b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-new file mode 100644
-index 0000000000..efd0a159f1
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
 @@ -0,0 +1,551 @@
@@ -1912,12 +1913,9 @@ index 0000000000..efd0a159f1
 +        anthraciteController.submit(text)
 +    }
 +}
-diff --git a/src/Mod/Anthracite/Gui/Sidebar.cpp b/src/Mod/Anthracite/Gui/Sidebar.cpp
-new file mode 100644
-index 0000000000..13b8236097
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,671 @@
+@@ -0,0 +1,709 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "Sidebar.h"
@@ -1925,6 +1923,9 @@ index 0000000000..13b8236097
 +#include "AgentBridge.h"
 +
 +#include <QDockWidget>
++#include <QDir>
++#include <QFileInfo>
++#include <QQmlError>
 +#include <QQmlContext>
 +#include <QQuickWidget>
 +#include <QUrl>
@@ -1936,6 +1937,7 @@ index 0000000000..13b8236097
 +#include <utility>
 +
 +#include <Gui/DockWindowManager.h>
++#include <Base/Console.h>
 +
 +
 +using namespace AnthraciteGui;
@@ -2532,21 +2534,55 @@ index 0000000000..13b8236097
 +    : QWidget(parent)
 +    , sidebarController(this)
 +    , agentBridge(new AgentBridge(&sidebarController, this))
-+    , quickView(new QQuickWidget(this))
++    , quickView(nullptr)
 +{
 +    setWindowTitle(tr("Anthracite"));
 +    setMinimumWidth(320);
 +
-+    quickView->setResizeMode(QQuickWidget::SizeRootObjectToView);
-+    quickView->rootContext()->setContextProperty(
++    auto* layout = new QVBoxLayout(this);
++    layout->setContentsMargins(0, 0, 0, 0);
++    reloadUi();
++}
++
++void Sidebar::reloadUi()
++{
++    QString configRoot = qEnvironmentVariable("XDG_CONFIG_HOME");
++    if (configRoot.isEmpty() || !QDir::isAbsolutePath(configRoot)) {
++        configRoot = QDir::home().filePath(QStringLiteral(".config"));
++    }
++    const QString overridePath = QDir(configRoot)
++        .filePath(QStringLiteral("anthracite/qml/Main.qml"));
++    QUrl source = QFileInfo::exists(overridePath)
++        ? QUrl::fromLocalFile(overridePath)
++        : QUrl(QStringLiteral("qrc:/Anthracite/qml/Main.qml"));
++    auto* replacement = new QQuickWidget(this);
++    replacement->setResizeMode(QQuickWidget::SizeRootObjectToView);
++    replacement->rootContext()->setContextProperty(
 +        QStringLiteral("anthraciteController"),
 +        &sidebarController
 +    );
-+    quickView->setSource(QUrl(QStringLiteral("qrc:/Anthracite/qml/Main.qml")));
-+
-+    auto* layout = new QVBoxLayout(this);
-+    layout->setContentsMargins(0, 0, 0, 0);
-+    layout->addWidget(quickView);
++    replacement->setSource(source);
++    if (replacement->status() != QQuickWidget::Ready) {
++        for (const auto& error : replacement->errors()) {
++            Base::Console().error("Anthracite QML: %s\n", error.toString().toUtf8().constData());
++        }
++        if (!quickView && source.isLocalFile()) {
++            source = QUrl(QStringLiteral("qrc:/Anthracite/qml/Main.qml"));
++            replacement->setSource(source);
++        }
++        if (quickView || replacement->status() != QQuickWidget::Ready) {
++            delete replacement;
++            return;
++        }
++    }
++    if (quickView) {
++        layout()->removeWidget(quickView);
++        delete quickView;
++    }
++    quickView = replacement;
++    layout()->addWidget(quickView);
++    setProperty("anthraciteQmlSource", source.toString());
++    Base::Console().message("Anthracite QML source: %s\n", source.toString().toUtf8().constData());
 +}
 +
 +Sidebar::~Sidebar()
@@ -2589,12 +2625,9 @@ index 0000000000..13b8236097
 +{
 +    return ensureSidebar()->controller();
 +}
-diff --git a/src/Mod/Anthracite/Gui/Sidebar.h b/src/Mod/Anthracite/Gui/Sidebar.h
-new file mode 100644
-index 0000000000..ac4872061b
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,186 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_SIDEBAR_H
@@ -2767,6 +2800,7 @@ index 0000000000..ac4872061b
 +    explicit Sidebar(QWidget* parent = nullptr);
 +    ~Sidebar() override;
 +    SidebarController* controller();
++    void reloadUi();
 +
 +private:
 +    SidebarController sidebarController;
@@ -2780,13 +2814,14 @@ index 0000000000..ac4872061b
 +}  // namespace AnthraciteGui
 +
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
-diff --git a/src/Mod/Anthracite/TestAnthraciteGui.py b/src/Mod/Anthracite/TestAnthraciteGui.py
-new file mode 100644
-index 0000000000..ede4cf8a06
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,115 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
++
++import os
++from pathlib import Path
++import tempfile
 +
 +import FreeCAD as App
 +import FreeCADGui as Gui
@@ -2831,6 +2866,27 @@ index 0000000000..ede4cf8a06
 +        raise AssertionError("Anthracite QML does not expose context-window usage.")
 +    if root.findChild(QtCore.QObject, "AnthraciteProviderPicker") is None:
 +        raise AssertionError("Anthracite QML does not expose the provider picker.")
++
++    controller = quick_widget.rootContext().contextProperty("anthraciteController")
++    Gui.runCommand("Anthracite_ReloadSidebar")
++    quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
++    if quick_widget.rootContext().contextProperty("anthraciteController") != controller:
++        raise AssertionError("Reload replaced the live controller.")
++    previous_config = os.environ.get("XDG_CONFIG_HOME")
++    try:
++        with tempfile.TemporaryDirectory() as directory:
++            os.environ["XDG_CONFIG_HOME"] = directory
++            qml = Path(directory) / "anthracite/qml/Main.qml"
++            qml.parent.mkdir(parents=True)
++            qml.write_text("this is invalid QML", encoding="utf-8")
++            Gui.runCommand("Anthracite_ReloadSidebar")
++            if dock.findChild(QtQuickWidgets.QQuickWidget) != quick_widget:
++                raise AssertionError("Invalid QML replaced the working sidebar.")
++    finally:
++        if previous_config is None:
++            os.environ.pop("XDG_CONFIG_HOME", None)
++        else:
++            os.environ["XDG_CONFIG_HOME"] = previous_config
 +
 +    render_document = App.newDocument("AnthraciteRender")
 +    render_result = AnthraciteExecutor.execute(

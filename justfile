@@ -6,7 +6,7 @@ patch_dir := root / "patches"
 series_file := patch_dir / "series"
 pin_file := root / "freecad_commit.txt"
 repo_file := root / "freecad_repo.txt"
-profile_dir := root / "build/profile"
+build_dir := root / "build/native"
 
 # List the available workflow commands.
 default:
@@ -14,51 +14,34 @@ default:
 
 # Configure the pinned FreeCAD source for a debug development build.
 configure: _require-source
-    cd "{{ source_dir }}" && pixi run configure-debug
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(uname -s)" != Linux ]]; then
+        printf '%s\n' 'The complete Nix FreeCAD dependency set currently supports Linux only.' >&2
+        exit 1
+    fi
+    nix develop --command bash -c 'cmake -S "$1" -B "$2" -G Ninja ${cmakeFlags:-} -DCMAKE_BUILD_TYPE=Debug -DBUILD_ANTHRACITE=ON' _ "{{ source_dir }}" "{{ build_dir }}"
 
 # Build the complete FreeCAD application and every configured workbench.
 build: _require-source
     #!/usr/bin/env bash
     set -euo pipefail
-    build_directory="{{ source_dir }}/build/debug"
-    cmake="{{ source_dir }}/.pixi/envs/default/bin/cmake"
-    if [[ ! -f "$build_directory/CMakeCache.txt" || ! -x "$cmake" ]]; then
+    build_directory="{{ build_dir }}"
+    if [[ ! -f "$build_directory/CMakeCache.txt" ]]; then
         printf '%s\n' "Anthracite is not configured; run \`just configure\` first." >&2
         exit 1
     fi
-    "$cmake" --build "$build_directory" --parallel "${JOBS:-10}"
+    nix develop --command cmake --build "$build_directory" --parallel "${JOBS:-10}"
 
-# Build and launch full FreeCAD with a writable, persistent Anthracite profile.
-run: build
+# Launch the existing native build. Building is an explicit separate action.
+run:
     #!/usr/bin/env bash
     set -euo pipefail
-    executable="{{ source_dir }}/build/debug/bin/FreeCAD"
-    defaults="{{ source_dir }}/build/debug/Mod/Anthracite/AnthraciteDefaults.cfg"
-    user_parameters="{{ profile_dir }}/user.cfg"
-    defaults_version='Name="DefaultsVersion" Value="1"'
+    executable="{{ build_dir }}/bin/FreeCAD"
     if [[ ! -x "$executable" ]]; then
-        printf '%s\n' "The complete Anthracite build did not produce FreeCAD." >&2
+        printf '%s\n' "Run just configure and just build, or use nix run for the packaged app." >&2
         exit 1
     fi
-    if [[ ! -r "$defaults" ]]; then
-        printf 'Anthracite defaults are missing: %s\n' "$defaults" >&2
-        exit 1
-    fi
-    mkdir -p "{{ profile_dir }}"
-    if [[ ! -f "$user_parameters" ]] || ! grep -Fq "$defaults_version" "$user_parameters"; then
-        if [[ -f "$user_parameters" ]]; then
-            backup="$user_parameters.before-anthracite-defaults-v1"
-            if [[ ! -e "$backup" ]]; then
-                cp -p "$user_parameters" "$backup"
-            fi
-            printf 'Applying Anthracite defaults; previous profile saved to %s\n' "$backup"
-        else
-            printf '%s\n' "Applying Anthracite defaults to the new development profile."
-        fi
-        cp "$defaults" "$user_parameters"
-    fi
-    export FREECAD_USER_HOME="{{ profile_dir }}"
-    export QSG_RHI_BACKEND="opengl"
 
     supervise_app() (
         set +m
@@ -74,7 +57,7 @@ run: build
         # Keep terminal SIGINT out of FreeCAD's embedded Python, then translate
         # it into a normal process termination from this development launcher.
         trap '' INT
-        "$executable" &
+        nix develop --command bash "{{ root }}/devutils/launch.sh" "$executable" &
         app_pid=$!
         trap stop_app INT TERM
 
@@ -98,7 +81,7 @@ doctor:
     #!/usr/bin/env bash
     set -euo pipefail
     failed=0
-    for command_name in git just pixi quilt; do
+    for command_name in nix git just quilt cmake ninja cargo rustc; do
         if command -v "$command_name" >/dev/null 2>&1; then
             printf '%-8s %s\n' "$command_name" "$(command -v "$command_name")"
         else
@@ -159,6 +142,7 @@ setup reference="":
 
     git clone "${clone_arguments[@]}" "$upstream_url" "{{ source_dir }}"
     git -C "{{ source_dir }}" checkout --detach "$upstream_commit"
+    git -C "{{ source_dir }}" submodule update --init --recursive
     printf 'Materialized FreeCAD %s in %s\n' "$upstream_commit" "{{ source_dir }}"
 
 # Show the pinned upstream, source-tree state, and Quilt stack.

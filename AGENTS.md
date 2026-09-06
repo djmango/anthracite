@@ -80,6 +80,9 @@ just validate
   add T3 Code's project registry, worktrees, or simultaneous project sessions.
 - Expose one CAD-specific model tool:
   `freecad(<ordinary FreeCAD Python source>)`.
+- Treat the agent as an operator of a checked Python executor. Follow the user's design
+  intent; do not silently invent requirements or equate successful recompute with design
+  correctness. Ground success claims in executor observations and explicit checks.
 - Python is the model's compositional action language. Prefer FreeCAD document
   and workbench APIs, then registered GUI commands, then thin helpers.
 - Do not replace FreeCAD with hundreds of per-operation JSON tools, a custom CAD
@@ -93,6 +96,12 @@ just validate
 
 ## Technology boundaries
 
+- Nix owns native build/runtime dependencies: OCCT, Qt, Python and its modules,
+  Rust, and compiler tooling. Keep them explicit in the flake/package definition;
+  do not depend on a Pixi environment or undeclared host libraries.
+- Keep mutable configuration, session state, and local UI overrides under XDG paths.
+  Launching or changing a dock must not require rebuilding FreeCAD. Local overrides
+  must be identifiable and reloadable; native/executor changes still require checks.
 - Use Rust whenever the work is naturally self-contained and doing so does not
   make the FreeCAD patch stack harder to maintain.
 - Rust should own provider processes and protocol normalization, session/event
@@ -111,6 +120,10 @@ just validate
 
 ## Reference repositories
 
+- [Autolith](https://github.com/lambda-symbolics/autolith): inspectable live state,
+  XDG storage, explicit runtime provenance, and a separation between packaged code
+  and local changes. Apply those principles to FreeCAD's native runtime; Python
+  actions remain checked calls into real CAD APIs, not a replacement CAD language.
 - [FreeCAD](https://github.com/FreeCAD/FreeCAD): upstream application, source
   conventions, module system, Python APIs, transactions, commands, Qt/QML
   integration, and build/test patterns. Follow native FreeCAD patterns before

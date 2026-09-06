@@ -3154,13 +3154,13 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/store.rs
-@@ -0,0 +1,772 @@
+@@ -0,0 +1,805 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use serde_json::{Value, json};
 +use sha2::{Digest, Sha256};
-+use std::fs::File;
-+use std::io::Read;
++use std::fs::{File, OpenOptions};
++use std::io::{Read, Write};
 +use std::path::{Path, PathBuf};
 +use std::time::{SystemTime, UNIX_EPOCH};
 +use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
@@ -3273,6 +3273,7 @@
 +    document_id: String,
 +    thread_id: String,
 +    provider: String,
++    event_log: PathBuf,
 +}
 +
 +impl Store {
@@ -3312,6 +3313,7 @@
 +            document_id: String::new(),
 +            thread_id: String::new(),
 +            provider: provider.to_owned(),
++            event_log: path.with_extension("events.jsonl"),
 +        };
 +        store.document_id = store.resolve_document(document)?;
 +        store.thread_id = store.resolve_thread(requested_thread_id, create_thread)?;
@@ -3658,6 +3660,7 @@
 +    }
 +
 +    pub fn record(&self, event_type: &str, payload: &Value) -> Result<(), String> {
++        let timestamp = now_ms();
 +        let turn_id = payload
 +            .get("turnId")
 +            .and_then(Value::as_str)
@@ -3672,10 +3675,32 @@
 +                    turn_id,
 +                    event_type,
 +                    payload.to_string(),
-+                    now_ms()
++                    timestamp
 +                ],
 +            ))
 +            .map_err(|error| error.to_string())?;
++        // A readable live projection; Turso remains authoritative for recovery.
++        // Projection failure must not turn a committed event into an apparent failure.
++        let record = json!({
++            "threadId": self.thread_id,
++            "documentId": self.document_id,
++            "provider": self.provider,
++            "type": event_type,
++            "timestampMs": timestamp,
++            "payload": payload,
++        });
++        let mut options = OpenOptions::new();
++        options.create(true).append(true);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::OpenOptionsExt;
++            options.mode(0o600);
++        }
++        if let Err(error) = options.open(&self.event_log).and_then(|mut file| {
++            file.write_all(format!("{record}\n").as_bytes())
++        }) {
++            eprintln!("Anthracite event projection {}: {error}", self.event_log.display());
++        }
 +        if event_type == "content.user"
 +            && let Some(text) = payload.get("text").and_then(Value::as_str)
 +        {
@@ -3780,6 +3805,14 @@
 +            )
 +            .unwrap();
 +        drop(store);
++
++        let projection = std::fs::read_to_string(database_path.with_extension("events.jsonl"))
++            .unwrap();
++        let records: Vec<Value> = projection.lines()
++            .map(|line| serde_json::from_str(line).unwrap()).collect();
++        assert_eq!(records.len(), 2);
++        assert_eq!(records[0]["threadId"], first_thread);
++        assert_eq!(records[0]["payload"]["text"], "Make a bracket");
 +
 +        let reopened = Store::open(
 +            database_path.to_str().unwrap(),
