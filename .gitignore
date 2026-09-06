@@ -13,7 +13,9 @@
 !README.md
 !freecad_commit.txt
 !freecad_repo.txt
-!shell.nix
+!flake.nix
+!flake.lock
+!.envrc
 !devutils/quilt-env.sh
 
 !patches/*.patch

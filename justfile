@@ -108,7 +108,7 @@ doctor:
     done
     printf '%-8s %s\n' "pin" "$(tr -d '[:space:]' < "{{ pin_file }}")"
     if (( failed != 0 )); then
-        printf '\nEnter `nix-shell` or install the missing commands.\n' >&2
+        printf '\nEnter `nix develop` or install the missing commands.\n' >&2
         exit 1
     fi
 
@@ -181,7 +181,7 @@ status:
         printf '\nUnapplied patches:\n'
         quilt unapplied 2>/dev/null || printf '%s\n' "(none)"
     else
-        printf '\nQuilt is missing; enter `nix-shell` for patch-stack status.\n'
+        printf '\nQuilt is missing; enter `nix develop` for patch-stack status.\n'
     fi
 
 # Apply every currently unapplied patch.
@@ -397,6 +397,6 @@ _require-source:
 _require-quilt:
     #!/usr/bin/env bash
     if ! command -v quilt >/dev/null 2>&1; then
-        printf '%s\n' "Quilt is missing; enter \`nix-shell\` first." >&2
+        printf '%s\n' "Quilt is missing; enter \`nix develop\` first." >&2
         exit 1
     fi

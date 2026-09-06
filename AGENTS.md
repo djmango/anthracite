@@ -33,7 +33,7 @@ an implementation only in that ignored tree.
 Use GNU Quilt through the `justfile`:
 
 ```sh
-nix-shell                 # when Quilt is not already available
+nix develop               # or automatic activation through direnv
 just doctor
 just setup                # materialize the pinned FreeCAD source
 just push                 # apply the existing series

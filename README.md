@@ -109,7 +109,11 @@ proven integration gaps.
 <details>
 <summary><strong>development</strong></summary>
 
-- `nix-shell` enters the Quilt development environment
+With Nix flakes enabled, run `nix develop`, or run `direnv allow` once for automatic
+activation through direnv's `use flake` integration. `flake.lock` pins the workflow tools;
+FreeCAD's upstream Pixi environment supplies its build dependencies.
+
+- `nix develop` enters the pinned Git, Just, Quilt, and Pixi environment
 - `just setup` materializes the pinned FreeCAD source
 - `just push` applies the current patch series
 - `just patch-edit sidebar` makes an existing semantic patch current
