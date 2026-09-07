@@ -116,6 +116,16 @@ The interaction standard is low acknowledgement latency and continuous, understa
   passing tests alone does not establish that the sidebar feels good. The 100 ms target is an
   acceptance goal, not a measured guarantee of the current implementation.
 
+Send/Sending/Stop share one fixed-size control. History and activity requests acknowledge loading
+and suppress duplicate clicks. Explicit Latest navigation and activity expansion use short,
+interruptible easing; settings and image overlays fade without delaying selection state.
+On macOS, motion follows the native accessibility preference; elsewhere it follows the Qt style's
+animation hint. `ReduceMotion=true` under `BaseApp/Preferences/Mod/Anthracite` disables Anthracite
+motion on either platform. It is re-read when opening overlays, navigating Latest, and returning
+to the application. Tests write rendered-frame acknowledgement samples to
+`build/test-results/interaction-latency.json`; these are not display-scanout measurements or a
+guarantee during blocking native CAD execution.
+
 Long prompts and individual work entries expand on demand. History arrives in 60-message pages,
 with work details in 20-entry pages and bounded render thumbnails. Paging changes only the chat
 view, never the CAD document or its undo history. Rust still reconstructs the conversation from

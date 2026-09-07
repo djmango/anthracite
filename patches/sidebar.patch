@@ -81,7 +81,7 @@
 +    : QObject(parent)
 +    , sidebar(controller)
 +{
-+    connect(sidebar, &SidebarController::promptSubmitted, this, &AgentBridge::submit);
++    connect(sidebar, &SidebarController::promptSubmitted, this, &AgentBridge::submit, Qt::QueuedConnection);
 +    connect(qobject_cast<ConversationModel*>(sidebar->messages()), &ConversationModel::earlierRequested,
 +            this, [this](const QString& before) {
 +                send(QStringLiteral("timeline.earlier"), {{"before", before}});
@@ -1179,7 +1179,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,115 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +find_package(
@@ -1256,6 +1256,13 @@
 +)
 +
 +add_library(AnthraciteGui SHARED ${AnthraciteGui_SRCS})
++if(APPLE)
++    # Keep Objective-C++ local; enabling another project-wide language from a
++    # module changes how upstream's unrelated .mm sources are generated.
++    set_source_files_properties(MotionMac.mm PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x objective-c++")
++    target_sources(AnthraciteGui PRIVATE MotionMac.mm)
++    target_link_libraries(AnthraciteGui PRIVATE "-framework AppKit")
++endif()
 +target_compile_definitions(AnthraciteGui PRIVATE ANTHRACITE_QML_VERSION="${AnthraciteQml_VERSION}")
 +add_dependencies(AnthraciteGui AnthraciteRuntime)
 +
@@ -1355,7 +1362,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/ConversationModel.cpp
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,187 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "ConversationModel.h"
@@ -1420,16 +1427,32 @@
 +
 +void ConversationModel::loadEarlier()
 +{
-+    if (!earlier || messages.empty()) return;
-+    earlier = false;
++    if (!earlier || earlierLoading || messages.empty()) return;
++    earlierLoading = true;
 +    Q_EMIT historyChanged();
++    const auto token = ++requestSequence;
++    requestTokens[QString()] = token;
++    QTimer::singleShot(10000, this, [this, token]() {
++        if (requestTokens.value(QString()) != token || !earlierLoading) return;
++        earlierLoading = false;
++        Q_EMIT historyChanged();
++    });
 +    Q_EMIT earlierRequested(idAt(0));
 +}
 +
 +void ConversationModel::loadDetails(const QString& id)
 +{
 +    const int row = indexOfId(id);
-+    if (row < 0) return;
++    if (row < 0 || detailStates.value(id) == QStringLiteral("loading")) return;
++    detailStates[id] = QStringLiteral("loading");
++    Q_EMIT historyChanged();
++    const auto token = ++requestSequence;
++    requestTokens[id] = token;
++    QTimer::singleShot(10000, this, [this, id, token]() {
++        if (requestTokens.value(id) != token || detailStates.value(id) != QStringLiteral("loading")) return;
++        detailStates[id] = QStringLiteral("retry");
++        Q_EMIT historyChanged();
++    });
 +    Q_EMIT detailsRequested(id, messages[row].value("entries").toList().size());
 +}
 +
@@ -1452,10 +1475,14 @@
 +    // Structural edits must not leave delayed signals addressing old row indices.
 +    if (operation != QLatin1String("update")) flushChanges();
 +    if (edit.contains("hasEarlier") || operation == QLatin1String("reset")) {
++        earlierLoading = false;
 +        earlier = edit.value("hasEarlier").toBool();
 +        Q_EMIT historyChanged();
 +    }
 +    if (operation == QLatin1String("reset")) {
++        detailStates.clear();
++        requestTokens.clear();
++        Q_EMIT historyChanged();
 +        beginResetModel();
 +        messages.clear();
 +        for (const auto& row : edit.value("rows").toList()) {
@@ -1478,6 +1505,9 @@
 +        auto entries = messages[row].value("entries").toList();
 +        // Duplicate or stale page responses must not duplicate activity.
 +        if (entries.size() != edit.value("offset").toInt()) return;
++        detailStates.remove(edit.value("id").toString());
++        requestTokens.remove(edit.value("id").toString());
++        Q_EMIT historyChanged();
 +        entries.append(edit.value("entries").toList());
 +        messages[row]["entries"] = entries;
 +        Q_EMIT dataChanged(index(row), index(row), {EntriesRole});
@@ -1522,7 +1552,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/ConversationModel.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,71 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_CONVERSATIONMODEL_H
@@ -1541,6 +1571,8 @@
 +{
 +    Q_OBJECT
 +    Q_PROPERTY(bool hasEarlier READ hasEarlier NOTIFY historyChanged)
++    Q_PROPERTY(QVariantMap detailRequests READ detailRequests NOTIFY historyChanged)
++    Q_PROPERTY(bool loadingEarlier READ loadingEarlier NOTIFY historyChanged)
 +
 +public:
 +    enum Role
@@ -1565,6 +1597,8 @@
 +    void clear();
 +    Q_INVOKABLE void apply(const QVariantMap& edit);
 +    bool hasEarlier() const { return earlier; }
++    QVariantMap detailRequests() const { return detailStates; }
++    bool loadingEarlier() const { return earlierLoading; }
 +    Q_INVOKABLE int indexOfId(const QString& id) const;
 +    Q_INVOKABLE QString idAt(int row) const;
 +    Q_INVOKABLE QString kindAt(int row) const;
@@ -1582,6 +1616,10 @@
 +    QMap<int, QList<int>> pendingRoles;
 +    std::vector<QVariantMap> messages;
 +    bool earlier = false;
++    bool earlierLoading = false;
++    QVariantMap detailStates;
++    QMap<QString, quint64> requestTokens;
++    quint64 requestSequence = 0;
 +};
 +}  // namespace AnthraciteGui
 +
@@ -1606,7 +1644,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,829 @@
+@@ -0,0 +1,913 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
@@ -1616,12 +1654,41 @@
 +
 +Pane {
 +    id: root
++    property bool reducedMotion: true
++    onReducedMotionChanged: {
++        if (reducedMotion && latestMotion && latestMotion.running) {
++            latestMotion.stop()
++            timeline.latest()
++        }
++    }
++    property string pendingThreadId: ""
++    function refreshMotion() {
++        reducedMotion = anthraciteController.reducedMotion()
++    }
++    Component.onCompleted: refreshMotion()
++    Connections {
++        target: Qt.application
++        function onStateChanged() { root.refreshMotion() }
++    }
++    Connections {
++        target: anthraciteController
++        function onThreadsChanged() {
++            if (root.pendingThreadId === anthraciteController.currentThreadId
++                || (root.pendingThreadId === "new" && anthraciteController.currentThreadId.length))
++                root.pendingThreadId = ""
++        }
++        function onStatusChanged() {
++            if (anthraciteController.status === "Error") root.pendingThreadId = ""
++        }
++    }
 +
 +    padding: 0
 +    Transcript.AgentSettings {
 +        id: agentSettings
 +        controller: anthraciteController
 +        returnFocus: agentSettingsButton
++        reducedMotion: root.reducedMotion
++        onOpening: root.refreshMotion()
 +    }
 +
 +    Popup {
@@ -1632,6 +1699,11 @@
 +        width: parent.width * 0.95
 +        height: parent.height * 0.9
 +        modal: true
++        focus: true
++        opacity: 0
++        onAboutToShow: root.refreshMotion()
++        enter: Transition { NumberAnimation { property: "opacity"; to: 1; duration: root.reducedMotion ? 0 : 120; easing.type: Easing.OutCubic } }
++        exit: Transition { NumberAnimation { property: "opacity"; to: 0; duration: root.reducedMotion ? 0 : 90; easing.type: Easing.OutCubic } }
 +        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 +        ScrollView {
 +            anchors.fill: parent
@@ -1640,10 +1712,18 @@
 +            contentHeight: previewImage.height
 +            Image {
 +                id: previewImage
-+                source: imagePreview.imageSource
++                source: imagePreview.visible ? imagePreview.imageSource : ""
++                asynchronous: true
 +                width: sourceSize.width
 +                height: sourceSize.height
 +            }
++        }
++        Label {
++            anchors.centerIn: parent
++            visible: previewImage.status === Image.Loading || previewImage.status === Image.Error
++            text: previewImage.status === Image.Error ? qsTr("Image could not be loaded. Close and reopen the preview to retry.") : qsTr("Loading image…")
++            width: parent.width - 32
++            wrapMode: Text.WordWrap
 +        }
 +        Button {
 +            anchors.right: parent.right
@@ -1689,11 +1769,14 @@
 +                        Layout.fillWidth: true
 +                        model: anthraciteController.threads
 +                        textRole: "title"
-+                        enabled: !anthraciteController.busy && !anthraciteController.processingAttachments && count > 0
++                        enabled: !root.pendingThreadId.length && !anthraciteController.busy && !anthraciteController.processingAttachments && count > 0
++                        displayText: root.pendingThreadId === "new" ? qsTr("Creating conversation…")
++                            : root.pendingThreadId.length ? qsTr("Opening %1…").arg(currentText) : currentText
 +
 +                        currentIndex: {
 +                            for (let index = 0; index < count; ++index) {
-+                                if (model[index].id === anthraciteController.currentThreadId) {
++                                if (model[index].id === (root.pendingThreadId.length && root.pendingThreadId !== "new"
++                                    ? root.pendingThreadId : anthraciteController.currentThreadId)) {
 +                                    return index
 +                                }
 +                            }
@@ -1701,6 +1784,8 @@
 +                        }
 +
 +                        onActivated: function(index) {
++                            if (model[index].id === anthraciteController.currentThreadId) return
++                            root.pendingThreadId = model[index].id
 +                            anthraciteController.selectThread(model[index].id)
 +                        }
 +                    }
@@ -1709,10 +1794,10 @@
 +                        id: newThreadButton
 +                        objectName: "AnthraciteNewThread"
 +                        text: "+"
-+                        enabled: !anthraciteController.busy && !anthraciteController.processingAttachments
++                        enabled: !root.pendingThreadId.length && !anthraciteController.busy && !anthraciteController.processingAttachments
 +                        ToolTip.visible: hovered
 +                        ToolTip.text: qsTr("New conversation")
-+                        onClicked: anthraciteController.newThread()
++                        onClicked: { root.pendingThreadId = "new"; anthraciteController.newThread() }
 +                    }
 +                }
 +            }
@@ -1757,6 +1842,7 @@
 +                if (item) { anchorId = item.rowId; anchorOffset = item.y - contentY }
 +            }
 +            function pauseAt(item) {
++                latestMotion.stop()
 +                scrollMode = "reading"
 +                pendingTurn = false
 +                anchorId = item.rowId
@@ -1768,6 +1854,7 @@
 +                expandedEntries = state
 +            }
 +            function navigate() {
++                latestMotion.stop()
 +                userScrolling = true
 +                gestureEnd.restart()
 +                scrollMode = "reading"
@@ -1775,18 +1862,25 @@
 +                // Keep the reserved space during a gesture; removing it clamps the viewport.
 +                settle.stop()
 +            }
-+            function latest() {
++            function latest() { jumpLatest(false) }
++            function jumpLatest(animate) {
++                latestMotion.stop()
 +                userScrolling = false
 +                gestureEnd.stop()
 +                scrollMode = "following"
 +                newTurnId = ""
-+                positionViewAtEnd()
++                root.refreshMotion()
++                forceLayout()
++                if (animate && !root.reducedMotion) {
++                    latestMotion.to = Math.max(originY, originY + contentHeight - height)
++                    latestMotion.start()
++                } else positionViewAtEnd()
 +            }
 +            function schedule() {
-+                if (!moving && !userScrolling && !settling && !settle.running) settle.start()
++                if (!moving && !userScrolling && !settling && !latestMotion.running && !settle.running) settle.start()
 +            }
 +            function reconcile() {
-+                if (moving || userScrolling) return
++                if (moving || userScrolling || latestMotion.running) return
 +                settling = true
 +                if (scrollMode === "following") {
 +                    positionViewAtEnd()
@@ -1823,6 +1917,15 @@
 +            onWidthChanged: schedule()
 +            onCountChanged: schedule()
 +            Timer { id: settle; interval: 16; onTriggered: timeline.reconcile() }
++            NumberAnimation {
++                id: latestMotion
++                objectName: "AnthraciteLatestMotion"
++                target: timeline
++                property: "contentY"
++                duration: 180
++                easing.type: Easing.OutCubic
++                onFinished: timeline.schedule()
++            }
 +            Timer {
 +                id: gestureEnd
 +                interval: 150
@@ -1863,7 +1966,8 @@
 +                objectName: "loadEarlier"
 +                visible: anthraciteController.messages.hasEarlier
 +                height: visible ? implicitHeight : 0
-+                text: qsTr("Load earlier messages")
++                text: anthraciteController.messages.loadingEarlier ? qsTr("Loading earlier messages…") : qsTr("Load earlier messages")
++                enabled: !anthraciteController.messages.loadingEarlier
 +                onClicked: { timeline.navigate(); timeline.remember(); anthraciteController.messages.loadEarlier() }
 +            }
 +            footer: Item {
@@ -1878,7 +1982,7 @@
 +                z: 2
 +                visible: timeline.scrollMode === "reading" && !timeline.atYEnd && !latestDelay.running
 +                text: qsTr("↓ Latest")
-+                onClicked: timeline.latest()
++                onClicked: timeline.jumpLatest(true)
 +            }
 +
 +            delegate: Item {
@@ -1941,21 +2045,38 @@
 +                            }
 +                        }
 +
-+                        Repeater {
-+                            model: isWork && activityExpanded ? entries : []
-+                            delegate: Transcript.ActivityEntry {
-+                                width: messageColumn.width
-+                                entry: modelData
-+                                expanded: timeline.expandedEntries[modelData.id] || false
-+                                onToggle: timeline.toggleEntry(modelData.id)
-+                                onResizing: timeline.pauseAt(timelineRow)
-+                                onPreview: function(source) { imagePreview.imageSource = source; imagePreview.open() }
++                        Item {
++                            id: workDetails
++                            property real reveal: activityExpanded ? 1 : 0
++                            width: parent.width
++                            height: reveal * detailColumn.implicitHeight
++                            clip: true
++                            // Animate the user's toggle, not every arriving token
++                            // or detail page changing the expanded content height.
++                            Behavior on reveal { NumberAnimation { duration: root.reducedMotion ? 0 : 140; easing.type: Easing.OutCubic } }
++                            Column {
++                                id: detailColumn
++                                width: parent.width
++                                spacing: 5
++                                Repeater {
++                                    model: isWork && (activityExpanded || workDetails.reveal > 0) ? entries : []
++                                    delegate: Transcript.ActivityEntry {
++                                        width: messageColumn.width
++                                        entry: modelData
++                                        expanded: timeline.expandedEntries[modelData.id] || false
++                                        onToggle: timeline.toggleEntry(modelData.id)
++                                        onResizing: timeline.pauseAt(timelineRow)
++                                        onPreview: function(source) { imagePreview.imageSource = source; imagePreview.open() }
++                                    }
++                                }
++                                Button {
++                                    visible: isWork && activityExpanded && entryCount > entries.length
++                                    text: anthraciteController.messages.detailRequests[rowId] === "loading" ? qsTr("Loading activity…")
++                                        : anthraciteController.messages.detailRequests[rowId] === "retry" ? qsTr("Activity hasn’t arrived · Retry") : qsTr("Show more activity")
++                                    enabled: anthraciteController.messages.detailRequests[rowId] !== "loading"
++                                    onClicked: { timeline.pauseAt(timelineRow); anthraciteController.messages.loadDetails(rowId) }
++                                }
 +                            }
-+                        }
-+                        Button {
-+                            visible: isWork && activityExpanded && entryCount > entries.length
-+                            text: qsTr("Show more activity")
-+                            onClicked: { timeline.pauseAt(timelineRow); anthraciteController.messages.loadDetails(rowId) }
 +                        }
 +
 +                        Rectangle {
@@ -2406,17 +2527,18 @@
 +                    }
 +
 +                    Button {
-+                        visible: anthraciteController.busy
-+                        text: qsTr("Stop")
-+                        onClicked: anthraciteController.stop()
-+                    }
-+
-+                    Button {
-+                        visible: !anthraciteController.busy
-+                        text: qsTr("Send")
-+                        highlighted: true
-+                        enabled: !anthraciteController.processingAttachments && (anthraciteController.draft.trim().length > 0 || anthraciteController.attachments.length > 0)
-+                        onClicked: send()
++                        id: submitButton
++                        objectName: "AnthraciteSubmitButton"
++                        Layout.preferredWidth: 112
++                        text: anthraciteController.submitting ? qsTr("Sending…")
++                            : anthraciteController.status === "Stopping" ? qsTr("Stopping…")
++                            : anthraciteController.busy ? qsTr("Stop") : qsTr("Send")
++                        highlighted: !anthraciteController.busy
++                        enabled: !root.pendingThreadId.length && !anthraciteController.submitting
++                            && anthraciteController.status !== "Stopping"
++                            && (anthraciteController.busy || (!anthraciteController.processingAttachments
++                                && (anthraciteController.draft.trim().length > 0 || anthraciteController.attachments.length > 0)))
++                        onClicked: { if (anthraciteController.busy) anthraciteController.stop(); else send() }
 +                    }
 +                }
 +            }
@@ -2438,7 +2560,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,946 @@
+@@ -0,0 +1,962 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "Sidebar.h"
@@ -2447,6 +2569,8 @@
 +
 +#include <QDockWidget>
 +#include <QApplication>
++#include <QStyle>
++#include <App/Application.h>
 +#include <QClipboard>
 +#include <QQmlAbstractUrlInterceptor>
 +#include <QMimeData>
@@ -2483,6 +2607,9 @@
 +
 +
 +using namespace AnthraciteGui;
++#ifdef Q_OS_MACOS
++extern bool anthraciteSystemReducedMotion();
++#endif
 +
 +namespace {
 +// Reproducible RCC timestamps cannot invalidate Qt's disk cache. Give only our
@@ -2548,6 +2675,17 @@
 +bool SidebarController::busy() const
 +{
 +    return turnBusy;
++}
++
++bool SidebarController::reducedMotion() const
++{
++    const auto preferences = App::GetApplication().GetParameterGroupByPath(
++        "User parameter:BaseApp/Preferences/Mod/Anthracite");
++    if (preferences->GetBool("ReduceMotion", false)) return true;
++#ifdef Q_OS_MACOS
++    if (anthraciteSystemReducedMotion()) return true;
++#endif
++    return qApp->style()->styleHint(QStyle::SH_Widget_Animation_Duration) == 0;
 +}
 +
 +bool SidebarController::interactionPending() const
@@ -3387,7 +3525,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,231 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_SIDEBAR_H
@@ -3463,6 +3601,7 @@
 +    QVariantList attachments() const { return currentAttachments; }
 +    bool picking() const { return pickActive; }
 +    bool processingAttachments() const { return pendingAttachments > 0; }
++    Q_INVOKABLE bool reducedMotion() const;
 +    Q_INVOKABLE bool pasteAttachments();
 +    Q_INVOKABLE void attachFiles();
 +    Q_INVOKABLE void attachFile(const QString& path);
@@ -3620,7 +3759,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,623 @@
+@@ -0,0 +1,768 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -3641,6 +3780,11 @@
 +
 +
 +def run_agent_settings_test(quick_widget, root, dock):
++    preferences = App.ParamGet('User parameter:BaseApp/Preferences/Mod/Anthracite')
++    original_motion = preferences.GetBool('ReduceMotion', False)
++    preferences.SetBool('ReduceMotion', True)
++    root.refreshMotion()
++    assert root.property('reducedMotion')
 +    settings = root.findChild(QtCore.QObject, 'AnthraciteAgentSettings')
 +    assert settings is not None
 +    original_width = root.property('width')
@@ -3678,6 +3822,35 @@
 +        quick_widget.setFocus()
 +        quick_widget.setFixedWidth(320)
 +        button = root.findChild(QtCore.QObject, 'AnthraciteAgentSettingsButton')
++        QtTest.QTest.qWait(100)
++        latencies = []
++        frames = []
++        def rendered():
++            frames.append(time.monotonic())
++        window = quick_widget.quickWindow()
++        window.afterRendering.connect(rendered)
++        try:
++            point = button.mapToScene(QtCore.QPointF(button.width() / 2, button.height() / 2)).toPoint()
++            for _ in range(5):
++                frames.clear()
++                pressed_at = time.monotonic()
++                QtTest.QTest.mousePress(quick_widget, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
++                assert button.property('down'), 'Pressed state did not acknowledge input synchronously'
++                QtTest.QTest.qWait(100)
++                assert frames, 'Pressed control did not produce a rendered frame'
++                latencies.append((frames[0] - pressed_at) * 1000)
++                QtTest.QTest.mouseRelease(quick_widget, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
++                assert settings.property('visible'), 'Popup did not acknowledge release'
++                evaluate('close()')
++                QtTest.QTest.qWait(120)
++        finally:
++            window.afterRendering.disconnect(rendered)
++        report = {'measurement': 'input to next QQuickWidget rendered frame, not display scanout',
++                  'samples_ms': latencies, 'p50_ms': sorted(latencies)[len(latencies) // 2],
++                  'max_ms': max(latencies), 'target_ms': 100}
++        path = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/interaction-latency.json'
++        path.write_text(json.dumps(report, indent=2))
++        assert max(latencies) < 100, report
 +        QtCore.QMetaObject.invokeMethod(button, 'clicked')
 +        QtTest.QTest.qWait(100)
 +        assert settings.property('visible')
@@ -3747,6 +3920,32 @@
 +        QtTest.QTest.qWait(100)
 +        assert not settings.property('visible')
 +        assert button.property('activeFocus'), 'Closing settings must restore keyboard focus'
++        # Reversing a popup transition must converge to the latest user intent,
++        # not leave a transparent modal surface or let an old close steal focus.
++        preferences.SetBool('ReduceMotion', False)
++        root.refreshMotion()
++        evaluate('open()')
++        QtTest.QTest.qWait(30)
++        evaluate('close()')
++        QtTest.QTest.qWait(20)
++        evaluate('open()')
++        QtTest.QTest.qWait(180)
++        assert settings.property('visible') and settings.property('opacity') == 1
++        evaluate('openSection("agent")')
++        QtTest.QTest.qWait(30)
++        QtCore.QMetaObject.invokeMethod(choices, 'close')
++        QtTest.QTest.qWait(20)
++        evaluate('openSection("agent")')
++        QtTest.QTest.qWait(180)
++        assert choices.property('visible') and choices.property('opacity') == 1
++        choice_list = settings.findChild(QtCore.QObject, 'AnthraciteAgentChoiceList')
++        assert choice_list.property('activeFocus'), 'Interrupted sheet transition lost keyboard focus'
++        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Escape)
++        QtTest.QTest.qWait(120)
++        assert not choices.property('visible') and settings.property('visible')
++        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Escape)
++        QtTest.QTest.qWait(120)
++        assert not settings.property('visible') and button.property('activeFocus')
 +    finally:
 +        evaluate('close()')
 +        evaluate('controller = anthraciteController')
@@ -3754,6 +3953,8 @@
 +        quick_widget.setMinimumWidth(original_min_width)
 +        quick_widget.setMaximumWidth(original_max_width)
 +        root.setProperty('width', original_width)
++        preferences.SetBool('ReduceMotion', original_motion)
++        root.refreshMotion()
 +
 +
 +def run_smoke_test():
@@ -3836,6 +4037,17 @@
 +    assert timeline is not None
 +    QtTest.QTest.qWait(100)
 +    assert model.indexOfId('40') == 40 and model.idAt(40) == '40', (model.rowCount(), model.indexOfId('40'), model.idAt(40))
++    requests = []
++    def requested(entry, offset):
++        requests.append((entry, offset))
++    model.detailsRequested.connect(requested)
++    model.loadDetails('40')
++    assert model.property('detailRequests')['40'] == 'loading', 'Activity request has no immediate acknowledgement'
++    model.loadDetails('40')
++    assert len(requests) == 1, 'Repeated click duplicated a pending page request'
++    apply_edit({'op': 'details', 'id': '40', 'offset': 0, 'entries': []})
++    assert '40' not in model.property('detailRequests')
++    model.detailsRequested.disconnect(requested)
 +    timeline.setProperty('scrollMode', 'reading')
 +    timeline.setProperty('anchorId', '40')
 +    timeline.setProperty('anchorOffset', 0)
@@ -3867,6 +4079,54 @@
 +    model.dataChanged.disconnect(changed)
 +    print(f'ANTHRACITE_STREAM_BURST: 250 updates, {len(notifications)} notifications, {time.monotonic() - started:.3f}s', flush=True)
 +    assert timeline.property('anchorId') == anchor
++    # Keep output changing while typing, and record render acknowledgement and
++    # frame gaps. This catches event-loop starvation that state-only tests miss.
++    saved_draft = controller.property('draft')
++    controller.setDraft('')
++    root.focusComposer()
++    timeline.latest()
++    QtTest.QTest.qWait(100)
++    render_times = []
++    def rendered_under_load():
++        render_times.append(time.monotonic())
++    quick_widget.quickWindow().afterRendering.connect(rendered_under_load)
++    stream_index = [0]
++    def stream_tick():
++        stream_index[0] += 1
++        apply_edit({'op': 'update', 'row': dict(rows[-1], kind='assistant', body='Streaming output\n' * 20 + str(stream_index[0]))})
++    stream_timer = QtCore.QTimer()
++    stream_timer.setInterval(8)
++    stream_timer.timeout.connect(stream_tick)
++    stream_timer.start()
++    input_latencies = []
++    try:
++        typed = ''
++        for letter in 'input':
++            begin_frame = len(render_times)
++            began = time.monotonic()
++            QtTest.QTest.keyClicks(quick_widget, letter)
++            typed += letter
++            assert controller.property('draft') == typed, 'Typing acknowledgement waited for the stream'
++            QtTest.QTest.qWait(100)
++            assert len(render_times) > begin_frame
++            input_latencies.append((render_times[begin_frame] - began) * 1000)
++    finally:
++        stream_timer.stop()
++        quick_widget.quickWindow().afterRendering.disconnect(rendered_under_load)
++        controller.setDraft(saved_draft)
++    gaps = [(b - a) * 1000 for a, b in zip(render_times, render_times[1:])]
++    report_path = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/interaction-latency.json'
++    report = json.loads(report_path.read_text())
++    report['streaming'] = {'input_samples_ms': input_latencies,
++                           'p50_ms': sorted(input_latencies)[2], 'max_ms': max(input_latencies),
++                           'frame_gaps_ms': gaps, 'max_frame_gap_ms': max(gaps, default=0)}
++    report_path.write_text(json.dumps(report, indent=2))
++    assert max(input_latencies) < 100, report['streaming']
++    timeline.setProperty('scrollMode', 'reading')
++    timeline.setProperty('anchorId', anchor)
++    timeline.setProperty('anchorOffset', offset)
++    timeline.reconcile()
++    QtTest.QTest.qWait(100)
 +    # Simulate the native wheel path, not a direct scroll-mode assignment.
 +    center = timeline.mapToScene(QtCore.QPointF(timeline.width() / 2, timeline.height() / 2))
 +    wheel = QtGui.QWheelEvent(center, center, QtCore.QPoint(), QtCore.QPoint(0, 120),
@@ -3896,6 +4156,25 @@
 +    assert timeline.property('anchorId') == anchor, 'Dock resize lost the reading anchor'
 +    assert abs(timeline.property('anchorOffset') - offset) < 3
 +    root.setProperty('width', original_width)
++    preferences = App.ParamGet('User parameter:BaseApp/Preferences/Mod/Anthracite')
++    previous_motion = preferences.GetBool('ReduceMotion', False)
++    motion = timeline.findChild(QtCore.QObject, 'AnthraciteLatestMotion')
++    assert motion is not None
++    preferences.SetBool('ReduceMotion', False)
++    root.refreshMotion()
++    if not root.property('reducedMotion'):
++        timeline.jumpLatest(True)
++        QtTest.QTest.qWait(30)
++        assert motion.property('running'), 'Explicit Latest navigation did not animate'
++        timeline.navigate()
++        stopped = timeline.property('contentY')
++        assert not motion.property('running'), 'User navigation did not interrupt motion immediately'
++        QtTest.QTest.qWait(200)
++        assert abs(timeline.property('contentY') - stopped) < 3, 'Cancelled animation continued moving'
++    preferences.SetBool('ReduceMotion', True)
++    timeline.jumpLatest(True)
++    assert not motion.property('running'), 'Reduced motion still animates navigation'
++    preferences.SetBool('ReduceMotion', previous_motion)
 +    timeline.latest()
 +    QtTest.QTest.qWait(100)
 +    assert timeline.property('atYEnd'), 'Latest failed to resume end following'
@@ -3945,6 +4224,11 @@
 +    apply_edit(details)
 +    apply_edit(details)
 +    assert len(model.data(model.index(model.rowCount()-1, 0), roles['entries'])) == 1
++    model.loadDetails('work')
++    apply_edit(details)
++    assert model.property('detailRequests')['work'] == 'loading', 'Stale page cleared a newer request'
++    apply_edit(dict(details, offset=1))
++    assert 'work' not in model.property('detailRequests')
 +    apply_edit({'op': 'reset', 'rows': original})
 +    Gui.runCommand("Anthracite_ReloadSidebar")
 +    quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
@@ -4541,7 +4825,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/AgentSettings.qml
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,261 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
@@ -4551,6 +4835,11 @@
 +    id: settings
 +    objectName: "AnthraciteAgentSettings"
 +    property var controller
++    property bool reducedMotion: true
++    signal opening()
++    opacity: 0
++    enter: Transition { NumberAnimation { property: "opacity"; to: 1; duration: settings.reducedMotion ? 0 : 120; easing.type: Easing.OutCubic } }
++    exit: Transition { NumberAnimation { property: "opacity"; to: 0; duration: settings.reducedMotion ? 0 : 90; easing.type: Easing.OutCubic } }
 +    // The native controller can disappear while a dock is being reloaded.
 +    readonly property var agentState: controller || ({
 +        busy: true, processingAttachments: false, providers: [], models: [],
@@ -4574,7 +4863,7 @@
 +    focus: true
 +    Overlay.modal: Rectangle { color: Qt.rgba(0, 0, 0, 0.28) }
 +    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-+    onOpened: agentRow.forceActiveFocus()
++    onAboutToShow: { opening(); Qt.callLater(function() { agentRow.forceActiveFocus() }) }
 +    onClosed: {
 +        choices.close()
 +        if (returnFocus) returnFocus.forceActiveFocus()
@@ -4614,22 +4903,28 @@
 +    }
 +
 +    component SettingRow: ItemDelegate {
++        id: settingRow
 +        property string value
 +        Layout.fillWidth: true
 +        implicitHeight: 56
 +        contentItem: Column {
 +            spacing: 3
-+            Text { text: parent.parent.text + "  ›"; color: colors.windowText; font.bold: true }
++            Text { text: settingRow.text + "  ›"; color: settingRow.down ? colors.highlightedText : colors.windowText; font.bold: true }
 +            Text {
 +                width: parent.width
 +                text: parent.parent.value
-+                color: colors.windowText
++                color: settingRow.down ? colors.highlightedText : colors.windowText
 +                opacity: 0.65
 +                elide: Text.ElideRight
 +            }
 +        }
 +        Accessible.name: text + ": " + value
 +        opacity: enabled ? 1 : 0.5
++        background: Rectangle {
++            radius: 8
++            color: parent.down ? colors.highlight : parent.hovered ? colors.alternateBase : "transparent"
++            border.color: parent.activeFocus ? colors.highlight : "transparent"
++        }
 +    }
 +
 +    contentItem: ScrollView {
@@ -4694,6 +4989,9 @@
 +    Popup {
 +        id: choices
 +        objectName: "AnthraciteAgentChoices"
++        opacity: 0
++        enter: Transition { NumberAnimation { property: "opacity"; to: 1; duration: settings.reducedMotion ? 0 : 120; easing.type: Easing.OutCubic } }
++        exit: Transition { NumberAnimation { property: "opacity"; to: 0; duration: settings.reducedMotion ? 0 : 90; easing.type: Easing.OutCubic } }
 +        property string section: "agent"
 +        readonly property var options: section === "agent" ? settings.agentState.providers
 +                                       : section === "model" ? settings.agentState.models : settings.agentState.reasoningEfforts
@@ -4709,7 +5007,7 @@
 +        focus: true
 +        Overlay.modal: Rectangle { color: Qt.rgba(0, 0, 0, 0.28) }
 +        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-+        onOpened: {
++        onAboutToShow: {
 +            choiceList.currentIndex = -1
 +            for (let i = 0; i < options.length; ++i) {
 +                if ((section === "model" ? options[i].model : options[i].id) === selected)
@@ -4717,7 +5015,7 @@
 +            }
 +            if (choiceList.currentIndex < 0 && options.length) choiceList.currentIndex = 0
 +            choiceList.positionViewAtIndex(choiceList.currentIndex, ListView.Contain)
-+            choiceList.forceActiveFocus()
++            Qt.callLater(function() { choiceList.forceActiveFocus() })
 +        }
 +        onClosed: {
 +            if (settings.opened) {
@@ -4754,6 +5052,7 @@
 +                Keys.onReturnPressed: settings.selectChoice(currentIndex)
 +                Keys.onEnterPressed: settings.selectChoice(currentIndex)
 +                delegate: ItemDelegate {
++                    id: choiceRow
 +                    required property var modelData
 +                    required property int index
 +                    readonly property string optionId: choices.section === "model" ? modelData.model : modelData.id
@@ -4767,7 +5066,7 @@
 +                    Accessible.checked: selected
 +                    background: Rectangle {
 +                        radius: 8
-+                        color: selected ? colors.highlight : parent.hovered || parent.ListView.isCurrentItem
++                        color: selected || parent.down ? colors.highlight : parent.hovered || parent.ListView.isCurrentItem
 +                               ? colors.alternateBase : "transparent"
 +                        border.color: parent.activeFocus ? colors.highlight : "transparent"
 +                    }
@@ -4775,7 +5074,7 @@
 +                        Text {
 +                            Layout.fillWidth: true
 +                            text: parent.parent.text
-+                            color: selected ? colors.highlightedText : colors.windowText
++                            color: selected || choiceRow.down ? colors.highlightedText : colors.windowText
 +                            elide: Text.ElideRight
 +                        }
 +                        Text { text: selected ? "✓" : ""; color: colors.highlightedText }
@@ -4787,4 +5086,14 @@
 +            }
 +        }
 +    }
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/MotionMac.mm
+@@ -0,0 +1,7 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#import <AppKit/AppKit.h>
++
++bool anthraciteSystemReducedMotion()
++{
++    return NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion;
 +}
