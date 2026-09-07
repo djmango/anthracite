@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
-@@ -0,0 +1,950 @@
+@@ -0,0 +1,986 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "AgentBridge.h"
@@ -92,6 +92,15 @@
 +    connect(sidebar, &SidebarController::stopRequested, this, &AgentBridge::stop);
 +    connect(sidebar, &SidebarController::chooseProviderRequested, this, &AgentBridge::chooseProvider);
 +    connect(sidebar, &SidebarController::providerSelected, this, &AgentBridge::selectProvider);
++    connect(sidebar, &SidebarController::busyChanged, this, [this]() {
++        if (sidebar->busy() || pendingProvider.isEmpty()) return;
++        QTimer::singleShot(0, this, [this]() {
++            if (!pendingProvider.isEmpty() && !sidebar->busy() && !executingTool) {
++                const QString provider = pendingProvider;
++                selectProvider(provider);
++            }
++        });
++    });
 +    connect(sidebar, &SidebarController::newThreadRequested, this, &AgentBridge::newThread);
 +    connect(sidebar, &SidebarController::threadSelected, this, &AgentBridge::selectThread);
 +    connect(sidebar, &SidebarController::draftEdited, this, &AgentBridge::draftEdited);
@@ -248,6 +257,27 @@
 +
 +void AgentBridge::selectProvider(const QString& provider)
 +{
++    if (sidebar->busy()) {
++        if (pendingProvider.isEmpty()) {
++            runningProviderModels = sidebar->models();
++            runningProviderModel = selectedModel;
++            runningProviderEffort = selectedEffort;
++        }
++        if (provider == providerKind()) {
++            pendingProvider.clear();
++            sidebar->updateModelCatalog(runningProviderModels);
++            sidebar->restoreModelSelection(runningProviderModel, runningProviderEffort);
++        }
++        else {
++            pendingProvider = provider;
++            // Never offer the running provider's models for a different harness.
++            // Its catalog is loaded when the deferred connection starts.
++            sidebar->updateModelCatalog({});
++            sidebar->restoreModelSelection(QString(), QString());
++        }
++        return;
++    }
++    pendingProvider.clear();
 +    auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
 +    preferences->SetASCII("Provider", provider.toUtf8().constData());
 +    selectedLocalThreadId.clear();
@@ -280,6 +310,7 @@
 +
 +void AgentBridge::modelSelectionEdited(const QString& model, const QString& effort)
 +{
++    if (!pendingProvider.isEmpty()) return;
 +    selectedModel = model;
 +    selectedEffort = effort;
 +    send(QStringLiteral("model.selection.save"), {{"model", selectedModel}, {"effort", selectedEffort}});
@@ -510,6 +541,7 @@
 +        }
 +    }
 +    else if (type == QLatin1String("model.selection")) {
++        if (!pendingProvider.isEmpty()) return;
 +        selectedModel = payload.value("model").toString();
 +        selectedEffort = payload.value("effort").toString();
 +        sidebar->restoreModelSelection(selectedModel, selectedEffort);
@@ -517,6 +549,10 @@
 +        selectedEffort = sidebar->selectedEffort();
 +    }
 +    else if (type == QLatin1String("model.catalog")) {
++        if (!pendingProvider.isEmpty()) {
++            runningProviderModels = payload.value("models").toArray().toVariantList();
++            return;
++        }
 +        sidebar->updateModelCatalog(payload.value("models").toArray().toVariantList());
 +        selectedModel = sidebar->selectedModel();
 +        selectedEffort = sidebar->selectedEffort();
@@ -953,7 +989,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.h
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,115 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_AGENTBRIDGE_H
@@ -1048,6 +1084,10 @@
 +    QString pendingDraft;
 +    QString selectedModel;
 +    QString selectedEffort;
++    QString pendingProvider;
++    QVariantList runningProviderModels;
++    QString runningProviderModel;
++    QString runningProviderEffort;
 +    QString pendingRestartThreadId;
 +    bool pendingRestartCreateThread = false;
 +    qint64 nextDraftSaveId = 1;
@@ -2802,7 +2842,7 @@
 +
 +void SidebarController::selectProvider(const QString& provider)
 +{
-+    if (turnBusy || processingAttachments() || (provider != QLatin1String("codex") && provider != QLatin1String("opencode"))
++    if ((provider != QLatin1String("codex") && provider != QLatin1String("opencode"))
 +        || provider == currentProvider) {
 +        return;
 +    }
@@ -2839,14 +2879,14 @@
 +
 +void SidebarController::selectModel(const QString& model)
 +{
-+    if (!turnBusy && model != currentModel) {
++    if (model != currentModel) {
 +        applyModelSelection(model, QString(), true);
 +    }
 +}
 +
 +void SidebarController::selectEffort(const QString& effort)
 +{
-+    if (!turnBusy && effort != currentEffort) {
++    if (effort != currentEffort) {
 +        applyModelSelection(currentModel, effort, true);
 +    }
 +}
@@ -3518,7 +3558,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,571 @@
+@@ -0,0 +1,579 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -3620,14 +3660,22 @@
 +        QtTest.QTest.qWait(100)
 +        fixture_controller.setProperty('processingAttachments', True)
 +        evaluate('openSection("agent")')
-+        assert not choices.property('visible')
++        assert choices.property('visible'), 'Attachment preparation must not lock settings'
++        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Escape)
++        QtTest.QTest.qWait(100)
 +        fixture_controller.setProperty('processingAttachments', False)
 +        fixture_controller.setProperty('busy', True)
++        evaluate('openSection("model")')
++        assert choices.property('visible'), 'Model picker must work during a run'
++        evaluate('selectChoice(0)')
++        assert fixture_controller.property('selectedModel') == 'm0'
++        evaluate('openSection("effort")')
++        assert choices.property('visible'), 'Effort picker must work during a run'
++        evaluate('selectChoice(0)')
 +        evaluate('openSection("agent")')
-+        assert not choices.property('visible'), 'Cannot switch harness during a run'
-+        fixture_controller.setProperty('busy', False)
-+        evaluate('openSection("agent")')
++        assert choices.property('visible'), 'Next-run harness picker must work during a run'
 +        evaluate('selectChoice(1)')
++        fixture_controller.setProperty('busy', False)
 +        assert fixture_controller.property('selectedProvider') == 'opencode'
 +        assert 'OpenCode' in settings.property('summary')
 +        assert 'Provider default' in settings.property('summary')
@@ -4399,7 +4447,7 @@
 +        selectedEffort: "", modelControlsAvailable: false
 +    })
 +    property Item returnFocus
-+    readonly property bool locked: settings.agentState.busy || settings.agentState.processingAttachments
++    readonly property bool locked: !controller
 +    readonly property string providerLabel: labelFor(settings.agentState.providers, "id", settings.agentState.selectedProvider, "name", qsTr("Agent"))
 +    readonly property string modelLabel: labelFor(settings.agentState.models, "model", settings.agentState.selectedModel, "name", qsTr("Provider default"))
 +    readonly property string effortLabel: labelFor(settings.agentState.reasoningEfforts, "id", settings.agentState.selectedEffort, "label", qsTr("Default"))
@@ -4512,8 +4560,8 @@
 +            }
 +            Label {
 +                Layout.fillWidth: true
-+                visible: settings.locked
-+                text: qsTr("Settings can be changed when the current operation finishes.")
++                visible: settings.agentState.busy
++                text: qsTr("Changes apply to your next run.")
 +                wrapMode: Text.WordWrap
 +                color: colors.windowText
 +                opacity: 0.65
@@ -4521,7 +4569,7 @@
 +            Button {
 +                Layout.fillWidth: true
 +                text: qsTr("Configure agent installation…")
-+                enabled: !settings.locked
++                enabled: !settings.locked && !settings.agentState.busy
 +                onClicked: { settings.close(); controller.chooseProvider() }
 +            }
 +            Button {

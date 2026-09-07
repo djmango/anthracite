@@ -94,6 +94,9 @@ New turns leave room for the answer beneath your prompt. Reading older messages,
 activity, and resizing the dock preserve your reading position. You can draft the next message
 while the agent works; Send waits for the current run to finish (no automatic queue or replay).
 One composer button opens agent, model and reasoning settings, each with its own selection sheet.
+The picker remains usable during a run: model/effort changes apply to the next submitted turn,
+and a harness change connects after the current run finishes. An unconnected harness's model
+catalog becomes available when it connects; the running harness's models are never substituted.
 Message text is selectable and supports normal keyboard copying, without per-response Copy buttons.
 Long prompts and individual work entries expand on demand. History arrives in 60-message pages,
 with work details in 20-entry pages and bounded render thumbnails. Paging changes only the chat

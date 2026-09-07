@@ -19,10 +19,16 @@ def provider_fixture():
         if method == "initialize":
             send({"id": request, "result": {"userAgent": "anthracite-smoke"}})
         elif method == "model/list":
-            send({"id": request, "result": {"data": [], "nextCursor": None}})
+            send({"id": request, "result": {"data": [
+                {"model": name, "displayName": name, "isDefault": name == 'model-a',
+                 "defaultReasoningEffort": 'low', "supportedReasoningEfforts": [
+                     {"reasoningEffort": 'low'}, {"reasoningEffort": 'high'}]}
+                for name in ('model-a', 'model-b')], "nextCursor": None}})
         elif method in ("thread/start", "thread/resume"):
             send({"id": request, "result": {"thread": {"id": "smoke-thread"}}})
         elif method == "turn/start":
+            assert message['params']['model'] == 'model-a', message
+            assert message['params']['effort'] == 'low', message
             inputs = message['params']['input']
             assert inputs[0]['type'] == 'text' and 'Attached file' in inputs[0]['text'], inputs
             assert inputs[1]['type'] == 'image' and inputs[1]['url'].startswith('data:image/png;base64,'), inputs
@@ -185,6 +191,17 @@ try:
                 if not any(item['stage'] == 'waiting-for-interaction' for item in health):
                     return
                 assert document.getObject('MustNotRunWhileModal') is None
+                assert controller.property('busy')
+                controller.selectModel('model-b')
+                controller.selectEffort('high')
+                assert controller.property('selectedModel') == 'model-b'
+                assert controller.property('selectedEffort') == 'high'
+                controller.selectProvider('opencode')
+                assert controller.property('selectedProvider') == 'opencode'
+                assert not controller.property('models'), 'Do not offer Codex models for OpenCode'
+                controller.selectProvider('codex')
+                assert controller.property('selectedModel') == 'model-b'
+                assert controller.property('selectedEffort') == 'high'
                 document.addObject('App::DocumentObjectGroup', 'ManualEditWhileWaiting')
                 document.recompute()
                 interaction_dialog.close()
@@ -195,6 +212,8 @@ try:
             if len(results) < 6:
                 return
             assert document.getObject('MustNotRunWhileModal') is None
+            assert controller.property('selectedModel') == 'model-b'
+            assert controller.property('selectedEffort') == 'high'
             assert {'python', 'recompute', 'validation', 'commit', 'rollback', 'feedback'} <= {item['stage'] for item in health}
             model = controller.property("messages")
             roles = {bytes(name).decode(): role for role, name in model.roleNames().items()}
