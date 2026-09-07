@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,1345 @@
+@@ -0,0 +1,1385 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -326,13 +326,24 @@
 +            state = [str(item) for item in obj.State]
 +        except Exception:
 +            pass
-+        errors = [item for item in state if item in {"Invalid", "Error"}]
++        errors = [item for item in state if item.casefold() in {"invalid", "error", "touched"}]
++        try:
++            if not obj.isValid():
++                errors.append("Native object is invalid")
++        except Exception as error:
++            errors.append(f"Native validity unavailable: {error}")
 +
 +        shape = _shape_summary(obj)
 +        if shape and shape.get("null") is False and shape.get("valid") is False:
 +            errors.append("Invalid shape")
 +
 +        if errors:
++            try:
++                status = obj.getStatusString()
++                if status:
++                    errors.append(str(status))
++            except Exception:
++                pass
 +            invalid.append({"name": str(obj.Name), "error": ", ".join(errors)})
 +    return invalid
 +
@@ -665,6 +676,13 @@
 +        self.render_request: dict[str, Any] | None = None
 +        self.render_views_request: list[dict[str, Any]] = []
 +        self.reference_baseline = None
++        self.automatic_images = True
++
++    def feedback(self, *, images=True):
++        """Control automatic images for this call only; explicit renders still run."""
++        if not isinstance(images, bool):
++            raise TypeError("images must be True or False")
++        self.automatic_images = images
 +
 +    def _reference_revision(self):
 +        if self.reference_baseline is not None and _document_snapshot(self.doc) != self.reference_baseline:
@@ -981,7 +999,7 @@
 +        _executing_docs.discard(doc.Name)
 +
 +
-+def _execute_impl(source: str, expected_revision: int | None = None) -> dict[str, Any]:
++def _execute_impl(source: str, expected_revision: int | None = None, progress=lambda stage: None) -> dict[str, Any]:
 +    """Execute source once, returning a structured result suitable for an LLM."""
 +
 +    if not isinstance(source, str) or not source.strip():
@@ -1103,6 +1121,7 @@
 +                baseline_images = [{**image, "phase": "before", "revision": revision}
 +                                   for image in _render_views(baseline.render_views_request)]
 +        code = _compile(source)
++        progress("python")
 +        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
 +            exec(code, namespace, namespace)
 +
@@ -1114,10 +1133,12 @@
 +                              if obj.getTypeIdOfProperty(key) != "Part::PropertyPartShape"}
 +                    for obj in doc.Objects}
 +        _recompute_writes[document_name] = set()
++        progress("recompute")
 +        try:
 +            doc.recompute()
 +        finally:
 +            recompute_writes = _recompute_writes.pop(document_name)
++        progress("validation")
 +        cad.assert_valid()
 +        after = _document_snapshot(doc)
 +        final_revision = revision + int(before != after)
@@ -1134,6 +1155,7 @@
 +                if not spec["highlight"]:
 +                    raise ValueError("No current changed geometry to highlight; make an edit or specify highlight explicitly.")
 +        verification = [Inspect.verify(doc, checks, final_revision) for checks in cad.check_requests]
++        progress("rendering")
 +        rendered = _render_views(
 +            specs
 +        )
@@ -1143,12 +1165,14 @@
 +                raise ValueError("Combined before/after views exceed the pixel limit.")
 +            if sum(len(image["dataUrl"]) for image in rendered) > _MAX_RENDER_BYTES:
 +                raise ValueError("Combined before/after images exceed the 8 MB payload limit.")
++        progress("commit")
 +        doc.commitTransaction()
 +    except Exception as error:
 +        error_traceback = traceback.format_exc()
 +        rolled_back = False
 +        remapped = []
 +        try:
++            progress("rollback")
 +            doc.abortTransaction()
 +            doc.recompute()
 +            rolled_back = True
@@ -1195,6 +1219,11 @@
 +        _last_changes[document_name] = {"revision": revision, "names": touched}
 +        History.record(doc, action_id, label, before, after, revision)
 +    observation = _observation(doc, before, after)
++    if not cad.automatic_images:
++        observation["visualFeedback"] = {
++            "status": "skipped", "reason": "Automatic images disabled for this call.",
++            "nextAction": "Use cad.render() or cad.review('Name') for final visual inspection.",
++        }
 +    observation["editReceipt"] = {
 +        "beforeFinalRecompute": {name: [key for key, value in item.items()
 +                                         if before.get(name, {}).get("properties", {}).get(key, {}).get("value") != value]
@@ -1262,6 +1291,8 @@
 +    observation = result.get("observation") or {}
 +    if not result.get("ok") or result.get("readOnly") or result.get("images"):
 +        return
++    if observation.get("visualFeedback", {}).get("status") == "skipped":
++        return
 +    changed = observation.get("created", []) + observation.get("changed", [])
 +    geometry = [entry["name"] for entry in changed if entry.get("shape") and
 +                (entry in observation.get("created", []) or
@@ -1295,13 +1326,21 @@
 +                                         "retry": "cad.render_views()", "editCommitted": True}
 +
 +
-+def execute(source: str, expected_revision: int | None = None) -> dict[str, Any]:
++def execute(source: str, expected_revision: int | None = None, progress=None) -> dict[str, Any]:
++    # Telemetry is optional and must never change transaction outcomes.
++    def report(stage):
++        if progress is not None:
++            try:
++                progress(stage)
++            except Exception:
++                pass
++    report("inspection")
 +    doc = App.ActiveDocument
 +    try:
 +        intervening = _intervening_changes(doc) if doc else None
 +    except Exception as error:
 +        intervening = {"status": "unavailable", "reason": str(error)}
-+    result = _execute_impl(source, expected_revision)
++    result = _execute_impl(source, expected_revision, report)
 +    result["interveningChanges"] = intervening
 +    current = App.ActiveDocument
 +    if current is not None and (doc is None or current is doc):
@@ -1313,6 +1352,7 @@
 +            _last_changes[current.Name] = {"revision": result["revision"],
 +                                           "names": [entry["name"] for entry in changes]}
 +        try:
++            report("feedback")
 +            _automatic_feedback(current, result)
 +        except Exception as error:
 +            if isinstance(result.get("observation"), dict):
@@ -1338,17 +1378,17 @@
 +    return result
 +
 +
-+def execute_json(source: str, expected_revision: int | None = None) -> str:
++def execute_json(source: str, expected_revision: int | None = None, progress=None) -> str:
 +    """JSON convenience boundary for the native provider bridge."""
 +
 +    return json.dumps(
-+        execute(source, expected_revision),
++        execute(source, expected_revision, progress),
 +        ensure_ascii=False,
 +        separators=(",", ":"),
 +    )
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthracite.py
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,528 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import unittest
@@ -1366,6 +1406,60 @@
 +
 +
 +class ExecutorTest(unittest.TestCase):
++    def test_native_validity_and_incomplete_state_diagnostics(self):
++        obj = SimpleNamespace(Name='Incomplete', State=['Touched'], isValid=lambda: True,
++                              getStatusString=lambda: 'Missing required input')
++        errors = AnthraciteExecutor._invalid_objects(SimpleNamespace(Objects=[obj]))
++        self.assertIn('Touched', errors[0]['error'])
++        self.assertIn('Missing required input', errors[0]['error'])
++        obj.State = []
++        obj.isValid = lambda: False
++        self.assertIn('Native object is invalid', AnthraciteExecutor._invalid_objects(
++            SimpleNamespace(Objects=[obj]))[0]['error'])
++
++    def test_shapeless_native_objects_are_valid(self):
++        self.run_code("import Sketcher, Spreadsheet\ndoc.addObject('App::DocumentObjectGroup', 'Group')\n"
++                      "doc.addObject('Sketcher::SketchObject', 'EmptySketch')\n"
++                      "doc.addObject('Spreadsheet::Sheet', 'Sheet')")
++        self.assertEqual(AnthraciteExecutor._invalid_objects(self.doc), [])
++
++    def test_incomplete_pad_rolls_back_with_native_diagnostic(self):
++        result = AnthraciteExecutor.execute("body = doc.addObject('PartDesign::Body', 'Body')\n"
++                                           "body.newObject('PartDesign::Pad', 'MissingProfile')")
++        self.assertFalse(result['ok'])
++        self.assertTrue(result['rolledBack'], result)
++        self.assertIn('MissingProfile', result['error']['message'])
++        self.assertIsNone(self.doc.getObject('Body'))
++
++    def test_feedback_is_per_call_and_does_not_disable_validation(self):
++        with patch.object(AnthraciteExecutor, '_render_views', return_value=[]) as render:
++            result = self.run_code("cad.feedback(images=False)\ndoc.addObject('Part::Box', 'Box')")
++            self.assertTrue(all(not call.args[0] for call in render.call_args_list))
++        self.assertEqual(result['observation']['visualFeedback']['status'], 'skipped')
++        self.assertEqual(result['images'], [])
++        followup = self.run_code("doc.getObject('Box').Length = 22")
++        self.assertNotEqual(followup['observation'].get('visualFeedback', {}).get('status'), 'skipped')
++        failed = AnthraciteExecutor.execute("cad.feedback(images=False)\ndoc.getObject('Box').Length = -1")
++        self.assertFalse(failed['ok'])
++        self.assertTrue(failed['rolledBack'])
++        self.assertEqual(self.doc.getObject('Box').Length.Value, 22)
++        with self.assertRaises(TypeError):
++            AnthraciteExecutor.Cad(self.doc).feedback(images='no')
++
++    def test_execution_stages_and_telemetry_failure_are_observational(self):
++        stages = []
++        result = AnthraciteExecutor.execute("cad.feedback(images=False)\ndoc.addObject('Part::Box', 'Box')",
++                                           progress=stages.append)
++        self.assertTrue(result['ok'], result)
++        self.assertEqual(stages, ['inspection', 'python', 'recompute', 'validation', 'rendering', 'commit', 'feedback'])
++        stages.clear()
++        failed = AnthraciteExecutor.execute("raise ValueError('test')", progress=stages.append)
++        self.assertTrue(failed['rolledBack'])
++        self.assertIn('rollback', stages)
++        def broken(stage):
++            raise RuntimeError('telemetry unavailable')
++        self.assertTrue(AnthraciteExecutor.execute("doc.getObject('Box').Length = 23", progress=broken)['ok'])
++
 +    def test_explain_follows_native_history_without_claiming_face_provenance(self):
 +        self.run_code(AnthraciteInspect.guide('partdesign')['code'])
 +        ref = self.run_code("cad.topology('BasePad')")['result']['items'][0]['reference']

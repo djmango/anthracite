@@ -27,6 +27,11 @@ def provider_fixture():
             assert inputs[0]['type'] == 'text' and 'Attached file' in inputs[0]['text'], inputs
             assert inputs[1]['type'] == 'image' and inputs[1]['url'].startswith('data:image/png;base64,'), inputs
             send({"id": request, "result": {"turn": {"id": "smoke-turn"}}})
+            send({"id": 9000, "method": "item/tool/call", "params": {
+                "tool": "freecad", "arguments": {"code": "doc.addObject('Part::Box', 'MustNotRunWhileModal')"}}})
+        elif request == 9000:
+            result = json.loads(message["result"]["contentItems"][0]["text"])
+            assert not result['ok'] and result['conflict'], result
             send({"id": 9001, "method": "item/tool/call", "params": {
                 "tool": "freecad", "arguments": {"code":
                     "box = doc.addObject('Part::Box', 'BridgeBox')\nbox.Length = 12\nbox.Width = 8\nbox.Height = 5\n"
@@ -110,6 +115,9 @@ try:
     saved_thread = ""
     saved_work = None
     saved_attachments = None
+    interaction_dialog = QtWidgets.QDialog(Gui.getMainWindow())
+    interaction_dialog.setModal(True)
+    interaction_released = False
     drafted_while_running = False
     def prepare_followup():
         global drafted_while_running
@@ -122,7 +130,7 @@ try:
     journal = Path(os.environ["XDG_STATE_HOME"]) / "anthracite/anthracite.events.jsonl"
 
     def check_result():
-        global submitted, expanded, replay_phase, saved_thread, saved_work, saved_attachments
+        global submitted, expanded, replay_phase, saved_thread, saved_work, saved_attachments, interaction_released
         try:
             if replay_phase == 'attaching':
                 if not controller.property('processingAttachments'):
@@ -145,6 +153,7 @@ try:
                     assert controller.property('draft') == 'Run the deterministic native bridge test'
                     assert dock.grab().save(str(Path(__file__).resolve().parent.parent / 'build/test-results/composer.png'))
                     controller.submit(controller.property('draft'))
+                    interaction_dialog.show()
                     submitted = True
                     replay_phase = 'live'
                 return
@@ -171,10 +180,22 @@ try:
             if not text.endswith("\n"):
                 return
             lines = text.splitlines()
+            health = [record['payload'] for record in map(json.loads, lines) if record['type'] == 'tool.health']
+            if not interaction_released:
+                if not any(item['stage'] == 'waiting-for-interaction' for item in health):
+                    return
+                assert document.getObject('MustNotRunWhileModal') is None
+                document.addObject('App::DocumentObjectGroup', 'ManualEditWhileWaiting')
+                document.recompute()
+                interaction_dialog.close()
+                interaction_released = True
+                return
             results = [record["payload"] for record in map(json.loads, lines)
                        if record["type"] == "tool.result"]
-            if len(results) < 5:
+            if len(results) < 6:
                 return
+            assert document.getObject('MustNotRunWhileModal') is None
+            assert {'python', 'recompute', 'validation', 'commit', 'rollback', 'feedback'} <= {item['stage'] for item in health}
             model = controller.property("messages")
             roles = {bytes(name).decode(): role for role, name in model.roleNames().items()}
             rows = [{name: model.data(model.index(row, 0), role) for name, role in roles.items()}
@@ -232,7 +253,7 @@ try:
             assert work[0]['body'] == saved_work['body']
             assert work[0]['author'] == saved_work['author']
             assert work[0]['entries'] == saved_work['entries']
-            assert [result["status"] for result in results] == ["committed", "rolled_back", "committed", "committed", "committed"], results
+            assert [result["status"] for result in results[1:]] == ["committed", "rolled_back", "committed", "committed", "committed"], results
             assert document.getObject("MustRollback") is None
             box = document.getObject("BridgeBox")
             assert box.Shape.isValid() and abs(box.Shape.Volume - 800) < 1e-6

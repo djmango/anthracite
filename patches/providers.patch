@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
-@@ -0,0 +1,1002 @@
+@@ -0,0 +1,1003 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
@@ -111,7 +111,8 @@
 +            "cad.frame('Name') gives local/world placement, origin, axes and conversion examples. Sketch Geometry is local XY; topology/measurements/picked points/section planes are world mm. Transform points with global Placement, directions with Rotation; avoid double-applying Shape placement. ",
 +            "cad.api('Name', kind='methods', query='setDatum') returns native method documentation without calling it. kind='workbenches' lists registered workbenches without activating them; kind='modules' lists loaded common CAD modules. Never invent undocumented signatures. ",
 +            "Explicit editability checks also include bodyTip (expected internal Tip name), sketchDegreesOfFreedom (numeric, requires tolerance), and nativeFeatureHistory (Body with native parametric Tip and sketch, not proof of complete editability). Preserve the tree and inspect affected downstream features after edits and undo. ",
-+            "Successful geometry edits without an explicit render attach compact automatic overview/focused images. visualFeedback reports unavailable/failed capture separately from CAD success; failed optional capture does not undo a committed edit. Use cad.review or explicit render_views for closer inspection, not repeated blind edits. ",
++            "Successful geometry edits without an explicit render attach compact automatic overview/focused images. cad.feedback(images=False) skips automatic images for this call only, for intermediate edits; validation and explicit renders still run. visualFeedback records the skip. Inspect the final result with cad.review or render_views. Failed optional capture does not undo a committed edit. ",
++            "A slow native operation may still be running. Pending/timeout status is not a rollback or cancellation. Wait for the actual result; never automatically retry an edit with an unknown outcome. Native incomplete-feature diagnostics must be resolved before building on that feature. ",
 +            "Use cad.topology('Name', kind='faces', surface='Cylinder', offset=0, limit=25) for paged candidates; omit surface for all types or use kind='edges'. Returned references bind document/object/subelement/revision. ",
 +            "Use cad.resolve_ref(reference) in Python or cad.measure(reference); all references expire on revision changes, including user edits. Finish mutations before querying fresh topology. Never choose an ambiguous candidate silently. ",
 +            "cad.measure('A') reports native size_mm/volume_mm3/area_mm2; cad.measure('A','B') reports distance_mm and overlapVolume_mm3 (null if unavailable). Do not infer overlap from zero distance. ",
@@ -1073,7 +1074,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/opencode.rs
-@@ -0,0 +1,906 @@
+@@ -0,0 +1,907 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
@@ -1243,7 +1244,8 @@
 +            "cad.frame('Name') gives local/world placement, origin, axes and conversion examples. Sketch Geometry is local XY; topology/measurements/picked points/section planes are world mm. Transform points with global Placement, directions with Rotation; avoid double-applying Shape placement. ",
 +            "cad.api('Name', kind='methods', query='setDatum') returns native method documentation without calling it. kind='workbenches' lists registered workbenches without activating them; kind='modules' lists loaded common CAD modules. Never invent undocumented signatures. ",
 +            "Explicit editability checks also include bodyTip (expected internal Tip name), sketchDegreesOfFreedom (numeric, requires tolerance), and nativeFeatureHistory (Body with native parametric Tip and sketch, not proof of complete editability). Preserve the tree and inspect affected downstream features after edits and undo. ",
-+            "Successful geometry edits without an explicit render attach compact automatic overview/focused images. visualFeedback reports unavailable/failed capture separately from CAD success; failed optional capture does not undo a committed edit. Use cad.review or explicit render_views for closer inspection, not repeated blind edits. ",
++            "Successful geometry edits without an explicit render attach compact automatic overview/focused images. cad.feedback(images=False) skips automatic images for this call only, for intermediate edits; validation and explicit renders still run. visualFeedback records the skip. Inspect the final result with cad.review or render_views. Failed optional capture does not undo a committed edit. ",
++            "A slow native operation may still be running. Pending/timeout status is not a rollback or cancellation. Wait for the actual result; never automatically retry an edit with an unknown outcome. Native incomplete-feature diagnostics must be resolved before building on that feature. ",
 +            "Use cad.topology('Name', kind='faces', surface='Cylinder', offset=0, limit=25) for paged candidates; omit surface for all types or use kind='edges'. Returned references bind document/object/subelement/revision. ",
 +            "Use cad.resolve_ref(reference) in Python or cad.measure(reference); all references expire on revision changes, including user edits. Finish mutations before querying fresh topology. Never choose an ambiguous candidate silently. ",
 +            "cad.measure('A') reports native size_mm/volume_mm3/area_mm2; cad.measure('A','B') reports distance_mm and overlapVolume_mm3 (null if unavailable). Do not infer overlap from zero distance. ",

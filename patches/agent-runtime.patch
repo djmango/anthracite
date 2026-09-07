@@ -1002,7 +1002,7 @@
 +tempfile = "3"
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/main.rs
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,276 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +mod composer;
@@ -1082,6 +1082,10 @@
 +            .as_ref()
 +            .ok_or_else(|| "Provider is not running.".to_string())
 +            .and_then(|provider| provider.emitter().prepare_tool(payload)),
++        "tool.progress" => provider
++            .as_ref()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .and_then(|provider| provider.emitter().execution_progress(payload)),
 +        "tool.result" => provider
 +            .as_mut()
 +            .ok_or_else(|| "Provider is not running.".to_string())
@@ -1166,7 +1170,16 @@
 +        "turn.interrupt" => provider
 +            .as_mut()
 +            .ok_or_else(|| "Provider is not running.".to_string())
-+            .and_then(|provider| provider.interrupt()),
++            .and_then(|provider| {
++                if provider.emitter().execution_pending() {
++                    provider.emitter().emit("runtime.warning", serde_json::json!({
++                        "message": "A CAD operation is pending. Native execution cannot be safely force-cancelled; wait for its result. No rollback or cancellation has been claimed."
++                    }));
++                    Ok(())
++                } else {
++                    provider.interrupt()
++                }
++            }),
 +        "session.shutdown" => return false,
 +        command => Err(format!("Unknown runtime command: {command}")),
 +    };
@@ -1208,7 +1221,15 @@
 +    process::spawn_host_reader(sender.clone());
 +
 +    let mut provider: Option<Box<dyn ProviderAdapter>> = None;
-+    while let Ok(event) = receiver.recv() {
++    loop {
++        if let Some(provider) = &provider {
++            provider.emitter().poll_execution(std::time::Instant::now());
++        }
++        let event = match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
++            Ok(event) => event,
++            Err(mpsc::RecvTimeoutError::Timeout) => continue,
++            Err(mpsc::RecvTimeoutError::Disconnected) => break,
++        };
 +        match event {
 +            IoEvent::HostLine(line) => match serde_json::from_str::<Value>(&line) {
 +                Ok(message) => {
@@ -1629,13 +1650,14 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/protocol.rs
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,351 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use serde_json::{Value, json};
 +use std::cell::RefCell;
 +use std::collections::HashMap;
 +use std::io::{self, Write};
++use std::time::{Duration, Instant};
 +
 +use crate::store::Store;
 +use crate::timeline::Timeline;
@@ -1689,6 +1711,15 @@
 +    store: Store,
 +    operations: RefCell<HashMap<String, Value>>,
 +    timeline: RefCell<Timeline>,
++    execution: RefCell<Option<ExecutionHealth>>,
++}
++
++struct ExecutionHealth {
++    request_id: Value,
++    operation_id: Value,
++    stage: String,
++    since: Instant,
++    warned: bool,
 +}
 +
 +impl Emitter {
@@ -1697,6 +1728,7 @@
 +            store,
 +            operations: RefCell::new(HashMap::new()),
 +            timeline: RefCell::new(Timeline::default()),
++            execution: RefCell::new(None),
 +        };
 +        emit_raw("thread.local.ready", emitter.store.summary());
 +        emitter.emit_thread_list();
@@ -1733,6 +1765,9 @@
 +    }
 +
 +    pub fn call_tool(&self, mut payload: Value) -> Result<(), String> {
++        if self.execution.borrow().is_some() {
++            return Err("A CAD operation is still pending. Wait for its actual result; do not retry or overlap edits.".into());
++        }
 +        let key = payload["requestId"].to_string();
 +        if self.operations.borrow().contains_key(&key) {
 +            return Err("Duplicate FreeCAD tool request; not executing again".into());
@@ -1743,6 +1778,13 @@
 +            .map_err(|e| format!("FreeCAD was not executed: could not persist operation: {e}"))?;
 +        payload["operationId"] = json!(id);
 +        self.operations.borrow_mut().insert(key, payload.clone());
++        *self.execution.borrow_mut() = Some(ExecutionHealth {
++            request_id: payload["requestId"].clone(),
++            operation_id: payload["operationId"].clone(),
++            stage: "preflight".into(),
++            since: Instant::now(),
++            warned: false,
++        });
 +        self.emit("tool.activity", payload.clone());
 +        emit_raw("tool.call", payload);
 +        Ok(())
@@ -1762,6 +1804,8 @@
 +            })?;
 +        let mut execution = call.clone();
 +        execution["context"] = payload["context"].clone();
++        self.execution_progress(&json!({"requestId": call["requestId"],
++            "operationId": call["operationId"], "stage": "queued"}))?;
 +        emit_raw("tool.execute", execution);
 +        Ok(())
 +    }
@@ -1778,7 +1822,45 @@
 +            // recovery will classify the remaining running row as unknown.
 +            let _ = self.store.mark_operation_unknown(id);
 +            format!("CAD outcome could not be durably recorded. Inspect the document; do not rerun the Python. Operation {id}: {e}")
-+        })
++        })?;
++        self.execution.borrow_mut().take();
++        Ok(())
++    }
++
++    pub fn execution_pending(&self) -> bool {
++        self.execution.borrow().is_some()
++    }
++
++    pub fn execution_progress(&self, payload: &Value) -> Result<(), String> {
++        let mut health = self.execution.borrow_mut();
++        let active = health.as_mut().ok_or("No pending CAD operation")?;
++        if active.request_id != payload["requestId"] || active.operation_id != payload["operationId"] {
++            return Err("CAD progress operation ID mismatch".into());
++        }
++        let stage = payload["stage"].as_str().unwrap_or_default();
++        if !["queued", "waiting-for-interaction", "inspection", "python", "recompute",
++             "validation", "rendering", "commit", "rollback", "feedback"].contains(&stage) {
++            return Err("Unknown CAD execution stage".into());
++        }
++        active.stage = stage.into();
++        self.emit("tool.health", json!({"operationId": active.operation_id,
++            "requestId": active.request_id, "stage": active.stage,
++            "elapsedSeconds": active.since.elapsed().as_secs(), "outcome": "pending"}));
++        Ok(())
++    }
++
++    pub fn poll_execution(&self, now: Instant) {
++        let mut health = self.execution.borrow_mut();
++        let Some(active) = health.as_mut() else { return; };
++        let elapsed = now.saturating_duration_since(active.since);
++        if elapsed < Duration::from_secs(60) || active.warned { return; }
++        active.warned = true;
++        self.emit("runtime.warning", json!({
++            "operationId": active.operation_id, "stage": active.stage,
++            "elapsedSeconds": elapsed.as_secs(), "outcome": "pending",
++            "message": format!("CAD operation {} has been pending for {}s (last reported stage: {}). Its outcome is not yet known. This is not a rollback or cancellation; wait for the actual result and do not retry the edit.",
++                active.operation_id.as_str().unwrap_or_default(), elapsed.as_secs(), active.stage)
++        }));
 +    }
 +
 +    fn project_timeline(&self, message_type: &str, payload: &Value) {
@@ -1884,9 +1966,25 @@
 +        preparation["operationId"] = id;
 +        emitter.prepare_tool(&preparation).unwrap();
 +        assert!(emitter.prepare_tool(&preparation).is_err());
++        assert!(emitter.execution_pending());
++        assert!(emitter.call_tool(json!({"requestId": 2})).is_err());
++        assert!(emitter.execution_progress(&json!({"requestId": 1, "operationId": "wrong", "stage": "python"})).is_err());
++        let id = preparation["operationId"].clone();
++        emitter.execution_progress(&json!({"requestId": 1, "operationId": id, "stage": "recompute"})).unwrap();
++        let since = emitter.execution.borrow().as_ref().unwrap().since;
++        emitter.poll_execution(since + Duration::from_secs(59));
++        assert!(!emitter.execution.borrow().as_ref().unwrap().warned);
++        emitter.poll_execution(since + Duration::from_secs(61));
++        assert!(emitter.execution.borrow().as_ref().unwrap().warned);
++        assert!(emitter.execution_pending()); // A deadline never completes/replays an operation.
++        emitter.execution_progress(&json!({"requestId": 1, "operationId": id, "stage": "commit"})).unwrap();
 +        emitter
 +            .finish_tool(&json!(1), r#"{"ok":true,"revision":1}"#)
 +            .unwrap();
++        assert!(!emitter.execution_pending());
++        let events = emitter.store.history().unwrap();
++        assert_eq!(events.iter().filter(|e| e["type"] == "runtime.warning").count(), 1);
++        assert!(events.iter().any(|e| e["type"] == "tool.health" && e["payload"]["stage"] == "recompute"));
 +        assert!(emitter.finish_tool(&json!(1), r#"{"ok":true}"#).is_err());
 +    }
 +
@@ -1906,7 +2004,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/store.rs
-@@ -0,0 +1,1293 @@
+@@ -0,0 +1,1294 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use rusqlite::{Connection, OptionalExtension, Params, TransactionBehavior, params};
@@ -2703,6 +2801,7 @@
 +                               'item.completed',
 +                               'tool.activity',
 +                               'tool.observation',
++                               'tool.health',
 +                               'turn.completed',
 +                               'plan.updated',
 +                               'runtime.warning',

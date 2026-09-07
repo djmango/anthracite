@@ -108,6 +108,18 @@ when there is one unambiguous visible result, a focused view. Failed optional ca
 separately and does not roll back a committed edit. Explicit render requests retain their normal
 transactional failure behavior.
 
+For intermediate edits, `cad.feedback(images=False)` skips automatic images for that call only.
+Explicit renders and all validation still run; the observation records the skipped feedback.
+Inspect the final result with `cad.review('Name')` or `cad.render_views()`.
+
+CAD execution waits while a mouse button, popup, or modal dialog is active, then rechecks the
+document revision. Native validity, incomplete post-recompute features, and native status messages
+are checked without treating legitimate shapeless containers or empty sketches as broken solids.
+Rust records operation IDs and execution stages independently of the GUI. After 60 seconds pending,
+it records a warning, not a failure: native work may still be running. Further CAD calls are rejected
+until the actual result arrives; a timeout neither rolls back nor retries an edit. A frozen GUI
+cannot display updates until it resumes; recorded health events remain in the XDG event history.
+
 `cad.explain(reference)` connects an exact pick to its native Body, Tip, profile, parameters,
 expressions and upstream/downstream dependencies. `cad.review(reference)` also attaches focused
 images, or a local-XY diagram for a sketch; an internal object name works too. Dependencies are

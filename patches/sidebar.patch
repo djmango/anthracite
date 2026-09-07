@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
-@@ -0,0 +1,901 @@
+@@ -0,0 +1,950 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "AgentBridge.h"
@@ -19,7 +19,10 @@
 +#include <QProcessEnvironment>
 +#include <QStandardPaths>
 +#include <QThread>
++#include <QPointer>
++#include <QScopedValueRollback>
 +#include <QUuid>
++#include <functional>
 +
 +#include <App/Application.h>
 +#include <App/Document.h>
@@ -32,6 +35,18 @@
 +namespace
 +{
 +constexpr auto preferencePath = "User parameter:BaseApp/Preferences/Mod/Anthracite";
++
++using ProgressCallback = std::function<void(const QString&)>;
++PyObject* reportExecutionStage(PyObject* self, PyObject* stage)
++{
++    const char* text = PyUnicode_AsUTF8(stage);
++    if (!text) return nullptr;
++    auto* callback = static_cast<ProgressCallback*>(PyCapsule_GetPointer(self, "anthracite.progress"));
++    if (!callback) return nullptr;
++    (*callback)(QString::fromUtf8(text));
++    Py_RETURN_NONE;
++}
++PyMethodDef progressMethod = {"report_stage", reportExecutionStage, METH_O, nullptr};
 +
 +QString pythonError()
 +{
@@ -558,7 +573,7 @@
 +        send(QStringLiteral("tool.prepare"), preparation);
 +    }
 +    else if (type == QLatin1String("tool.execute")) {
-+        runFreeCADTool(payload);
++        scheduleFreeCADTool(payload, runtime.processId());
 +    }
 +    else if (type == QLatin1String("request.opened")) {
 +        sidebar->showApproval(
@@ -601,9 +616,28 @@
 +    }
 +}
 +
++void AgentBridge::scheduleFreeCADTool(const QJsonObject& payload, qint64 processId, bool notified)
++{
++    // Do not run stale queued work after its runtime exits or is replaced.
++    if (runtime.state() != QProcess::Running || runtime.processId() != processId) return;
++    if (executingTool || QApplication::mouseButtons() != Qt::NoButton
++        || QApplication::activePopupWidget() || QApplication::activeModalWidget()) {
++        if (!notified) {
++            send(QStringLiteral("tool.progress"), {{"requestId", payload.value("requestId")},
++                {"operationId", payload.value("operationId")}, {"stage", "waiting-for-interaction"}});
++        }
++        QTimer::singleShot(100, this, [this, payload, processId]() {
++            scheduleFreeCADTool(payload, processId, true);
++        });
++        return;
++    }
++    runFreeCADTool(payload);
++}
++
 +void AgentBridge::runFreeCADTool(const QJsonObject& payload)
 +{
 +    Q_ASSERT(QThread::currentThread() == qApp->thread());
++    QScopedValueRollback<bool> executionGuard(executingTool, true);
 +    const QString operationId = payload.value("operationId").toString();
 +    if (operationId.isEmpty() || executedOperations.contains(operationId)) {
 +        fail(tr("Missing or duplicate CAD operation ID; Python was not executed."));
@@ -639,7 +673,7 @@
 +
 +    bool success = false;
 +    QString result
-+        = executePython(payload.value("arguments").toObject().value("code").toString(), success);
++        = executePython(payload.value("arguments").toObject().value("code").toString(), success, payload);
 +    auto resultDocument = QJsonDocument::fromJson(result.toUtf8());
 +    QJsonArray images;
 +    if (resultDocument.isObject()) {
@@ -663,7 +697,7 @@
 +    );
 +}
 +
-+QString AgentBridge::executePython(const QString& source, bool& success)
++QString AgentBridge::executePython(const QString& source, bool& success, const QJsonObject& payload)
 +{
 +    success = false;
 +    const PyGILState_STATE state = PyGILState_Ensure();
@@ -683,9 +717,24 @@
 +    }
 +
 +    const QByteArray encoded = source.toUtf8();
-+    PyObject* result = documentRevision
-+        ? PyObject_CallMethod(module, "execute_json", "si", encoded.constData(), *documentRevision)
-+        : PyObject_CallMethod(module, "execute_json", "s", encoded.constData());
++    QPointer<AgentBridge> bridge(this);
++    const auto processId = runtime.processId();
++    auto* callback = new ProgressCallback([bridge, payload, processId](const QString& stage) {
++        if (!bridge || bridge->runtime.processId() != processId) return;
++        bridge->send(QStringLiteral("tool.progress"), {{"requestId", payload.value("requestId")},
++            {"operationId", payload.value("operationId")}, {"stage", stage}});
++        // Flush before entering native work, without pumping user events.
++        if (bridge->runtime.bytesToWrite()) bridge->runtime.waitForBytesWritten(1000);
++    });
++    PyObject* capsule = PyCapsule_New(callback, "anthracite.progress", [](PyObject* value) {
++        delete static_cast<ProgressCallback*>(PyCapsule_GetPointer(value, "anthracite.progress"));
++    });
++    PyObject* progress = capsule ? PyCFunction_New(&progressMethod, capsule) : nullptr;
++    if (!capsule) delete callback;
++    Py_XDECREF(capsule);
++    PyObject* result = progress ? PyObject_CallMethod(module, "execute_json", "siO",
++        encoded.constData(), documentRevision.value_or(0), progress) : nullptr;
++    Py_XDECREF(progress);
 +    Py_DECREF(module);
 +
 +    if (!result) {
@@ -904,7 +953,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.h
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,111 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_AGENTBRIDGE_H
@@ -967,7 +1016,8 @@
 +    void send(const QString& type, const QJsonObject& payload = {});
 +    void handleMessage(const QJsonObject& message);
 +    void runFreeCADTool(const QJsonObject& payload);
-+    QString executePython(const QString& source, bool& success);
++    void scheduleFreeCADTool(const QJsonObject& payload, qint64 processId, bool notified = false);
++    QString executePython(const QString& source, bool& success, const QJsonObject& payload);
 +    QString runtimePath() const;
 +    QString providerKind() const;
 +    QString providerPath() const;
@@ -989,6 +1039,7 @@
 +    bool awaitingSubmission = false;
 +    bool runtimeReady = false;
 +    bool stopping = false;
++    bool executingTool = false;
 +    bool createNewThread = false;
 +    bool draftDirty = false;
 +    bool restartPending = false;
