@@ -1073,7 +1073,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,99 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +find_package(
@@ -1135,6 +1135,7 @@
 +    AppAnthraciteGui.cpp
 +    Command.cpp
 +    ConversationModel.cpp
++    Composer.cpp
 +    ConversationModel.h
 +    Sidebar.cpp
 +    Sidebar.h
@@ -1372,7 +1373,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,780 @@
+@@ -0,0 +1,792 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
@@ -1842,29 +1843,33 @@
 +                spacing: 8
 +
 +                ScrollView {
++                    id: attachmentTray
++                    objectName: "AnthraciteAttachmentTray"
++                    property var visibleAttachments: anthraciteController.attachments.map((item, index) => ({item: item, index: index})).filter(entry => entry.item.type !== "cad")
 +                    Layout.fillWidth: true
-+                    Layout.preferredHeight: anthraciteController.attachments.length > 0 ? 88 : 0
-+                    visible: anthraciteController.attachments.length > 0
++                    Layout.preferredHeight: visibleAttachments.length > 0 ? 88 : 0
++                    visible: visibleAttachments.length > 0
 +                    clip: true
 +                    Row {
 +                        spacing: 6
 +                        Repeater {
-+                            model: anthraciteController.attachments
-+                            delegate: Frame {
++                            model: attachmentTray.visibleAttachments
++                            delegate: Rectangle {
++                                property var attachment: modelData.item
 +                                width: 154
 +                                height: 80
-+                                padding: 4
-+                                background: Rectangle {
-+                                    radius: 6
-+                                    color: Qt.rgba(0.5, 0.5, 0.5, 0.07)
-+                                    border.color: systemPalette.mid
-+                                }
++                                radius: 6
++                                color: Qt.rgba(0.5, 0.5, 0.5, 0.07)
++                                border.color: systemPalette.mid
 +                                Column {
-+                                    width: parent.width
++                                    anchors.left: parent.left
++                                    anchors.right: parent.right
++                                    anchors.top: parent.top
++                                    anchors.margins: 4
 +                                    Image {
 +                                        width: parent.width - 24
-+                                        height: modelData.type === "image" ? 42 : 0
-+                                        source: modelData.type === "image" ? modelData.dataUrl : ""
++                                        height: attachment.type === "image" ? 42 : 0
++                                        source: attachment.type === "image" ? attachment.dataUrl : ""
 +                                        fillMode: Image.PreserveAspectFit
 +                                        MouseArea {
 +                                            anchors.fill: parent
@@ -1873,13 +1878,13 @@
 +                                    }
 +                                    Label {
 +                                        width: parent.width
-+                                        text: modelData.name
++                                        text: attachment.name
 +                                        elide: Text.ElideMiddle
 +                                        font.pixelSize: 11
 +                                    }
 +                                    Label {
-+                                        visible: modelData.type !== "image"
-+                                        text: modelData.type === "cad" ? qsTr("Picked CAD geometry") : qsTr("File for agent tools")
++                                        visible: attachment.type !== "image"
++                                        text: qsTr("File for agent tools")
 +                                        font.pixelSize: 10
 +                                        opacity: 0.65
 +                                    }
@@ -1897,10 +1902,10 @@
 +                                    }
 +                                    enabled: !anthraciteController.busy
 +                                    Accessible.name: qsTr("Remove attachment")
-+                                    onClicked: anthraciteController.removeAttachment(index)
++                                    onClicked: anthraciteController.removeAttachment(modelData.index)
 +                                }
 +                                ToolTip.visible: attachmentHover.hovered
-+                                ToolTip.text: modelData.name
++                                ToolTip.text: attachment.name
 +                                HoverHandler { id: attachmentHover }
 +                            }
 +                        }
@@ -1956,11 +1961,21 @@
 +                    Layout.preferredHeight: Math.max(70, Math.min(140, implicitHeight))
 +                    placeholderText: qsTr("Describe what you want to make or change…")
 +                    wrapMode: TextEdit.Wrap
++                    textFormat: TextEdit.RichText
++                    persistentSelection: true
 +                    enabled: !anthraciteController.busy
-+                    onTextChanged: anthraciteController.setDraft(text)
++                    Component.onCompleted: anthraciteController.bindComposer(textDocument)
++                    onSelectionStartChanged: anthraciteController.setComposerSelection(selectionStart, selectionEnd)
++                    onSelectionEndChanged: anthraciteController.setComposerSelection(selectionStart, selectionEnd)
 +
 +                    Keys.onPressed: function(event) {
-+                        if (event.matches(StandardKey.Paste) && anthraciteController.pasteAttachments()) {
++                        if (event.matches(StandardKey.Copy) || event.matches(StandardKey.Cut)) {
++                            anthraciteController.copyComposerSelection(event.matches(StandardKey.Cut))
++                            event.accepted = true
++                            return
++                        }
++                        if (event.matches(StandardKey.Paste)) {
++                            if (!anthraciteController.pasteAttachments()) anthraciteController.pasteComposerText()
 +                            event.accepted = true
 +                            return
 +                        }
@@ -1979,10 +1994,8 @@
 +                        if (!anthraciteController.picking) composer.forceActiveFocus()
 +                    }
 +
-+                    function onDraftChanged() {
-+                        if (composer.text !== anthraciteController.draft) {
-+                            composer.text = anthraciteController.draft
-+                        }
++                    function onComposerCursorRequested(position) {
++                        composer.cursorPosition = position
 +                    }
 +                }
 +
@@ -2136,7 +2149,7 @@
 +                        visible: !anthraciteController.busy
 +                        text: qsTr("Send")
 +                        highlighted: true
-+                        enabled: !anthraciteController.processingAttachments && (composer.text.trim().length > 0 || anthraciteController.attachments.length > 0)
++                        enabled: !anthraciteController.processingAttachments && (anthraciteController.draft.trim().length > 0 || anthraciteController.attachments.length > 0)
 +                        onClicked: send()
 +                    }
 +                }
@@ -2145,7 +2158,7 @@
 +    }
 +
 +    function send() {
-+        const text = composer.text.trim()
++        const text = anthraciteController.draft.trim()
 +        if ((text.length === 0 && anthraciteController.attachments.length === 0) || anthraciteController.busy) {
 +            return
 +        }
@@ -2155,7 +2168,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,888 @@
+@@ -0,0 +1,910 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "Sidebar.h"
@@ -2176,6 +2189,7 @@
 +#include <QMouseEvent>
 +#include <QtConcurrent/QtConcurrentRun>
 +#include <QFutureWatcher>
++#include <QTextDocument>
 +#include <QDir>
 +#include <QFileInfo>
 +#include <QFile>
@@ -2369,7 +2383,13 @@
 +
 +void SidebarController::submit(const QString& prompt)
 +{
-+    const QString text = prompt.trimmed();
++    QString text = prompt.trimmed();
++    for (const auto& item : currentAttachments) {
++        const auto token = item.toMap();
++        if (token.value("type").toString() == QLatin1String("cad") && !token.value("token").toString().isEmpty()) {
++            text.replace(token.value("token").toString(), QStringLiteral("@[%1]").arg(token.value("name").toString()));
++        }
++    }
 +    if ((text.isEmpty() && currentAttachments.isEmpty()) || turnBusy || processingAttachments()) {
 +        return;
 +    }
@@ -2385,6 +2405,8 @@
 +{
 +    currentAttachments.clear();
 +    currentDraft.clear();
++    composerTokens.clear();
++    renderComposer();
 +    Q_EMIT attachmentsChanged();
 +    Q_EMIT draftChanged();
 +    Q_EMIT draftEdited(currentDraft);
@@ -2394,6 +2416,16 @@
 +{
 +    ++composerGeneration;
 +    currentAttachments = attachments;
++    composerTokens.clear();
++    for (auto& item : currentAttachments) {
++        auto token = item.toMap();
++        if (token.value("type").toString() != QLatin1String("cad")) continue;
++        if (token.value("id").toString().isEmpty()) token.insert("id", QUuid::createUuid().toString(QUuid::WithoutBraces));
++        if (token.value("token").toString().isEmpty()) token.insert("token", QStringLiteral("@[%1]").arg(token.value("name").toString()));
++        composerTokens.insert(token.value("id").toString(), token);
++        item = token;
++    }
++    renderComposer();
 +    Q_EMIT attachmentsChanged();
 +}
 +
@@ -2411,13 +2443,13 @@
 +        appendActivity(tr("Images exceed the 24 MiB message limit."));
 +        return;
 +    }
++    if (attachment.value("type").toString() == QLatin1String("cad")) {
++        insertPick(attachment);
++        return;
++    }
 +    currentAttachments.append(attachment);
 +    Q_EMIT attachmentsChanged();
 +    Q_EMIT draftEdited(currentDraft);
-+    if (attachment.value("type").toString() == QLatin1String("cad")) {
-+        setDraft(currentDraft + QStringLiteral(" @[%1] ").arg(attachment.value("name").toString()));
-+        Q_EMIT draftChanged();
-+    }
 +}
 +
 +void SidebarController::removeAttachment(int index)
@@ -2425,7 +2457,7 @@
 +    if (index < 0 || index >= currentAttachments.size() || turnBusy) return;
 +    const auto removed = currentAttachments.takeAt(index).toMap();
 +    if (removed.value("type").toString() == QLatin1String("cad")) {
-+        setDraft(currentDraft.replace(QStringLiteral("@[%1]").arg(removed.value("name").toString()), QString()));
++        setDraft(QString(currentDraft).replace(removed.value("token").toString(), QString()));
 +        Q_EMIT draftChanged();
 +    }
 +    Q_EMIT attachmentsChanged();
@@ -2606,6 +2638,8 @@
 +        return;
 +    }
 +    currentDraft = body;
++    renderComposer();
++    readComposer();
 +    Q_EMIT draftChanged();
 +    Q_EMIT draftEdited(currentDraft);
 +}
@@ -2778,6 +2812,7 @@
 +        return;
 +    }
 +    currentDraft = body;
++    renderComposer();
 +    Q_EMIT draftChanged();
 +}
 +
@@ -3046,7 +3081,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,227 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_SIDEBAR_H
@@ -3063,6 +3098,8 @@
 +#include "ConversationModel.h"
 +
 +class QQuickWidget;
++class QTextDocument;
++class QTextCursor;
 +
 +namespace AnthraciteGui
 +{
@@ -3122,6 +3159,10 @@
 +    Q_INVOKABLE void attachFiles();
 +    Q_INVOKABLE void attachFile(const QString& path);
 +    Q_INVOKABLE void removeAttachment(int index);
++    Q_INVOKABLE void bindComposer(QObject* quickDocument);
++    Q_INVOKABLE void setComposerSelection(int start, int end);
++    Q_INVOKABLE void copyComposerSelection(bool cut);
++    Q_INVOKABLE void pasteComposerText();
 +    Q_INVOKABLE void togglePicker();
 +    void setPicking(bool active);
 +    void addAttachment(const QVariantMap& attachment);
@@ -3195,6 +3236,7 @@
 +    void draftChanged();
 +    void attachmentsChanged();
 +    void pickingChanged();
++    void composerCursorRequested(int position);
 +    void modelsChanged();
 +    void usageChanged();
 +    void providerChanged();
@@ -3202,6 +3244,12 @@
 +private:
 +    bool eventFilter(QObject* watched, QEvent* event) override;
 +    void prepareAttachment(std::function<QVariantMap()> read);
++    void renderComposer();
++    void readComposer();
++    void insertComposerText(QTextCursor& cursor, const QString& text);
++    void insertComposerToken(QTextCursor& cursor, const QVariantMap& token);
++    QString composerPlainText(QTextDocument* document) const;
++    void insertPick(QVariantMap attachment);
 +    void setStatus(QString status);
 +    void setBusy(bool busy);
 +    void applyModelSelection(const QString& model, const QString& effort, bool edited);
@@ -3217,6 +3265,11 @@
 +    QVariantList availableThreads;
 +    QString activeThreadId;
 +    QString currentDraft;
++    QPointer<QTextDocument> composerDocument;
++    QHash<QString, QVariantMap> composerTokens;
++    bool updatingComposer = false;
++    int composerSelectionStart = 0;
++    int composerSelectionEnd = 0;
 +    QVariantList currentAttachments;
 +    bool pickActive = false;
 +    int pendingAttachments = 0;
@@ -3258,7 +3311,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,314 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -3396,6 +3449,7 @@
 +        assert Path(attached[0]['path']).read_text() == 'Original reference'
 +        controller.removeAttachment(0)
 +    for subelement in ('Face1', 'Edge1', 'Vertex1', ''):
++        controller.setDraft('')
 +        Gui.Selection.clearSelection()
 +        controller.togglePicker()
 +        assert controller.property('picking')
@@ -3406,7 +3460,41 @@
 +        assert picked['reference']['object'] == 'RenderBox'
 +        assert picked['name'] in controller.property('draft')
 +        assert AnthraciteExecutor.validate_picks_json(json.dumps([picked])) == 'ok'
-+        controller.removeAttachment(0)
++        composer = root.findChild(QtCore.QObject, 'AnthraciteComposer')
++        assert composer.property('length') == 1, 'A CAD token must occupy exactly one editor character'
++        assert not root.findChild(QtCore.QObject, 'AnthraciteAttachmentTray').property('visible'), 'CAD token duplicated in tray'
++        composer.forceActiveFocus()
++        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Backspace)
++        assert not controller.property('attachments'), 'Backspace left a hidden model reference'
++        assert controller.property('draft') == ''
++        QtTest.QTest.keySequence(quick_widget, QtGui.QKeySequence(QtGui.QKeySequence.Undo))
++        assert controller.property('attachments')[0]['reference'] == picked['reference'], 'Undo lost token identity'
++        assert composer.property('length') == 1
++        if subelement == 'Face1':
++            Gui.runCommand('Anthracite_ReloadSidebar')
++            quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
++            root = quick_widget.rootObject()
++            composer = root.findChild(QtCore.QObject, 'AnthraciteComposer')
++            assert composer.property('length') == 1, 'Reload expanded a token into ordinary text'
++            assert controller.property('attachments')[0]['reference'] == picked['reference']
++            composer.forceActiveFocus()
++        composer.select(0, 1)
++        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Delete)
++        assert not controller.property('attachments'), 'Selection deletion left a hidden reference'
++    controller.setDraft('Make  thinner')
++    composer.setProperty('cursorPosition', 5)
++    Gui.Selection.clearSelection()
++    controller.togglePicker()
++    Gui.Selection.addSelection(render_document.Name, 'RenderBox', 'Face1')
++    assert controller.property('draft').startswith('Make @[') and controller.property('draft').endswith(' thinner')
++    assert composer.property('length') == len('Make  thinner') + 1
++    QtWidgets.QApplication.processEvents()
++    capture = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/picker-token.png'
++    assert dock.grab().save(str(capture))
++    composer.select(5, 6)
++    QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Backspace)
++    assert controller.property('draft') == 'Make  thinner'
++    assert not controller.property('attachments')
 +    controller.togglePicker()
 +    QtWidgets.QApplication.sendEvent(main_window, QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_Escape, QtCore.Qt.NoModifier))
 +    assert not controller.property('picking')
@@ -3529,8 +3617,212 @@
 +    App.closeDocument(first.Name)
 +    App.closeDocument(second.Name)
 +    QtWidgets.QApplication.processEvents()
-+    print("ANTHRACITE_GUI_SMOKE_OK")
++    print("ANTHRACITE_GUI_SMOKE_OK", flush=True)
 +
 +
 +run_smoke_test()
-+QtCore.QTimer.singleShot(0, QtWidgets.QApplication.instance().quit)
++def finish():
++    # Drain deferred native-widget destruction before Cocoa tears down Qt thread storage.
++    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
++    QtWidgets.QApplication.instance().quit()
++QtCore.QTimer.singleShot(0, finish)
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Composer.cpp
+@@ -0,0 +1,197 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++// Native text-document glue: a CAD mention is one inline image character, not editable label text.
++#include "Sidebar.h"
++
++#include <QApplication>
++#include <QBuffer>
++#include <QClipboard>
++#include <QPainter>
++#include <QQuickTextDocument>
++#include <QTextBlock>
++#include <QTextCursor>
++#include <QTextDocument>
++#include <QTextDocumentFragment>
++#include <QTextImageFormat>
++#include <QUuid>
++#include <QSet>
++#include <algorithm>
++
++using namespace AnthraciteGui;
++
++namespace {
++constexpr int tokenProperty = QTextFormat::UserProperty + 1;
++}
++
++void SidebarController::bindComposer(QObject* quickDocument)
++{
++    auto* quick = qobject_cast<QQuickTextDocument*>(quickDocument);
++    if (!quick) return;
++    if (composerDocument) disconnect(composerDocument, nullptr, this, nullptr);
++    composerDocument = quick->textDocument();
++    connect(composerDocument, &QTextDocument::contentsChanged, this, &SidebarController::readComposer);
++    renderComposer();
++}
++
++void SidebarController::setComposerSelection(int start, int end)
++{
++    if (updatingComposer) return;
++    composerSelectionStart = start;
++    composerSelectionEnd = end;
++}
++
++QString SidebarController::composerPlainText(QTextDocument* document) const
++{
++    QString result;
++    for (auto block = document->begin(); block.isValid(); block = block.next()) {
++        if (block != document->begin()) result += QLatin1Char('\n');
++        for (auto it = block.begin(); !it.atEnd(); ++it) {
++            const auto fragment = it.fragment();
++            if (fragment.charFormat().isImageFormat()) {
++                const auto id = fragment.charFormat().property(tokenProperty).toString();
++                if (composerTokens.contains(id)) result += composerTokens.value(id).value("token").toString();
++            } else {
++                result += fragment.text();
++            }
++        }
++    }
++    return result;
++}
++
++void SidebarController::readComposer()
++{
++    if (updatingComposer || !composerDocument) return;
++    currentDraft = composerPlainText(composerDocument);
++    QVariantList active;
++    for (const auto& item : currentAttachments) {
++        if (item.toMap().value("type").toString() != QLatin1String("cad")) active.append(item);
++    }
++    QSet<QString> seen;
++    for (auto block = composerDocument->begin(); block.isValid(); block = block.next()) {
++        for (auto it = block.begin(); !it.atEnd(); ++it) {
++            if (!it.fragment().charFormat().isImageFormat()) continue;
++            const auto id = it.fragment().charFormat().property(tokenProperty).toString();
++            if (composerTokens.contains(id) && !seen.contains(id)) {
++                active.append(composerTokens.value(id));
++                seen.insert(id);
++            }
++        }
++    }
++    currentAttachments = active;
++    Q_EMIT attachmentsChanged();
++    Q_EMIT draftChanged();
++    Q_EMIT draftEdited(currentDraft);
++}
++
++void SidebarController::insertComposerToken(QTextCursor& cursor, const QVariantMap& token)
++{
++    const QString id = token.value("id").toString();
++    const QString label = token.value("name").toString();
++    const QFont font = composerDocument->defaultFont();
++    const QFontMetrics metrics(font);
++    const QString display = metrics.elidedText(label, Qt::ElideMiddle, 250);
++    const QSize size(metrics.horizontalAdvance(display) + 16, metrics.height() + 8);
++    QImage image(size * 2, QImage::Format_ARGB32_Premultiplied);
++    image.setDevicePixelRatio(2);
++    image.fill(Qt::transparent);
++    image.setText("anthracite-token", id);
++    QPainter painter(&image);
++    painter.setRenderHint(QPainter::Antialiasing);
++    painter.setPen(Qt::NoPen);
++    auto background = qApp->palette().highlight().color();
++    background.setAlpha(65);
++    painter.setBrush(background);
++    painter.drawRoundedRect(QRectF(QPointF(0, 0), size), 5, 5);
++    painter.setFont(font);
++    painter.setPen(qApp->palette().text().color());
++    painter.drawText(QRect(QPoint(), size), Qt::AlignCenter, display);
++    painter.end();
++    QByteArray png;
++    QBuffer buffer(&png);
++    buffer.open(QIODevice::WriteOnly);
++    image.save(&buffer, "PNG");
++    QTextImageFormat format;
++    format.setName(QStringLiteral("data:image/png;base64,") + QString::fromLatin1(png.toBase64()));
++    format.setWidth(size.width());
++    format.setHeight(size.height());
++    format.setToolTip(label);
++    format.setProperty(tokenProperty, id);
++    cursor.insertImage(format);
++    // Following text must not inherit the object's identity.
++    cursor.setCharFormat(QTextCharFormat());
++}
++
++void SidebarController::insertComposerText(QTextCursor& cursor, const QString& text)
++{
++    int position = 0;
++    while (position < text.size()) {
++        int next = text.size();
++        QVariantMap found;
++        for (const auto& token : composerTokens) {
++            const QString marker = token.value("token").toString();
++            const int index = marker.isEmpty() ? -1 : text.indexOf(marker, position);
++            if (index >= 0 && index < next) { next = index; found = token; }
++        }
++        cursor.insertText(text.mid(position, next - position));
++        if (found.isEmpty()) break;
++        insertComposerToken(cursor, found);
++        position = next + found.value("token").toString().size();
++    }
++}
++
++void SidebarController::renderComposer()
++{
++    if (!composerDocument) return;
++    updatingComposer = true;
++    Q_EMIT composerCursorRequested(0);
++    composerDocument->clear();
++    QTextCursor cursor(composerDocument);
++    insertComposerText(cursor, currentDraft);
++    composerDocument->clearUndoRedoStacks();
++    composerSelectionStart = composerSelectionEnd = cursor.position();
++    updatingComposer = false;
++    Q_EMIT composerCursorRequested(cursor.position());
++}
++
++void SidebarController::insertPick(QVariantMap attachment)
++{
++    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
++    attachment.insert("id", id);
++    attachment.insert("token", QStringLiteral("@[%1 #%2]").arg(attachment.value("name").toString(), id));
++    composerTokens.insert(id, attachment);
++    if (!composerDocument) return;
++    QTextCursor cursor(composerDocument);
++    cursor.setPosition(std::clamp(composerSelectionStart, 0, composerDocument->characterCount() - 1));
++    cursor.setPosition(std::clamp(composerSelectionEnd, 0, composerDocument->characterCount() - 1), QTextCursor::KeepAnchor);
++    cursor.beginEditBlock();
++    insertComposerToken(cursor, attachment);
++    cursor.endEditBlock();
++    Q_EMIT composerCursorRequested(cursor.position());
++}
++
++void SidebarController::copyComposerSelection(bool cut)
++{
++    if (!composerDocument) return;
++    QTextCursor cursor(composerDocument);
++    cursor.setPosition(std::clamp(composerSelectionStart, 0, composerDocument->characterCount() - 1));
++    cursor.setPosition(std::clamp(composerSelectionEnd, 0, composerDocument->characterCount() - 1), QTextCursor::KeepAnchor);
++    if (!cursor.hasSelection()) return;
++    QTextDocument selected;
++    QTextCursor(&selected).insertFragment(cursor.selection());
++    QApplication::clipboard()->setText(composerPlainText(&selected));
++    if (cut) cursor.removeSelectedText();
++}
++
++void SidebarController::pasteComposerText()
++{
++    if (!composerDocument) return;
++    QTextCursor cursor(composerDocument);
++    cursor.setPosition(std::clamp(composerSelectionStart, 0, composerDocument->characterCount() - 1));
++    cursor.setPosition(std::clamp(composerSelectionEnd, 0, composerDocument->characterCount() - 1), QTextCursor::KeepAnchor);
++    cursor.beginEditBlock();
++    cursor.removeSelectedText();
++    // Only restore known local tokens. Never load arbitrary clipboard HTML/image resources.
++    insertComposerText(cursor, QApplication::clipboard()->text());
++    cursor.endEditBlock();
++    Q_EMIT composerCursorRequested(cursor.position());
++}

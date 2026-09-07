@@ -82,7 +82,9 @@ attachments, 8 MiB per selected file, images scaled to fit 2048×2048, 24 MiB co
 Attachments persist with each thread’s draft. File snapshots remain until explicitly removed.
 
 Click the **eyedropper**, then click a face, edge, vertex, or object in the viewport. FreeCAD’s
-native selection resolves the hit; the composer shows its label, internal name and subelement.
+native selection resolves the hit; the composer shows its label, internal name and subelement as
+one inline token, not a second attachment card. One Backspace (or deleting a selection containing
+it) removes the whole token and its model reference; native editor undo restores both.
 Escape or right-click cancels. The agent receives an exact revision-bound reference, geometry
 summary and picked point in mm. Stale references block sending until removed and picked again;
 the executor also rejects them if geometry changes later. Unsupported selections are reported,
