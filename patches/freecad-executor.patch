@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,1233 @@
+@@ -0,0 +1,1345 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -40,6 +40,7 @@
 +_executing_docs: set[str] = set()
 +_last_changes = {}
 +_recompute_writes = {}
++_observed_snapshots = {}
 +
 +
 +def _bump_revision(doc: Any) -> None:
@@ -82,6 +83,7 @@
 +    def slotDeletedDocument(self, doc):
 +        Inspect.forget(doc)
 +        _last_changes.pop(str(doc.Name), None)
++        _observed_snapshots.pop(str(doc.Name), None)
 +        _revisions.pop(str(doc.Name), None)
 +        History.forget(doc)
 +
@@ -504,7 +506,7 @@
 +            obj = Inspect.resolve(App.ActiveDocument, spec["focus"])
 +            if not hasattr(obj, "Shape") or obj.Shape.isNull():
 +                raise ValueError("Focus requires an object with non-null native geometry.")
-+            bounds = obj.Shape.BoundBox
++            bounds = Inspect.native_shape(App.ActiveDocument, obj, spec.get("revision", 0)).BoundBox
 +            center = bounds.Center
 +            extent = max(bounds.DiagonalLength, 0.01)
 +            camera = view.getCameraNode()
@@ -705,6 +707,25 @@
 +    def diagnostics(self, obj=None):
 +        return Inspect.diagnostics(self.doc, None if obj is None else [Inspect.resolve(self.doc, obj)])
 +
++    def explain(self, obj, offset=0, limit=20):
++        return Inspect.explain(self.doc, obj, self._reference_revision(), offset, limit)
++
++    def frame(self, obj):
++        return Inspect.frame(self.doc, obj)
++
++    def review(self, obj):
++        """Explain an exact target and attach a focused view without editing geometry."""
++        explanation = self.explain(obj)
++        name = explanation["selectedObject"]
++        target = Inspect.resolve(self.doc, name)
++        if target.isDerivedFrom("Sketcher::SketchObject"):
++            self.render_sketch(name)
++        else:
++            refs = [obj] if isinstance(obj, dict) else []
++            self.render_views(["current", "axonometric"], width=640, height=480,
++                              focus=name, highlight=[name], labels=True, axes=True, references=refs)
++        return explanation
++
 +    def topology(self, obj, *, kind="faces", surface=None, offset=0, limit=25):
 +        return Inspect.topology(self.doc, obj, self._reference_revision(),
 +                                kind=kind, surface=surface, offset=offset, limit=limit)
@@ -841,6 +862,8 @@
 +    obj = doc.getObject(object_name)
 +    return json.dumps({"type": "cad", "name": f"{obj.Label} ({obj.Name}) · {subelement or 'whole object'}",
 +                       "reference": reference, "point_mm": [x, y, z],
++                       "coordinateFrame": "document/world",
++                       "inspect": f"cad.review({reference!r})",
 +                       "geometry": _topology_summary(shape)})
 +
 +
@@ -863,7 +886,7 @@
 +    })
 +
 +
-+_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify"}
++_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame"}
 +_HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint"}
 +
 +
@@ -979,7 +1002,7 @@
 +        if standalone:
 +            method, args, kwargs = standalone
 +            try:
-+                if method in {"guide", "checkpoints"}:
++                if method in {"guide", "checkpoints"} or (method == "api" and kwargs.get("kind") in {"modules", "commands", "workbenches"}):
 +                    result = getattr(Cad(None), method)(*args, **kwargs)
 +                elif method in {"tree", "inspect"} and not args and not kwargs:
 +                    result = {"document": None, "nodes": [], "total": 0, "nextOffset": None}
@@ -1208,8 +1231,97 @@
 +    }
 +
 +
++def _intervening_changes(doc):
++    previous = _observed_snapshots.get(doc.Name)
++    if previous is None:
++        return {"baseline": "first observation in this application session", "changes": None}
++    current = _document_snapshot(doc)
++    before, revision = previous
++    names = sorted(set(before) | set(current))
++    entries = []
++    for name in names:
++        if before.get(name) == current.get(name):
++            continue
++        old, new = before.get(name), current.get(name)
++        entry = {"object": name, "kind": "created" if old is None else "deleted" if new is None else "changed"}
++        if old and new:
++            changed = _changed_properties(old, new)
++            entry["properties"] = {key: {"before": old["properties"].get(key, {}).get("value"),
++                                          "after": new["properties"].get(key, {}).get("value")}
++                                   for key in changed[:20] if key != "Shape"}
++            entry["propertyCount"] = len(changed)
++            entry["geometryChanged"] = "Shape" in changed
++        entries.append(entry)
++    return {"sinceRevision": revision, "revision": _revisions.get(doc.Name, 0),
++            "changes": entries[:40], "remaining": max(0, len(entries) - 40),
++            "source": "Changes outside this executor since its last call: user, native undo/redo, or other automation; author is not inferred.",
++            "referencePolicy": "Revision changes invalidate topology references even when geometry later returns to the same appearance."}
++
++
++def _automatic_feedback(doc, result):
++    observation = result.get("observation") or {}
++    if not result.get("ok") or result.get("readOnly") or result.get("images"):
++        return
++    changed = observation.get("created", []) + observation.get("changed", [])
++    geometry = [entry["name"] for entry in changed if entry.get("shape") and
++                (entry in observation.get("created", []) or
++                 set(entry.get("properties", [])) & {"Shape", "Placement"})]
++    if not geometry and not observation.get("deleted"):
++        return
++    if Gui is None or Gui.activeDocument() is None:
++        observation["visualFeedback"] = {"status": "unavailable", "reason": "No native GUI viewport."}
++        return
++    # Prefer the visible final Body to hidden intermediate features. Multiple
++    # independent results get an overview; never arbitrarily choose one of them.
++    candidates = [doc.getObject(name) for name in geometry]
++    bodies = [obj for obj in candidates if obj.isDerivedFrom("PartDesign::Body")]
++    candidates = bodies or [obj for obj in candidates if getattr(getattr(obj, "ViewObject", None), "Visibility", False)]
++    focus = candidates[0].Name if len(candidates) == 1 else None
++    specs = [{**_render_spec(640, 480, "current", True), "labels": True, "axes": True,
++              "revision": result["revision"], "automatic": True, "purpose": "post-edit overview"}]
++    if focus:
++        specs.append({**_render_spec(640, 480, "axonometric", False), "focus": focus,
++                      "highlight": [focus], "labels": True, "axes": True, "revision": result["revision"],
++                      "automatic": True, "purpose": "post-edit focused inspection"})
++    try:
++        rendered = _render_views(specs)
++        observation["renders"] = [{"imageIndex": i, **{k: v for k, v in image.items() if k != "dataUrl"}}
++                                  for i, image in enumerate(rendered)]
++        result["images"] = [image["dataUrl"] for image in rendered]
++        observation["visualFeedback"] = {"status": "captured", "note": "Images are observations, not proof of design correctness."}
++    except Exception as error:
++        # Optional feedback must not undo an already validated and committed CAD edit.
++        observation["visualFeedback"] = {"status": "failed", "reason": str(error),
++                                         "retry": "cad.render_views()", "editCommitted": True}
++
++
 +def execute(source: str, expected_revision: int | None = None) -> dict[str, Any]:
++    doc = App.ActiveDocument
++    try:
++        intervening = _intervening_changes(doc) if doc else None
++    except Exception as error:
++        intervening = {"status": "unavailable", "reason": str(error)}
 +    result = _execute_impl(source, expected_revision)
++    result["interveningChanges"] = intervening
++    current = App.ActiveDocument
++    if current is not None and (doc is None or current is doc):
++        observation = result.get("observation") or {}
++        changes = observation.get("created", []) + observation.get("changed", [])
++        if result.get("ok") and changes:
++            # Native undo/redo is also an observed edit, not a reason to retain
++            # or guess the pre-undo geometry highlight.
++            _last_changes[current.Name] = {"revision": result["revision"],
++                                           "names": [entry["name"] for entry in changes]}
++        try:
++            _automatic_feedback(current, result)
++        except Exception as error:
++            if isinstance(result.get("observation"), dict):
++                result["observation"]["visualFeedback"] = {"status": "failed", "reason": str(error),
++                                                           "editCommitted": bool(result.get("ok"))}
++        try:
++            _observed_snapshots[current.Name] = (_document_snapshot(current), _revisions.get(current.Name, 0))
++        except Exception as error:
++            result["changeTracking"] = {"status": "unavailable", "reason": str(error)}
 +    if not result.get("ok"):
 +        error_type = result.get("error", {}).get("type")
 +        if result.get("conflict") or "topology" in result.get("error", {}).get("message", "").lower():
@@ -1236,7 +1348,7 @@
 +    )
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthracite.py
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,474 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import unittest
@@ -1254,6 +1366,82 @@
 +
 +
 +class ExecutorTest(unittest.TestCase):
++    def test_explain_follows_native_history_without_claiming_face_provenance(self):
++        self.run_code(AnthraciteInspect.guide('partdesign')['code'])
++        ref = self.run_code("cad.topology('BasePad')")['result']['items'][0]['reference']
++        explanation = self.run_code(f"cad.explain({ref!r}, limit=1)")
++        self.assertTrue(explanation['readOnly'])
++        result = explanation['result']
++        self.assertEqual(result['body'], 'Body')
++        self.assertEqual(result['displayedTip'], 'BasePad')
++        self.assertEqual(result['profile']['name'], 'BaseSketch')
++        self.assertEqual(result['nextOffset'], 1)
++        self.assertIn('not face-generation provenance', result['topologyPolicy'])
++        self.assertEqual(self.run_code("cad.explain('Body')")['result']['feature']['name'], 'BasePad')
++        self.run_code("doc.getObject('BasePad').Length = 12")
++        self.assertFalse(AnthraciteExecutor.execute(f"cad.explain({ref!r})")['ok'])
++
++    def test_frames_include_rotated_container_placement(self):
++        self.run_code(AnthraciteInspect.guide('partdesign')['code'])
++        self.run_code("doc.getObject('Body').Placement = App.Placement(App.Vector(30,40,50), App.Rotation(App.Vector(0,0,1),90))")
++        frame = self.run_code("cad.frame('BaseSketch')")['result']
++        self.assertEqual(frame['origin_world_mm'], {'x': 30.0, 'y': 40.0, 'z': 50.0})
++        self.assertAlmostEqual(frame['axes_world']['x']['x'], 0, places=7)
++        self.assertAlmostEqual(frame['axes_world']['x']['y'], 1, places=7)
++        measured = self.run_code("cad.measure('BasePad')")['result']
++        self.assertAlmostEqual(measured['centerOfMass_mm']['x'], 30)
++        self.assertIn('world', measured['coordinateFrame'])
++
++    def test_intervening_changes_report_native_edits_once_and_not_agent_edits(self):
++        self.run_code("doc.addObject('Part::Box', 'Box')")
++        self.doc.openTransaction('Manual dimension edit')
++        self.doc.getObject('Box').Length = 25
++        self.doc.recompute()
++        self.doc.commitTransaction()
++        report = self.run_code("cad.tree()")['interveningChanges']
++        entry = next(x for x in report['changes'] if x['object'] == 'Box')
++        self.assertEqual(entry['properties']['Length']['before']['value'], 10)
++        self.assertEqual(entry['properties']['Length']['after']['value'], 25)
++        self.assertEqual(self.run_code("cad.tree()")['interveningChanges']['changes'], [])
++        self.doc.undo()
++        self.doc.recompute()
++        self.assertTrue(self.run_code("cad.tree()")['interveningChanges']['changes'])
++        self.run_code("doc.getObject('Box').Length = 30")
++        self.assertEqual(self.run_code("cad.tree()")['interveningChanges']['changes'], [])
++
++    def test_native_api_discovery_is_paged_and_does_not_invoke_methods(self):
++        self.run_code(AnthraciteInspect.guide('partdesign')['code'])
++        before = AnthraciteExecutor._document_snapshot(self.doc)
++        result = self.run_code("cad.api('BaseSketch', kind='methods', query='setDatum', limit=1)")['result']
++        self.assertEqual(result['methods'][0]['name'], 'setDatum')
++        self.assertIn('documentation', result['methods'][0])
++        self.assertEqual(before, AnthraciteExecutor._document_snapshot(self.doc))
++        modules = self.run_code("cad.api(kind='modules')")['result']['modules']
++        self.assertIn('Sketcher', modules)
++
++    def test_editability_checks_are_explicit_and_fail_closed(self):
++        self.run_code(AnthraciteInspect.guide('partdesign')['code'])
++        checks = [{'object': 'Body', 'metric': 'bodyTip', 'expected': 'BasePad'},
++                  {'object': 'Body', 'metric': 'nativeFeatureHistory', 'expected': True},
++                  {'object': 'BaseSketch', 'metric': 'sketchDegreesOfFreedom', 'expected': 0, 'tolerance': 0}]
++        self.assertEqual(self.run_code(f"cad.verify({checks!r})")['result']['status'], 'pass')
++        self.run_code("opaque = doc.getObject('Body').newObject('PartDesign::Feature', 'Frozen')\nopaque.Shape = doc.getObject('BasePad').Shape.copy()\ndoc.getObject('Body').Tip = opaque")
++        failed = self.run_code(f"cad.verify({checks!r})")['result']
++        self.assertEqual(failed['claims'][0]['status'], 'fail')
++        self.assertEqual(failed['claims'][1]['status'], 'fail')
++
++    def test_optional_visual_feedback_failure_never_reverts_committed_edit(self):
++        def unavailable(specs):
++            if specs:
++                raise RuntimeError('Camera unavailable')
++            return []
++        with patch.object(AnthraciteExecutor, 'Gui', SimpleNamespace(activeDocument=lambda: object())), \
++                patch.object(AnthraciteExecutor, '_render_views', side_effect=unavailable):
++            result = self.run_code("doc.addObject('Part::Box', 'Box')")
++        self.assertIsNotNone(self.doc.getObject('Box'))
++        self.assertTrue(result['observation']['visualFeedback']['editCommitted'])
++        self.assertEqual(result['observation']['visualFeedback']['status'], 'failed')
++
 +    def test_reference_cannot_cross_document_recreation(self):
 +        self.run_code("doc.addObject('Part::Box', 'Box')")
 +        ref = self.run_code("cad.topology('Box')")['result']['items'][0]['reference']
@@ -1822,7 +2010,7 @@
 +            "checkpoint": identity, "originalDocumentPreserved": True}
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteInspect.py
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,459 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Readable, bounded native CAD observations; never a replacement geometry API."""
 +import FreeCAD as App
@@ -1896,12 +2084,14 @@
 +            "nextOffset": offset + limit if offset + limit < len(entries) else None,
 +            "provenance": "FreeCAD/OCC native BRep; analytic surface/curve parameters where available; kernel-tolerance numerical integrals otherwise",
 +            "units": {"length": "mm", "area": "mm^2"},
++            "coordinateFrame": "document/world; directions are unit vectors",
 +            "referencePolicy": "Every reference expires on a document revision change. Multiple matches are candidates, not a selection."}
 +
 +
 +def measure(doc, target, revision, other=None):
 +    shape = native_shape(doc, target, revision)
 +    result = {"document": doc.Name, "revision": revision,
++              "coordinateFrame": "document/world; lengths in mm",
 +              "provenance": "FreeCAD/OCC BRep, not viewport tessellation",
 +              "tolerance_mm": shape.getTolerance(1)}
 +    if other is not None:
@@ -1945,6 +2135,25 @@
 +                    raise ValueError("fullyConstrained requires a native sketch.")
 +                measured = obj.DoF == 0 and not obj.ConflictingConstraints and not obj.RedundantConstraints
 +                measured = bool(measured)
++            elif metric in ("bodyTip", "sketchDegreesOfFreedom", "nativeFeatureHistory"):
++                obj = resolve(doc, check["object"])
++                if "Touched" in obj.State:
++                    raise ValueError("Recompute before checking feature history.")
++                if metric == "sketchDegreesOfFreedom":
++                    if not obj.isDerivedFrom("Sketcher::SketchObject"):
++                        raise ValueError("sketchDegreesOfFreedom requires a native sketch.")
++                    measured = obj.DoF
++                else:
++                    if not obj.isDerivedFrom("PartDesign::Body"):
++                        raise ValueError(f"{metric} requires a native PartDesign Body.")
++                    if metric == "bodyTip":
++                        measured = obj.Tip.Name if obj.Tip else None
++                    else:
++                        measured = bool(obj.Tip and obj.Tip in obj.Group
++                            and obj.Tip.isDerivedFrom("PartDesign::Feature")
++                            and obj.Tip.TypeId not in ("PartDesign::Feature", "PartDesign::FeaturePython")
++                            and any(x.isDerivedFrom("Sketcher::SketchObject") for x in obj.Group))
++                        claim["scope"] = "Body has a native parametric Tip and a sketch; not proof that every operation or design relationship is editable."
 +            elif metric == "type":
 +                measured = resolve(doc, check["object"]).TypeId
 +            else:
@@ -2089,6 +2298,59 @@
 +            "total": len(objects), "nextOffset": offset + limit if offset + limit < len(objects) else None}
 +
 +
++def frame(doc, target):
++    obj = resolve(doc, target)
++    if not hasattr(obj, "Placement"):
++        raise ValueError("This object has no native placement frame.")
++    placement = obj.getGlobalPlacement()
++    return {"object": obj.Name, "lengthUnit": "mm", "angleUnit": "degrees",
++            "worldFromLocal": value(placement), "localFromWorld": value(placement.inverse()),
++            "origin_world_mm": value(placement.Base),
++            "axes_world": {name: value(placement.Rotation.multVec(axis)) for name, axis in
++                           (("x", App.Vector(1, 0, 0)), ("y", App.Vector(0, 1, 0)), ("z", App.Vector(0, 0, 1)))},
++            "pointConversion": f"doc.getObject({obj.Name!r}).getGlobalPlacement().multVec(App.Vector(x, y, z))",
++            "directionConversion": "Use Placement.Rotation.multVec(direction); directions must not include translation.",
++            "geometryFrame": "Sketch Geometry/constraints use local XY. cad.topology(), cad.measure(), picker points and section planes use document/world coordinates.",
++            "placementNote": "Placement is relative to its parent; getGlobalPlacement includes native container placement. Shape geometry can already carry placement; do not apply it twice."}
++
++
++def explain(doc, target, revision, offset=0, limit=20):
++    """Explain exact native dependencies, never infer which sketch edge generated a face."""
++    if offset < 0 or not 1 <= limit <= 50:
++        raise ValueError("Explanation limit must be 1..50; offset must be non-negative.")
++    reference = target if isinstance(target, dict) else None
++    if reference is not None:
++        native_shape(doc, reference, revision)  # Reject stale, ambiguous, or recreated targets.
++        target = reference["object"]
++    obj = resolve(doc, target)
++    body = obj if obj.isDerivedFrom("PartDesign::Body") else next(
++        (parent for parent in obj.InList if parent.isDerivedFrom("PartDesign::Body") and obj in parent.Group), None)
++    feature = body.Tip if obj is body and body.Tip else obj
++    profile = getattr(feature, "Profile", None)
++    if isinstance(profile, tuple):
++        profile = profile[0]
++    downstream = sorted({x.Name for x in feature.InListRecursive if x is not body})
++    chain, seen, pending = [], set(), [feature]
++    while pending and len(chain) < 100:
++        current = pending.pop(0)
++        if current.Name in seen:
++            continue
++        seen.add(current.Name)
++        chain.append(current)
++        pending.extend(x for x in current.OutList if x is not body and x.Name not in seen)
++    return {"document": doc.Name, "revision": revision, "selectedObject": obj.Name,
++            "reference": reference, "body": body.Name if body else None,
++            "displayedTip": body.Tip.Name if body and body.Tip else None,
++            "feature": node(feature), "profile": node(profile) if hasattr(profile, "Name") else None,
++            "upstream": [node(x) for x in chain[offset:offset + limit]],
++            "nextOffset": offset + limit if offset + limit < len(chain) else None,
++            "truncated": bool(pending), "downstream": downstream[:50], "downstreamCount": len(downstream),
++            "frame": frame(doc, obj) if hasattr(obj, "Placement") else None,
++            "editability": diagnostics(doc, [feature] + ([profile] if hasattr(profile, "Name") else [])),
++            "editAdvice": "Inspect the listed parameters, expressions and profile constraints before editing. Preserve feature names and downstream dependencies; confirm which dimension expresses the user's intent.",
++            "topologyPolicy": "This is a native dependency chain, not face-generation provenance. A Body pick identifies its displayed Tip, not a proven originating sketch edge. Never infer a face/edge correspondence from list position."}
++
++
 +def diagnostics(doc, objects=None):
 +    warnings = []
 +    objects = list(doc.Objects if objects is None else objects)
@@ -2103,6 +2365,11 @@
 +                warn("underconstrained", f"Sketch has {obj.DoF} remaining degrees of freedom; confirm these are intentional.")
 +            if obj.ConflictingConstraints or obj.RedundantConstraints:
 +                warn("constraint-conflict", "Inspect conflicting/redundant constraint indices before changing geometry.")
++        if obj.isDerivedFrom("PartDesign::Body"):
++            if obj.Group and not obj.Tip:
++                warn("missing-body-tip", "Body contains features but has no Tip; inspect native history before continuing.")
++            elif obj.Tip and obj.Tip not in obj.Group:
++                warn("disconnected-body-tip", "The Body Tip is not in its native Group.")
 +        for prop in ("Support", "Profile", "Base"):
 +            if prop not in obj.PropertiesList:
 +                continue
@@ -2170,18 +2437,36 @@
 +
 +
 +def api(doc, obj=None, query="", offset=0, limit=40, kind="types"):
-+    if obj is not None:
++    if obj is not None and kind != "methods":
 +        return properties(resolve(doc, obj), offset=offset, limit=limit)
 +    if offset < 0 or not 1 <= limit <= 100:
 +        raise ValueError("API limit must be 1..100; offset must be non-negative.")
++    if kind == "methods":
++        target = resolve(doc, obj)
++        methods = []
++        for name in sorted(dir(target)):
++            if name.startswith("_") or query.lower() not in name.lower() or name in target.PropertiesList:
++                continue
++            try:
++                member = getattr(target, name)
++                if callable(member):
++                    methods.append({"name": name, "documentation": (getattr(member, "__doc__", "") or "")[:2000]})
++            except Exception:
++                continue
++        return {"object": target.Name, "methods": methods[offset:offset + limit], "total": len(methods),
++                "nextOffset": offset + limit if offset + limit < len(methods) else None,
++                "note": "Native runtime method documentation; no methods were invoked. Empty documentation is not a guessed signature."}
 +    if kind == "types":
 +        available = doc.supportedTypes()
-+    elif kind == "commands":
++    elif kind in ("commands", "workbenches"):
 +        import FreeCADGui
-+        available = FreeCADGui.listCommands()
++        available = FreeCADGui.listCommands() if kind == "commands" else FreeCADGui.listWorkbenches().keys()
++    elif kind == "modules":
++        import sys
++        available = [name for name in sys.modules if name in ("FreeCAD", "FreeCADGui", "Part", "PartDesign", "Sketcher", "Draft", "Arch", "Mesh", "MeshPart", "TechDraw", "Fem", "Assembly", "Spreadsheet", "Path", "Points")]
 +    else:
-+        raise ValueError("API kind must be 'types' or 'commands'.")
++        raise ValueError("API kind must be types, commands, workbenches, modules, or methods (with an object).")
 +    types = sorted(t for t in available if query.lower() in t.lower())
-+    return {"objectTypes" if kind == "types" else "commands": types[offset:offset + limit], "total": len(types),
++    return {"objectTypes" if kind == "types" else kind: types[offset:offset + limit], "total": len(types),
 +            "nextOffset": offset + limit if offset + limit < len(types) else None,
 +            "note": "Types from loaded native modules. Import the relevant FreeCAD module to discover its types."}

@@ -55,6 +55,10 @@ def provider_fixture():
         elif request in (9003, 9004):
             result = json.loads(message["result"]["contentItems"][0]["text"])
             assert result["ok"], result
+            assert result['observation']['visualFeedback']['status'] == 'captured', result
+            images = message['result']['contentItems'][1:]
+            assert len(images) == 2 and all(image['type'] == 'inputImage' for image in images)
+            assert all(view['automatic'] for view in result['observation']['renders'])
             direction = "undo" if request == 9003 else "redo"
             entry = result["history"][direction]
             assert entry, result
@@ -206,10 +210,11 @@ try:
             images = [entry['body'] for entry in entries if entry['kind'] == 'image']
             observations = [record['payload'] for record in map(json.loads, lines)
                             if record['type'] == 'tool.observation']
-            assert len(images) == 4 and images == observations[0]['images']
+            expected_images = [image for observation in observations for image in observation.get('images', [])]
+            assert len(images) == 10 and images == expected_images
             rendered = [item for item in items if item.objectName() == 'workImage'
                         and item.property('source').toString()]
-            assert len(rendered) == 4, [(item.property('source').toString()[:40], item.property('visible')) for item in rendered]
+            assert len(rendered) == len(expected_images), [(item.property('source').toString()[:40], item.property('visible')) for item in rendered]
             assert [item.property('source').toString() for item in rendered] == images
             assert all(item.property('height') > 0 for item in rendered)
             capture = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/thread-expanded.png'

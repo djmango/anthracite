@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
-@@ -0,0 +1,996 @@
+@@ -0,0 +1,1002 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
@@ -106,6 +106,12 @@
 +            "The tool accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
 +            "Prefer parametric, named objects and constraints. Inspect before editing. ",
 +            "Start with cad.tree(); use cad.inspect('Name'), cad.sketch('SketchName') and cad.diagnostics() for details. ",
++            "For a picked feature, cad.explain(reference) traces its exact Body/Tip/profile/dependencies and candidate parameters; cad.review(reference) adds focused views (or a local sketch diagram). This does not prove which sketch edge generated a face. Ask when edit intent is ambiguous. ",
++            "Read interveningChanges before relying on earlier observations: it reports changes outside this executor since the last call, not an inferred author. Never overwrite intervening edits based on stale assumptions. ",
++            "cad.frame('Name') gives local/world placement, origin, axes and conversion examples. Sketch Geometry is local XY; topology/measurements/picked points/section planes are world mm. Transform points with global Placement, directions with Rotation; avoid double-applying Shape placement. ",
++            "cad.api('Name', kind='methods', query='setDatum') returns native method documentation without calling it. kind='workbenches' lists registered workbenches without activating them; kind='modules' lists loaded common CAD modules. Never invent undocumented signatures. ",
++            "Explicit editability checks also include bodyTip (expected internal Tip name), sketchDegreesOfFreedom (numeric, requires tolerance), and nativeFeatureHistory (Body with native parametric Tip and sketch, not proof of complete editability). Preserve the tree and inspect affected downstream features after edits and undo. ",
++            "Successful geometry edits without an explicit render attach compact automatic overview/focused images. visualFeedback reports unavailable/failed capture separately from CAD success; failed optional capture does not undo a committed edit. Use cad.review or explicit render_views for closer inspection, not repeated blind edits. ",
 +            "Use cad.topology('Name', kind='faces', surface='Cylinder', offset=0, limit=25) for paged candidates; omit surface for all types or use kind='edges'. Returned references bind document/object/subelement/revision. ",
 +            "Use cad.resolve_ref(reference) in Python or cad.measure(reference); all references expire on revision changes, including user edits. Finish mutations before querying fresh topology. Never choose an ambiguous candidate silently. ",
 +            "cad.measure('A') reports native size_mm/volume_mm3/area_mm2; cad.measure('A','B') reports distance_mm and overlapVolume_mm3 (null if unavailable). Do not infer overlap from zero distance. ",
@@ -1067,7 +1073,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/opencode.rs
-@@ -0,0 +1,900 @@
+@@ -0,0 +1,906 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
@@ -1232,6 +1238,12 @@
 +            "It accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
 +            "Prefer parametric, named objects and constraints. Inspect before editing. ",
 +            "Start with cad.tree(); use cad.inspect('Name'), cad.sketch('SketchName') and cad.diagnostics() for details. ",
++            "For a picked feature, cad.explain(reference) traces its exact Body/Tip/profile/dependencies and candidate parameters; cad.review(reference) adds focused views (or a local sketch diagram). This does not prove which sketch edge generated a face. Ask when edit intent is ambiguous. ",
++            "Read interveningChanges before relying on earlier observations: it reports changes outside this executor since the last call, not an inferred author. Never overwrite intervening edits based on stale assumptions. ",
++            "cad.frame('Name') gives local/world placement, origin, axes and conversion examples. Sketch Geometry is local XY; topology/measurements/picked points/section planes are world mm. Transform points with global Placement, directions with Rotation; avoid double-applying Shape placement. ",
++            "cad.api('Name', kind='methods', query='setDatum') returns native method documentation without calling it. kind='workbenches' lists registered workbenches without activating them; kind='modules' lists loaded common CAD modules. Never invent undocumented signatures. ",
++            "Explicit editability checks also include bodyTip (expected internal Tip name), sketchDegreesOfFreedom (numeric, requires tolerance), and nativeFeatureHistory (Body with native parametric Tip and sketch, not proof of complete editability). Preserve the tree and inspect affected downstream features after edits and undo. ",
++            "Successful geometry edits without an explicit render attach compact automatic overview/focused images. visualFeedback reports unavailable/failed capture separately from CAD success; failed optional capture does not undo a committed edit. Use cad.review or explicit render_views for closer inspection, not repeated blind edits. ",
 +            "Use cad.topology('Name', kind='faces', surface='Cylinder', offset=0, limit=25) for paged candidates; omit surface for all types or use kind='edges'. Returned references bind document/object/subelement/revision. ",
 +            "Use cad.resolve_ref(reference) in Python or cad.measure(reference); all references expire on revision changes, including user edits. Finish mutations before querying fresh topology. Never choose an ambiguous candidate silently. ",
 +            "cad.measure('A') reports native size_mm/volume_mm3/area_mm2; cad.measure('A','B') reports distance_mm and overlapVolume_mm3 (null if unavailable). Do not infer overlap from zero distance. ",

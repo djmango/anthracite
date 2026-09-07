@@ -1134,7 +1134,7 @@
 +# Content-address the resource path, not a URL query (Qt's disk-cache key strips
 +# queries). Fixed RCC timestamps must never reuse a previous component definition.
 +set(AnthraciteQml_FINGERPRINT "")
-+foreach(component Main TranscriptText ActivityEntry)
++foreach(component Main TranscriptText ActivityEntry AgentSettings)
 +    set(qml_file ${CMAKE_CURRENT_SOURCE_DIR}/Resources/qml/${component}.qml)
 +    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${qml_file})
 +    file(SHA256 ${qml_file} qml_hash)
@@ -1459,15 +1459,17 @@
 +#endif  // ANTHRACITEGUI_CONVERSATIONMODEL_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,15 @@
 +<!DOCTYPE RCC>
 +<RCC version="1.0">
 +    <qresource prefix="/Anthracite">
++        <file alias="qml/AgentSettings.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/AgentSettings.qml</file>
 +        <file alias="qml/Main.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Main.qml</file>
 +        <file alias="qml/TranscriptText.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptText.qml</file>
 +        <file alias="qml/ActivityEntry.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ActivityEntry.qml</file>
 +    </qresource>
 +    <qresource prefix="/Anthracite/@AnthraciteQml_VERSION@">
++        <file alias="qml/AgentSettings.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/AgentSettings.qml</file>
 +        <file alias="qml/Main.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Main.qml</file>
 +        <file alias="qml/TranscriptText.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptText.qml</file>
 +        <file alias="qml/ActivityEntry.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ActivityEntry.qml</file>
@@ -1475,7 +1477,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,838 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
@@ -1487,8 +1489,11 @@
 +    id: root
 +
 +    padding: 0
-+    property bool compact: width < 440
-+    property bool settingsExpanded: false
++    Transcript.AgentSettings {
++        id: agentSettings
++        controller: anthraciteController
++        returnFocus: agentSettingsButton
++    }
 +
 +    Popup {
 +        id: imagePreview
@@ -1746,7 +1751,9 @@
 +            }
 +            footer: Item {
 +                // Retain end space while reading: removing it would clamp the scroll position.
-+                height: timeline.newTurnId.length ? Math.max(0, timeline.height - 80) : 0
++                // Reserve a full viewport: a short prompt must still reach the
++                // top when transcript controls are hidden or text wraps differently.
++                height: timeline.newTurnId.length ? timeline.height : 0
 +            }
 +            ToolButton {
 +                anchors.right: parent.right
@@ -2122,46 +2129,13 @@
 +                    }
 +                }
 +
-+                RowLayout {
++                Label {
 +                    Layout.fillWidth: true
-+                    ToolButton {
-+                        objectName: "AnthraciteAttachFiles"
-+                        text: "+"
-+                        enabled: !anthraciteController.busy
-+                        Accessible.name: qsTr("Attach files")
-+                        ToolTip.visible: hovered
-+                        ToolTip.text: qsTr("Attach images or files (up to 8 MiB each). You can also paste images.")
-+                        onClicked: anthraciteController.attachFiles()
-+                    }
-+                    ToolButton {
-+                        objectName: "AnthraciteGeometryPicker"
-+                        checked: anthraciteController.picking
-+                        enabled: !anthraciteController.busy && !anthraciteController.processingAttachments
-+                        Accessible.name: qsTr("Pick CAD geometry")
-+                        ToolTip.visible: hovered
-+                        ToolTip.text: qsTr("Pick a face, edge, vertex or object in the model. Escape cancels.")
-+                        contentItem: Canvas {
-+                            implicitWidth: 22; implicitHeight: 22
-+                            onPaint: {
-+                                const c = getContext("2d")
-+                                c.reset(); c.strokeStyle = systemPalette.buttonText; c.lineWidth = 1.8
-+                                c.beginPath(); c.moveTo(3,20); c.lineTo(5,15); c.lineTo(13,7)
-+                                c.lineTo(17,11); c.lineTo(9,19); c.closePath(); c.stroke()
-+                                c.beginPath(); c.moveTo(11,5); c.lineTo(19,13); c.stroke()
-+                                c.beginPath(); c.moveTo(14,7); c.lineTo(16,5)
-+                                c.quadraticCurveTo(20,1,21,4); c.quadraticCurveTo(23,7,18,10)
-+                                c.closePath(); c.fillStyle = systemPalette.buttonText; c.fill()
-+                            }
-+                        }
-+                        onClicked: anthraciteController.togglePicker()
-+                    }
-+                    Label {
-+                        Layout.fillWidth: true
-+                        wrapMode: Text.Wrap
-+                        text: anthraciteController.processingAttachments ? qsTr("Preparing attachments…")
-+                            : anthraciteController.picking ? qsTr("Click model geometry · Esc to cancel") : ""
-+                        font.pixelSize: 11
-+                    }
++                    visible: text.length > 0
++                    wrapMode: Text.Wrap
++                    text: anthraciteController.processingAttachments ? qsTr("Preparing attachments…")
++                        : anthraciteController.picking ? qsTr("Click model geometry · Esc to cancel") : ""
++                    font.pixelSize: 11
 +                }
 +
 +                TextArea {
@@ -2174,6 +2148,53 @@
 +                    textFormat: TextEdit.RichText
 +                    persistentSelection: true
 +                    enabled: !anthraciteController.submitting
++                    // Keep the final text line above the overlaid actions.
++                    bottomPadding: composerActions.height + 10
++                    Row {
++                        id: composerActions
++                        objectName: "AnthraciteComposerActions"
++                        anchors.right: parent.right
++                        anchors.bottom: parent.bottom
++                        anchors.rightMargin: 6
++                        anchors.bottomMargin: 4
++                        spacing: 2
++                        z: 2
++                        ToolButton {
++                            width: 30; height: 30
++                            padding: 4
++                            objectName: "AnthraciteAttachFiles"
++                            text: "+"
++                            enabled: !anthraciteController.busy
++                            Accessible.name: qsTr("Attach files")
++                            ToolTip.visible: hovered
++                            ToolTip.text: qsTr("Attach images or files (up to 8 MiB each). You can also paste images.")
++                            onClicked: anthraciteController.attachFiles()
++                        }
++                        ToolButton {
++                            width: 30; height: 30
++                            padding: 4
++                            objectName: "AnthraciteGeometryPicker"
++                            checked: anthraciteController.picking
++                            enabled: !anthraciteController.busy && !anthraciteController.processingAttachments
++                            Accessible.name: qsTr("Pick CAD geometry")
++                            ToolTip.visible: hovered
++                            ToolTip.text: qsTr("Pick a face, edge, vertex or object in the model. Escape cancels.")
++                            contentItem: Canvas {
++                                implicitWidth: 22; implicitHeight: 22
++                                onPaint: {
++                                    const c = getContext("2d")
++                                    c.reset(); c.strokeStyle = systemPalette.buttonText; c.lineWidth = 1.8
++                                    c.beginPath(); c.moveTo(3,20); c.lineTo(5,15); c.lineTo(13,7)
++                                    c.lineTo(17,11); c.lineTo(9,19); c.closePath(); c.stroke()
++                                    c.beginPath(); c.moveTo(11,5); c.lineTo(19,13); c.stroke()
++                                    c.beginPath(); c.moveTo(14,7); c.lineTo(16,5)
++                                    c.quadraticCurveTo(20,1,21,4); c.quadraticCurveTo(23,7,18,10)
++                                    c.closePath(); c.fillStyle = systemPalette.buttonText; c.fill()
++                                }
++                            }
++                            onClicked: anthraciteController.togglePicker()
++                        }
++                    }
 +                    Component.onCompleted: anthraciteController.bindComposer(textDocument)
 +                    onSelectionStartChanged: anthraciteController.setComposerSelection(selectionStart, selectionEnd)
 +                    onSelectionEndChanged: anthraciteController.setComposerSelection(selectionStart, selectionEnd)
@@ -2205,70 +2226,24 @@
 +                    }
 +                }
 +
-+                GridLayout {
-+                    id: modelControls
-+                    columns: root.compact ? 1 : 3
-+                    objectName: "AnthraciteModelControls"
-+                    visible: (!root.compact || root.settingsExpanded) && (anthraciteController.modelControlsAvailable
-+                             || anthraciteController.usageVisible)
++                RowLayout {
 +                    Layout.fillWidth: true
-+
-+                    ComboBox {
-+                        id: modelPicker
-+                        objectName: "AnthraciteModelPicker"
-+                        visible: anthraciteController.modelControlsAvailable
++                    ToolButton {
++                        id: agentSettingsButton
++                        objectName: "AnthraciteAgentSettingsButton"
 +                        Layout.fillWidth: true
-+                        model: anthraciteController.models
-+                        textRole: "name"
-+                        enabled: !anthraciteController.busy
-+
-+                        currentIndex: {
-+                            for (let index = 0; index < count; ++index) {
-+                                if (model[index].model === anthraciteController.selectedModel) {
-+                                    return index
-+                                }
-+                            }
-+                            return count > 0 ? 0 : -1
++                        Layout.minimumWidth: 0
++                        text: agentSettings.summary + "  ▾"
++                        Accessible.name: qsTr("Choose agent, model, and reasoning: ") + agentSettings.summary
++                        contentItem: Text {
++                            text: parent.text
++                            color: systemPalette.windowText
++                            elide: Text.ElideRight
++                            verticalAlignment: Text.AlignVCenter
 +                        }
-+
-+                        onActivated: function(index) {
-+                            anthraciteController.selectModel(model[index].model)
-+                        }
-+
-+                        ToolTip.visible: hovered && currentIndex >= 0
-+                                             && (model[currentIndex].description || "").length > 0
-+                        ToolTip.text: currentIndex >= 0
-+                                      ? model[currentIndex].description || ""
-+                                      : ""
-+                    }
-+
-+                    ComboBox {
-+                        id: effortPicker
-+                        objectName: "AnthraciteEffortPicker"
-+                        visible: anthraciteController.modelControlsAvailable
-+                        Layout.preferredWidth: Math.max(105, implicitWidth)
-+                        model: anthraciteController.reasoningEfforts
-+                        textRole: "label"
-+                        enabled: !anthraciteController.busy && count > 0
-+
-+                        currentIndex: {
-+                            for (let index = 0; index < count; ++index) {
-+                                if (model[index].id === anthraciteController.selectedEffort) {
-+                                    return index
-+                                }
-+                            }
-+                            return count > 0 ? 0 : -1
-+                        }
-+
-+                        onActivated: function(index) {
-+                            anthraciteController.selectEffort(model[index].id)
-+                        }
-+
-+                        ToolTip.visible: hovered && currentIndex >= 0
-+                                             && (model[currentIndex].description || "").length > 0
-+                        ToolTip.text: currentIndex >= 0
-+                                      ? model[currentIndex].description || ""
-+                                      : ""
++                        ToolTip.visible: hovered
++                        ToolTip.text: agentSettings.summary
++                        onClicked: agentSettings.open()
 +                    }
 +
 +                    Rectangle {
@@ -2309,53 +2284,6 @@
 +                            hoverEnabled: true
 +                        }
 +                    }
-+                }
-+
-+                RowLayout {
-+                    visible: !root.compact || root.settingsExpanded
-+                    Layout.fillWidth: true
-+
-+                    ComboBox {
-+                        id: providerPicker
-+                        Layout.fillWidth: true
-+                        objectName: "AnthraciteProviderPicker"
-+                        Layout.preferredWidth: Math.max(105, implicitWidth)
-+                        model: anthraciteController.providers
-+                        textRole: "name"
-+                        enabled: !anthraciteController.busy && !anthraciteController.processingAttachments
-+
-+                        currentIndex: {
-+                            for (let index = 0; index < count; ++index) {
-+                                if (model[index].id === anthraciteController.selectedProvider) {
-+                                    return index
-+                                }
-+                            }
-+                            return 0
-+                        }
-+
-+                        onActivated: function(index) {
-+                            anthraciteController.selectProvider(model[index].id)
-+                        }
-+                    }
-+
-+                    ToolButton {
-+                        text: qsTr("Configure…")
-+                        flat: true
-+                        onClicked: anthraciteController.chooseProvider()
-+                    }
-+                }
-+
-+                RowLayout {
-+                    Layout.fillWidth: true
-+                    ToolButton {
-+                        objectName: "compactSettings"
-+                        visible: root.compact
-+                        text: qsTr("Settings")
-+                        onClicked: root.settingsExpanded = !root.settingsExpanded
-+                    }
-+                    Item {
-+                        Layout.fillWidth: true
-+                    }
 +
 +                    Button {
 +                        visible: anthraciteController.busy
@@ -2390,7 +2318,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,951 @@
+@@ -0,0 +1,946 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "Sidebar.h"
@@ -2657,11 +2585,6 @@
 +    Q_EMIT draftChanged();
 +    Q_EMIT draftEdited(currentDraft);
 +    Q_EMIT busyChanged();
-+}
-+
-+void SidebarController::copyText(const QString& text)
-+{
-+    QApplication::clipboard()->setText(text);
 +}
 +
 +void SidebarController::loadAttachments(const QVariantList& attachments)
@@ -3344,7 +3267,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,230 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_SIDEBAR_H
@@ -3427,7 +3350,6 @@
 +    Q_INVOKABLE void bindComposer(QObject* quickDocument);
 +    Q_INVOKABLE void setComposerSelection(int start, int end);
 +    Q_INVOKABLE void copyComposerSelection(bool cut);
-+    Q_INVOKABLE void copyText(const QString& text);
 +    Q_INVOKABLE void pasteComposerText();
 +    Q_INVOKABLE void togglePicker();
 +    void setPicking(bool active);
@@ -3578,7 +3500,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,541 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -3596,6 +3518,114 @@
 +
 +import AnthraciteExecutor
 +import AnthraciteGui  # noqa: F401 - importing registers the dock window
++
++
++def run_agent_settings_test(quick_widget, root, dock):
++    settings = root.findChild(QtCore.QObject, 'AnthraciteAgentSettings')
++    assert settings is not None
++    original_width = root.property('width')
++    original_min_width, original_max_width = quick_widget.minimumWidth(), quick_widget.maximumWidth()
++
++    def evaluate(source):
++        expression = QtQml.QQmlExpression(quick_widget.rootContext(), settings, source)
++        result = expression.evaluate()
++        assert not expression.hasError(), expression.error().toString()
++        return result
++
++    # Exercise the real QML component with a deterministic catalog, without
++    # connecting a provider or changing the user's thread/model preferences.
++    fixture = '''import QtQml 2.15
++        QtObject {
++            property bool busy: false
++            property bool processingAttachments: false
++            property bool modelControlsAvailable: models.length > 0
++            property var providers: [{id: "codex", name: "Codex"}, {id: "opencode", name: "OpenCode"}]
++            property var models: [{model: "a", name: "Model A"}, {model: "b", name: "Model B"}]
++            property var reasoningEfforts: [{id: "low", label: "Low"}, {id: "high", label: "High"}]
++            property string selectedProvider: "codex"
++            property string selectedModel: "a"
++            property string selectedEffort: "low"
++            function selectProvider(id) { selectedProvider = id; models = []; reasoningEfforts = []; selectedModel = ""; selectedEffort = "" }
++            function selectModel(id) { selectedModel = id; reasoningEfforts = [{id: "high", label: "High"}]; selectedEffort = "high" }
++            function selectEffort(id) { selectedEffort = id }
++        }'''
++    evaluate('controller = Qt.createQmlObject(' + json.dumps(fixture) + ', this, "AgentSettingsFixture")')
++    fixture_controller = settings.property('controller')
++    try:
++        dock.show()
++        Gui.getMainWindow().activateWindow()
++        QtWidgets.QApplication.setActiveWindow(Gui.getMainWindow())
++        quick_widget.setFocus()
++        quick_widget.setFixedWidth(320)
++        button = root.findChild(QtCore.QObject, 'AnthraciteAgentSettingsButton')
++        QtCore.QMetaObject.invokeMethod(button, 'clicked')
++        QtTest.QTest.qWait(100)
++        assert settings.property('visible')
++        assert settings.property('width') <= 320
++        capture = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/agent-settings-main.png'
++        assert quick_widget.grab().save(str(capture))
++        choices = settings.findChild(QtCore.QObject, 'AnthraciteAgentChoices')
++        row = settings.findChild(QtCore.QObject, 'AnthraciteEffortRow')
++        QtCore.QMetaObject.invokeMethod(row, 'clicked')
++        QtTest.QTest.qWait(100)
++        assert choices.property('visible') and settings.property('visible'), 'Choices must overlay the settings popup'
++        assert choices.property('section') == 'effort'
++        capture = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/agent-settings.png'
++        assert quick_widget.grab().save(str(capture))
++        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Down)
++        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Return)
++        QtTest.QTest.qWait(100)
++        assert fixture_controller.property('selectedEffort') == 'high'
++        assert not choices.property('visible') and settings.property('visible')
++        evaluate('openSection("model")')
++        QtTest.QTest.qWait(50)
++        evaluate('selectChoice(1)')
++        assert fixture_controller.property('selectedModel') == 'b'
++        assert 'Model B' in settings.property('summary')
++        evaluate('openSection("effort")')
++        QtTest.QTest.qWait(50)
++        options = choices.property('options')
++        options = options.toVariant() if hasattr(options, 'toVariant') else options
++        assert len(options) == 1, 'Efforts must follow the selected model'
++        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Escape)
++        QtTest.QTest.qWait(100)
++        assert not choices.property('visible') and settings.property('visible'), 'Escape must dismiss only the top sheet'
++        evaluate('controller.models = Array.from({length: 50}, (_, i) => ({model: "m" + i, name: "Model " + i})); controller.selectedModel = "m49"')
++        evaluate('openSection("model")')
++        QtTest.QTest.qWait(100)
++        choice_list = settings.findChild(QtCore.QObject, 'AnthraciteAgentChoiceList')
++        assert choice_list.property('count') == 50
++        assert choice_list.property('currentIndex') == 49
++        assert choice_list.property('contentY') > 0, 'Long catalogs must scroll to the selected model'
++        assert choices.property('height') <= 360
++        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Escape)
++        QtTest.QTest.qWait(100)
++        fixture_controller.setProperty('processingAttachments', True)
++        evaluate('openSection("agent")')
++        assert not choices.property('visible')
++        fixture_controller.setProperty('processingAttachments', False)
++        fixture_controller.setProperty('busy', True)
++        evaluate('openSection("agent")')
++        assert not choices.property('visible'), 'Cannot switch harness during a run'
++        fixture_controller.setProperty('busy', False)
++        evaluate('openSection("agent")')
++        evaluate('selectChoice(1)')
++        assert fixture_controller.property('selectedProvider') == 'opencode'
++        assert 'OpenCode' in settings.property('summary')
++        assert 'Provider default' in settings.property('summary')
++        evaluate('openSection("model")')
++        assert not choices.property('visible'), 'Empty catalog must not expose stale models'
++        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Escape)
++        QtTest.QTest.qWait(100)
++        assert not settings.property('visible')
++        assert button.property('activeFocus'), 'Closing settings must restore keyboard focus'
++    finally:
++        evaluate('close()')
++        evaluate('controller = anthraciteController')
++        fixture_controller.deleteLater()
++        quick_widget.setMinimumWidth(original_min_width)
++        quick_widget.setMaximumWidth(original_max_width)
++        root.setProperty('width', original_width)
 +
 +
 +def run_smoke_test():
@@ -3622,16 +3652,38 @@
 +        raise AssertionError("Anthracite QML does not expose the new-conversation control.")
 +    if root.findChild(QtCore.QObject, "AnthraciteComposer") is None:
 +        raise AssertionError("Anthracite QML does not expose the persistent composer.")
-+    if root.findChild(QtCore.QObject, "AnthraciteModelControls") is None:
-+        raise AssertionError("Anthracite QML does not expose model controls.")
-+    if root.findChild(QtCore.QObject, "AnthraciteModelPicker") is None:
-+        raise AssertionError("Anthracite QML does not expose the model picker.")
-+    if root.findChild(QtCore.QObject, "AnthraciteEffortPicker") is None:
-+        raise AssertionError("Anthracite QML does not expose the reasoning-effort picker.")
++    if root.findChild(QtCore.QObject, "AnthraciteAgentSettingsButton") is None:
++        raise AssertionError("Anthracite QML does not expose unified agent settings.")
 +    if root.findChild(QtCore.QObject, "AnthraciteContextUsage") is None:
 +        raise AssertionError("Anthracite QML does not expose context-window usage.")
-+    if root.findChild(QtCore.QObject, "AnthraciteProviderPicker") is None:
-+        raise AssertionError("Anthracite QML does not expose the provider picker.")
++
++    run_agent_settings_test(quick_widget, root, dock)
++
++    composer = root.findChild(QtCore.QObject, 'AnthraciteComposer')
++    actions = root.findChild(QtCore.QObject, 'AnthraciteComposerActions')
++    assert actions is not None and actions.parentItem() == composer
++    for width in (320, 520):
++        original_min, original_max = quick_widget.minimumWidth(), quick_widget.maximumWidth()
++        quick_widget.setFixedWidth(width)
++        QtTest.QTest.qWait(100)
++        assert abs(actions.x() + actions.width() - composer.width() + 6) < 1
++        assert abs(actions.y() + actions.height() - composer.height() + 4) < 1
++        assert composer.property('bottomPadding') >= actions.height() + 4
++        assert actions.width() >= 60, 'Both actions must fit inside the input'
++        quick_widget.setMinimumWidth(original_min)
++        quick_widget.setMaximumWidth(original_max)
++
++    component = QtQml.QQmlComponent(quick_widget.engine())
++    component.setData(b'import QtQuick 2.15; import "qrc:/Anthracite/qml" as Chat; Chat.TranscriptText { body: "Selectable response"; width: 250 }', QtCore.QUrl())
++    transcript = component.create(quick_widget.rootContext())
++    assert transcript is not None, [e.toString() for e in component.errors()]
++    assert transcript.findChild(QtCore.QObject, 'copyMessage') is None
++    response_text = transcript.findChild(QtCore.QObject, 'transcriptText')
++    assert response_text.property('readOnly') and response_text.property('selectByMouse')
++    response_text.select(0, len('Selectable response'))
++    response_text.copy()
++    assert QtWidgets.QApplication.clipboard().text() == 'Selectable response'
++    transcript.deleteLater()
 +
 +    controller = quick_widget.rootContext().contextProperty("anthraciteController")
 +    QtTest.QTest.qWait(500)  # Drain document-switch notifications from executor tests.
@@ -3674,7 +3726,7 @@
 +    original_width = root.property('width')
 +    root.setProperty('width', 320)
 +    QtTest.QTest.qWait(100)
-+    assert root.property('compact'), 'Narrow dock did not compact its controls'
++    assert root.findChild(QtCore.QObject, 'AnthraciteAgentSettingsButton').property('width') > 0
 +    assert timeline.property('anchorId') == anchor, 'Dock resize lost the reading anchor'
 +    assert abs(timeline.property('anchorOffset') - offset) < 3
 +    root.setProperty('width', original_width)
@@ -3697,8 +3749,6 @@
 +    apply_edit(details)
 +    apply_edit(details)
 +    assert len(model.data(model.index(model.rowCount()-1, 0), roles['entries'])) == 1
-+    controller.copyText('exact Python\npass')
-+    assert QtWidgets.QApplication.clipboard().text() == 'exact Python\npass'
 +    apply_edit({'op': 'reset', 'rows': original})
 +    Gui.runCommand("Anthracite_ReloadSidebar")
 +    quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
@@ -3740,6 +3790,24 @@
 +        raise AssertionError("Viewport observation metadata is incomplete.")
 +    view = Gui.activeDocument().activeView()
 +    Gui.updateGui()
++    camera_before_feedback = view.getCamera()
++    automatic = AnthraciteExecutor.execute("doc.getObject('RenderBox').Length = 13")
++    assert automatic['ok'], automatic
++    assert len(automatic['images']) == 2
++    assert all(image['automatic'] for image in automatic['observation']['renders'])
++    assert automatic['observation']['renders'][1]['focus'] == 'RenderBox'
++    assert view.getCamera() == camera_before_feedback
++    undo = automatic['history']['undo']
++    undone = AnthraciteExecutor.execute(f"cad.undo(action={undo['action']!r}, revision={undo['revision']})")
++    assert undone['ok'] and render_document.getObject('RenderBox').Length.Value == 12
++    reference = AnthraciteExecutor.execute("cad.topology('RenderBox')")['result']['items'][0]['reference']
++    reviewed = AnthraciteExecutor.execute(f"cad.review({reference!r})")
++    assert reviewed['ok'] and len(reviewed['images']) == 2, reviewed
++    assert reviewed['result']['selectedObject'] == 'RenderBox'
++    assert view.getCamera() == camera_before_feedback
++    workbenches = AnthraciteExecutor.execute("cad.api(kind='workbenches')")
++    assert workbenches['ok'] and workbenches['readOnly'], workbenches
++    assert workbenches['result']['workbenches']
 +    root = quick_widget.rootObject()
 +    assert root.findChild(QtCore.QObject, "AnthraciteAttachFiles") is not None
 +    assert root.findChild(QtCore.QObject, "AnthraciteGeometryPicker") is not None
@@ -4228,7 +4296,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/TranscriptText.qml
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,34 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
@@ -4257,27 +4325,258 @@
 +        color: colors.text
 +        Accessible.name: root.body
 +    }
-+    Row {
-+        spacing: 6
-+        ToolButton {
-+            visible: root.foldLong && messageText.contentHeight > 120
-+            text: root.expanded ? qsTr("Show less") : qsTr("Show full message")
-+            onClicked: { root.resizing(); root.expanded = !root.expanded }
++    ToolButton {
++        visible: root.foldLong && messageText.contentHeight > 120
++        text: root.expanded ? qsTr("Show less") : qsTr("Show full message")
++        onClicked: { root.resizing(); root.expanded = !root.expanded }
++    }
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Resources/qml/AgentSettings.qml
+@@ -0,0 +1,246 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++import QtQuick 2.15
++import QtQuick.Controls 2.15
++import QtQuick.Layouts 1.15
++
++Popup {
++    id: settings
++    objectName: "AnthraciteAgentSettings"
++    property var controller
++    // The native controller can disappear while a dock is being reloaded.
++    readonly property var agentState: controller || ({
++        busy: true, processingAttachments: false, providers: [], models: [],
++        reasoningEfforts: [], selectedProvider: "", selectedModel: "",
++        selectedEffort: "", modelControlsAvailable: false
++    })
++    property Item returnFocus
++    readonly property bool locked: settings.agentState.busy || settings.agentState.processingAttachments
++    readonly property string providerLabel: labelFor(settings.agentState.providers, "id", settings.agentState.selectedProvider, "name", qsTr("Agent"))
++    readonly property string modelLabel: labelFor(settings.agentState.models, "model", settings.agentState.selectedModel, "name", qsTr("Provider default"))
++    readonly property string effortLabel: labelFor(settings.agentState.reasoningEfforts, "id", settings.agentState.selectedEffort, "label", qsTr("Default"))
++    readonly property string summary: providerLabel + " · " + modelLabel
++                                      + (settings.agentState.selectedEffort ? " · " + effortLabel : "")
++    parent: Overlay.overlay
++    width: Math.max(0, Math.min(400, parent.width - 16))
++    height: Math.min(parent.height - 16, mainColumn.implicitHeight + padding * 2)
++    x: (parent.width - width) / 2
++    y: Math.max(8, parent.height - height - 8)
++    padding: 12
++    modal: true
++    focus: true
++    Overlay.modal: Rectangle { color: Qt.rgba(0, 0, 0, 0.28) }
++    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
++    onOpened: agentRow.forceActiveFocus()
++    onClosed: {
++        choices.close()
++        if (returnFocus) returnFocus.forceActiveFocus()
++    }
++    SystemPalette { id: colors }
++    background: Rectangle {
++        radius: 12
++        color: colors.window
++        border.color: colors.mid
++    }
++
++    function labelFor(items, key, selected, label, fallback) {
++        for (let i = 0; i < items.length; ++i) {
++            if (items[i][key] === selected) return items[i][label] || selected
 +        }
-+        ToolButton {
-+            objectName: "copyMessage"
-+            font.pixelSize: 11
-+            implicitHeight: 24
-+            Accessible.name: qsTr("Copy message")
-+            text: copied.running ? qsTr("Copied") : qsTr("Copy")
-+            contentItem: Text {
-+                text: parent.text
-+                font: parent.font
-+                color: colors.text
-+                verticalAlignment: Text.AlignVCenter
++        return selected || fallback
++    }
++
++    function openSection(section) {
++        if (locked) return
++        if (section === "model" && !settings.agentState.modelControlsAvailable) return
++        if (section === "effort" && !settings.agentState.reasoningEfforts.length) return
++        choices.section = section
++        choices.open()
++    }
++
++    // Return to the summary after every selection; the next sheet always reads
++    // the current provider's catalog, including model-dependent effort choices.
++    function selectChoice(index) {
++        if (locked || index < 0 || index >= choices.options.length) return
++        const item = choices.options[index]
++        const section = choices.section
++        choices.close()
++        if (section === "agent") controller.selectProvider(item.id)
++        else if (section === "model") controller.selectModel(item.model)
++        else controller.selectEffort(item.id)
++    }
++
++    component SettingRow: ItemDelegate {
++        property string value
++        Layout.fillWidth: true
++        implicitHeight: 56
++        contentItem: Column {
++            spacing: 3
++            Text { text: parent.parent.text + "  ›"; color: colors.windowText; font.bold: true }
++            Text {
++                width: parent.width
++                text: parent.parent.value
++                color: colors.windowText
++                opacity: 0.65
++                elide: Text.ElideRight
 +            }
-+            onClicked: { anthraciteController.copyText(root.body); copied.restart() }
-+            Timer { id: copied; interval: 1000 }
++        }
++        Accessible.name: text + ": " + value
++        opacity: enabled ? 1 : 0.5
++    }
++
++    contentItem: ScrollView {
++        clip: true
++        contentWidth: availableWidth
++        ColumnLayout {
++            id: mainColumn
++            width: parent.width
++            spacing: 6
++            Label {
++                text: qsTr("Agent settings")
++                color: colors.windowText
++                font.bold: true
++                Layout.bottomMargin: 4
++            }
++            SettingRow {
++                id: agentRow
++                objectName: "AnthraciteAgentRow"
++                text: qsTr("Agent / harness")
++                value: settings.providerLabel
++                enabled: !settings.locked
++                onClicked: settings.openSection("agent")
++            }
++            SettingRow {
++                id: modelRow
++                objectName: "AnthraciteModelRow"
++                text: qsTr("Model")
++                value: settings.modelLabel
++                enabled: !settings.locked && settings.agentState.modelControlsAvailable
++                onClicked: settings.openSection("model")
++            }
++            SettingRow {
++                id: effortRow
++                objectName: "AnthraciteEffortRow"
++                text: qsTr("Reasoning")
++                value: settings.agentState.reasoningEfforts.length ? settings.effortLabel : qsTr("Provider default / unavailable")
++                enabled: !settings.locked && settings.agentState.reasoningEfforts.length > 0
++                onClicked: settings.openSection("effort")
++            }
++            Label {
++                Layout.fillWidth: true
++                visible: settings.locked
++                text: qsTr("Settings can be changed when the current operation finishes.")
++                wrapMode: Text.WordWrap
++                color: colors.windowText
++                opacity: 0.65
++            }
++            Button {
++                Layout.fillWidth: true
++                text: qsTr("Configure agent installation…")
++                enabled: !settings.locked
++                onClicked: { settings.close(); controller.chooseProvider() }
++            }
++            Button {
++                Layout.fillWidth: true
++                text: qsTr("Done")
++                onClicked: settings.close()
++            }
++        }
++    }
++
++    Popup {
++        id: choices
++        objectName: "AnthraciteAgentChoices"
++        property string section: "agent"
++        readonly property var options: section === "agent" ? settings.agentState.providers
++                                       : section === "model" ? settings.agentState.models : settings.agentState.reasoningEfforts
++        readonly property string selected: section === "agent" ? settings.agentState.selectedProvider
++                                           : section === "model" ? settings.agentState.selectedModel : settings.agentState.selectedEffort
++        parent: Overlay.overlay
++        width: settings.width
++        height: Math.min(parent.height - 32, 360, choiceColumn.implicitHeight + padding * 2)
++        x: settings.x
++        y: Math.max(8, settings.y + settings.height - height)
++        padding: 12
++        modal: true
++        focus: true
++        Overlay.modal: Rectangle { color: Qt.rgba(0, 0, 0, 0.28) }
++        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
++        onOpened: {
++            choiceList.currentIndex = -1
++            for (let i = 0; i < options.length; ++i) {
++                if ((section === "model" ? options[i].model : options[i].id) === selected)
++                    choiceList.currentIndex = i
++            }
++            if (choiceList.currentIndex < 0 && options.length) choiceList.currentIndex = 0
++            choiceList.positionViewAtIndex(choiceList.currentIndex, ListView.Contain)
++            choiceList.forceActiveFocus()
++        }
++        onClosed: {
++            if (settings.opened) {
++                const row = section === "agent" ? agentRow : section === "model" ? modelRow : effortRow
++                if (row.enabled) row.forceActiveFocus()
++                else agentRow.forceActiveFocus()
++            }
++        }
++        background: Rectangle {
++            radius: 12
++            color: colors.window
++            border.color: colors.mid
++        }
++        contentItem: ColumnLayout {
++            id: choiceColumn
++            spacing: 8
++            Button {
++                text: "‹ " + (choices.section === "agent" ? qsTr("Agent / harness")
++                            : choices.section === "model" ? qsTr("Model") : qsTr("Reasoning"))
++                Accessible.name: qsTr("Back to agent settings")
++                onClicked: choices.close()
++            }
++            ListView {
++                id: choiceList
++                objectName: "AnthraciteAgentChoiceList"
++                Layout.fillWidth: true
++                Layout.fillHeight: true
++                implicitHeight: contentHeight
++                clip: true
++                model: choices.options
++                keyNavigationEnabled: true
++                boundsBehavior: Flickable.StopAtBounds
++                ScrollBar.vertical: ScrollBar {}
++                Keys.onReturnPressed: settings.selectChoice(currentIndex)
++                Keys.onEnterPressed: settings.selectChoice(currentIndex)
++                delegate: ItemDelegate {
++                    required property var modelData
++                    required property int index
++                    readonly property string optionId: choices.section === "model" ? modelData.model : modelData.id
++                    readonly property bool selected: optionId === choices.selected
++                    width: ListView.view.width
++                    height: 48
++                    enabled: !settings.locked
++                    text: (choices.section === "effort" ? modelData.label : modelData.name) || optionId
++                    Accessible.name: text
++                    Accessible.role: Accessible.RadioButton
++                    Accessible.checked: selected
++                    background: Rectangle {
++                        radius: 8
++                        color: selected ? colors.highlight : parent.hovered || parent.ListView.isCurrentItem
++                               ? colors.alternateBase : "transparent"
++                        border.color: parent.activeFocus ? colors.highlight : "transparent"
++                    }
++                    contentItem: RowLayout {
++                        Text {
++                            Layout.fillWidth: true
++                            text: parent.parent.text
++                            color: selected ? colors.highlightedText : colors.windowText
++                            elide: Text.ElideRight
++                        }
++                        Text { text: selected ? "✓" : ""; color: colors.highlightedText }
++                    }
++                    ToolTip.visible: hovered
++                    ToolTip.text: modelData.description || text
++                    onClicked: settings.selectChoice(index)
++                }
++            }
 +        }
 +    }
 +}

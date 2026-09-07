@@ -93,8 +93,9 @@ never guessed. Scroll up or expand a work summary to pause auto-scroll; **↓ La
 New turns leave room for the answer beneath your prompt. Reading older messages, expanding
 activity, and resizing the dock preserve your reading position. You can draft the next message
 while the agent works; Send waits for the current run to finish (no automatic queue or replay).
-Narrow docks collapse secondary controls under Settings. Message text is selectable and copyable;
-long prompts and individual work entries expand on demand. History arrives in 60-message pages,
+One composer button opens agent, model and reasoning settings, each with its own selection sheet.
+Message text is selectable and supports normal keyboard copying, without per-response Copy buttons.
+Long prompts and individual work entries expand on demand. History arrives in 60-message pages,
 with work details in 20-entry pages and bounded render thumbnails. Paging changes only the chat
 view, never the CAD document or its undo history. Rust still reconstructs the conversation from
 stored events; this bounds UI transport/rendering, not database replay memory.
@@ -102,6 +103,26 @@ stored events; this bounds UI transport/rendering, not database replay memory.
 Inside that tool, `cad.render_views()` attaches axonometric, front, right, and top
 PNG views for visual inspection. Pass a list such as `cad.render_views(["front", "rear"])`
 to choose up to six views. `cad.render(view="current")` captures just one.
+Geometry edits without an explicit render request automatically attach a compact overview and,
+when there is one unambiguous visible result, a focused view. Failed optional capture is reported
+separately and does not roll back a committed edit. Explicit render requests retain their normal
+transactional failure behavior.
+
+`cad.explain(reference)` connects an exact pick to its native Body, Tip, profile, parameters,
+expressions and upstream/downstream dependencies. `cad.review(reference)` also attaches focused
+images, or a local-XY diagram for a sketch; an internal object name works too. Dependencies are
+not proof of which sketch edge generated a face. Ambiguous design intent still needs clarification.
+`cad.frame("Name")` describes local/world placement, origin, axes and native conversion examples.
+Measurements, topology and picker points use world mm; sketch geometry uses local XY.
+Every call reports `interveningChanges` since the previous call in this application session,
+including native undo/redo and edits outside the executor, without guessing who made them.
+
+`cad.api("Name", kind="methods", query="setDatum")` returns bounded native method documentation.
+`kind="workbenches"` lists registered workbenches without activating them; `kind="modules"` lists
+loaded common CAD modules. Explicit `cad.verify` checks can test `bodyTip`, `sketchDegreesOfFreedom`,
+and `nativeFeatureHistory`; the latter only establishes a Body with a native parametric Tip and
+a sketch, not complete editability or design correctness.
+
 Images describe the final recomputed model, with ordered view metadata; rendering
 restores the user's camera and bounds the combined pixel count and image payload.
 Use images alongside object/geometry checks, never as proof of exact topology.
