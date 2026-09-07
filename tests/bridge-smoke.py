@@ -84,7 +84,10 @@ try:
         raise RuntimeError("Run this test through just test with an isolated profile")
     import FreeCAD as App
     import FreeCADGui as Gui
+    App.ParamGet("User parameter:BaseApp/Preferences/NotificationArea").SetBool(
+        "NotificationAreaEnabled", False)
     from PySide6 import QtCore, QtWidgets, QtQuickWidgets, QtGui
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
 
     fixture_directory = tempfile.TemporaryDirectory(prefix="anthracite-provider-smoke-")
     python = Path(os.environ.get("ANTHRACITE_PYTHON", str(Path(sys.prefix) / "bin/python3")))

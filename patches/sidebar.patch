@@ -1477,7 +1477,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,838 @@
+@@ -0,0 +1,805 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
@@ -1538,7 +1538,7 @@
 +
 +        Rectangle {
 +            Layout.fillWidth: true
-+            Layout.preferredHeight: 78
++            Layout.preferredHeight: threadControls.implicitHeight + 16
 +            color: systemPalette.window
 +
 +            ColumnLayout {
@@ -1549,39 +1549,9 @@
 +                anchors.bottomMargin: 8
 +                spacing: 4
 +
-+                RowLayout {
-+                    Layout.fillWidth: true
-+
-+                    Label {
-+                        text: qsTr("Anthracite")
-+                        font.pixelSize: 16
-+                        font.weight: Font.DemiBold
-+                        color: systemPalette.windowText
-+                    }
-+
-+                    Item {
-+                        Layout.fillWidth: true
-+                    }
-+
-+                    Rectangle {
-+                        implicitWidth: statusLabel.implicitWidth + 16
-+                        implicitHeight: 24
-+                        radius: 12
-+                        color: anthraciteController.busy
-+                               ? Qt.rgba(0.30, 0.52, 0.95, 0.18)
-+                               : Qt.rgba(0.50, 0.50, 0.50, 0.14)
-+
-+                        Label {
-+                            id: statusLabel
-+                            anchors.centerIn: parent
-+                            text: anthraciteController.status
-+                            font.pixelSize: 11
-+                            color: systemPalette.windowText
-+                        }
-+                    }
-+                }
 +
 +                RowLayout {
++                    id: threadControls
 +                    Layout.fillWidth: true
 +
 +                    ComboBox {
@@ -1779,41 +1749,37 @@
 +                }
 +                property bool isActivity: kind === "activity"
 +                property bool isWork: kind === "work"
++                property bool isUser: kind === "user"
 +
-+                width: timeline.width
++                width: Math.max(0, timeline.width - timelineScrollBar.width - 4)
 +                height: bubble.implicitHeight
 +
 +                Rectangle {
 +                    id: bubble
-+                    width: parent.width
-+                    implicitHeight: messageColumn.implicitHeight + (isActivity ? 12 : 18)
-+                    radius: 8
-+                    color: isWork ? "transparent" : kind === "user"
++                    objectName: "AnthraciteTranscriptSurface"
++                    anchors.right: parent.right
++                    width: isUser ? Math.min(parent.width * 0.85, Math.ceil(userTextMetrics.advanceWidth) + 26) : parent.width
++                    implicitHeight: messageColumn.implicitHeight + (isUser ? 24 : 12)
++                    radius: 12
++                    color: isUser
 +                           ? Qt.rgba(0.30, 0.52, 0.95, 0.16)
 +                             : kind === "error"
 +                             ? Qt.rgba(0.90, 0.25, 0.25, 0.15)
-+                             : kind === "plan"
-+                               ? Qt.rgba(0.38, 0.63, 0.42, 0.14)
-+                             : kind === "activity"
-+                               ? Qt.rgba(0.50, 0.50, 0.50, 0.10)
-+                               : Qt.rgba(0.50, 0.50, 0.50, 0.07)
++                             : "transparent"
++
++                    TextMetrics {
++                        id: userTextMetrics
++                        font: messageBody.font
++                        text: isUser ? body : ""
++                    }
 +
 +                    Column {
 +                        id: messageColumn
 +                        anchors.left: parent.left
 +                        anchors.right: parent.right
 +                        anchors.top: parent.top
-+                        anchors.margins: isActivity ? 6 : 9
++                        anchors.margins: isUser ? 12 : 6
 +                        spacing: isWork ? 12 : 5
-+
-+                        Label {
-+                            visible: !isActivity && !isWork
-+                            text: author || ""
-+                            font.pixelSize: 11
-+                            font.weight: Font.DemiBold
-+                            color: systemPalette.windowText
-+                            opacity: 0.72
-+                        }
 +
 +                        Label {
 +                            visible: isWork
@@ -1878,6 +1844,7 @@
 +                            onResizing: timeline.pauseAt(timelineRow)
 +                        }
 +                        Transcript.TranscriptText {
++                            id: messageBody
 +                            visible: !isActivity && kind !== "image" && body.length > 0
 +                            width: parent.width
 +                            body: visible ? model.body : ""
@@ -1890,7 +1857,7 @@
 +                }
 +            }
 +
-+            ScrollBar.vertical: ScrollBar {}
++            ScrollBar.vertical: ScrollBar { id: timelineScrollBar }
 +        }
 +
 +        Rectangle {
@@ -3500,7 +3467,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,541 @@
+@@ -0,0 +1,571 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -3742,6 +3709,36 @@
 +    apply_edit({'op': 'append', 'row': dict(rows[0], id='answer', kind='assistant', body='Short answer')})
 +    QtTest.QTest.qWait(100)
 +    assert abs(timeline.property('contentY') - top) < 3, 'Short answer moved the new prompt'
++    # User prompts have a right-aligned bubble; agent replies have no author
++    # label, background card, or duplicate idle/branding header.
++    expression = QtQml.QQmlExpression(quick_widget.rootContext(), timeline, '''
++        const reply = itemAtIndex(count - 1);
++        const prompt = itemAtIndex(count - 2);
++        const surface = reply.children[0];
++        const promptSurface = prompt.children[0];
++        if (surface.color.a !== 0) throw new Error("Assistant reply is still boxed");
++        if (promptSurface.width >= width || promptSurface.x <= 0)
++            throw new Error("User prompt is not a right-aligned bubble");
++    ''')
++    expression.evaluate()
++    assert not expression.hasError(), expression.error().toString()
++    del expression
++    # Traverse visual items in QML, without manufacturing PySide wrappers for
++    # private QML objects that will be destroyed by the reload test below.
++    expression = QtQml.QQmlExpression(quick_widget.rootContext(), root, '''
++        function check(item) {
++            if (item.text === "Anthracite" || item.text === "Ready" || item.text === "You")
++                throw new Error("Redundant thread label");
++            const children = item.children || [];
++            for (let i = 0; i < children.length; ++i) check(children[i]);
++        }
++        check(this);
++    ''')
++    expression.evaluate()
++    assert not expression.hasError(), expression.error().toString()
++    del expression
++    capture = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/thread-layout.png'
++    assert quick_widget.grab().save(str(capture))
 +    # Detail responses are append-only pages and duplicate responses are ignored.
 +    apply_edit({'op': 'append', 'row': dict(rows[0], id='work', kind='work', entryCount=2)})
 +    details = {'op': 'details', 'id': 'work', 'offset': 0,
@@ -4261,7 +4258,7 @@
 +    ToolButton {
 +        width: parent.width
 +        visible: root.entry.kind !== "image"
-+        text: (root.expanded ? "⌄  " : "›  ") + (root.entry.title || root.entry.author || qsTr("Activity"))
++        text: (root.expanded ? "⌄  " : "›  ") + (root.entry.title || qsTr("Activity"))
 +        contentItem: Text {
 +            text: parent.text
 +            color: colors.text
@@ -4296,7 +4293,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/TranscriptText.qml
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,35 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
@@ -4304,6 +4301,7 @@
 +Column {
 +    id: root
 +    property string body: ""
++    property alias font: messageText.font
 +    property bool markdown: false
 +    property bool foldLong: false
 +    property bool expanded: false

@@ -11,6 +11,13 @@ try:
     import FreeCAD as App
     import FreeCADGui as Gui
 
+    # Native notification widgets can re-enter Qt logging/accessibility on
+    # macOS. Keep diagnostics in the report/log, not transient test widgets.
+    from PySide6 import QtCore
+    App.ParamGet("User parameter:BaseApp/Preferences/NotificationArea").SetBool(
+        "NotificationAreaEnabled", False)
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
     # The GUI-only checks must not start the user's real agent installation.
     preferences = App.ParamGet("User parameter:BaseApp/Preferences/Mod/Anthracite")
     preferences.SetString("CodexBinary", str(Path(os.environ["XDG_STATE_HOME"]) / "disabled-provider"))
