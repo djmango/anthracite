@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
-@@ -0,0 +1,986 @@
+@@ -0,0 +1,993 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "AgentBridge.h"
@@ -10,6 +10,7 @@
 +#include <Python.h>
 +
 +#include <QApplication>
++#include <QElapsedTimer>
 +#include <QDir>
 +#include <QFileDialog>
 +#include <QFileInfo>
@@ -364,7 +365,13 @@
 +void AgentBridge::readStandardOutput()
 +{
 +    standardOutputBuffer += runtime.readAllStandardOutput();
++    QElapsedTimer budget;
++    budget.start();
 +    while (true) {
++        if (budget.elapsed() >= 8) {
++            QTimer::singleShot(0, this, &AgentBridge::readStandardOutput);
++            return;
++        }
 +        const qsizetype newline = standardOutputBuffer.indexOf('\n');
 +        if (newline < 0) {
 +            break;
@@ -1348,17 +1355,30 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/ConversationModel.cpp
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,164 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "ConversationModel.h"
 +#include <QUuid>
++#include <utility>
 +
 +using namespace AnthraciteGui;
 +
 +ConversationModel::ConversationModel(QObject* parent)
 +    : QAbstractListModel(parent)
-+{}
++{
++    updateTimer.setSingleShot(true);
++    updateTimer.setInterval(16);
++    connect(&updateTimer, &QTimer::timeout, this, &ConversationModel::flushChanges);
++}
++
++void ConversationModel::flushChanges()
++{
++    updateTimer.stop();
++    const auto changes = std::exchange(pendingRoles, {});
++    for (auto it = changes.cbegin(); it != changes.cend(); ++it)
++        Q_EMIT dataChanged(index(it.key()), index(it.key()), it.value());
++}
 +
 +int ConversationModel::rowCount(const QModelIndex& parent) const
 +{
@@ -1429,6 +1449,8 @@
 +{
 +    // Generic row transport only. Message/run semantics belong to the Rust runtime.
 +    const QString operation = edit.value("op").toString();
++    // Structural edits must not leave delayed signals addressing old row indices.
++    if (operation != QLatin1String("update")) flushChanges();
 +    if (edit.contains("hasEarlier") || operation == QLatin1String("reset")) {
 +        earlier = edit.value("hasEarlier").toBool();
 +        Q_EMIT historyChanged();
@@ -1470,8 +1492,19 @@
 +        const QVariantMap value = edit.value("row").toMap();
 +        for (int row = 0; row < rowCount(); ++row) {
 +            if (messages[row].value("id") == value.value("id")) {
++                auto roles = roleNames();
++                QList<int> changed;
++                for (auto it = roles.cbegin(); it != roles.cend(); ++it) {
++                    const QString key = it.key() == IdRole ? QStringLiteral("id") : QString::fromLatin1(it.value());
++                    if (messages[row].value(key) != value.value(key)) changed.append(it.key());
++                }
 +                messages[row] = value;
-+                Q_EMIT dataChanged(index(row), index(row));
++                if (!changed.isEmpty()) {
++                    auto& pending = pendingRoles[row];
++                    for (int role : changed) if (!pending.contains(role)) pending.append(role);
++                    // Throttle, don't debounce: continuous output must still paint.
++                    if (!updateTimer.isActive()) updateTimer.start();
++                }
 +                break;
 +            }
 +        }
@@ -1489,7 +1522,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/ConversationModel.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,63 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_CONVERSATIONMODEL_H
@@ -1497,6 +1530,8 @@
 +
 +#include <QAbstractListModel>
 +#include <QString>
++#include <QTimer>
++#include <QMap>
 +#include <vector>
 +
 +
@@ -1542,6 +1577,9 @@
 +    void detailsRequested(const QString& id, int offset);
 +
 +private:
++    void flushChanges();
++    QTimer updateTimer;
++    QMap<int, QList<int>> pendingRoles;
 +    std::vector<QVariantMap> messages;
 +    bool earlier = false;
 +};
@@ -1568,7 +1606,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,805 @@
+@@ -0,0 +1,829 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
@@ -1709,6 +1747,8 @@
 +            property var expandedRows: ({})
 +            property var expandedEntries: ({})
 +            cacheBuffer: 240
++            boundsBehavior: Flickable.StopAtBounds
++            property bool userScrolling: false
 +
 +            function remember() {
 +                if (settling || moving) return
@@ -1728,19 +1768,25 @@
 +                expandedEntries = state
 +            }
 +            function navigate() {
++                userScrolling = true
++                gestureEnd.restart()
 +                scrollMode = "reading"
 +                pendingTurn = false
 +                // Keep the reserved space during a gesture; removing it clamps the viewport.
 +                settle.stop()
 +            }
 +            function latest() {
++                userScrolling = false
++                gestureEnd.stop()
 +                scrollMode = "following"
 +                newTurnId = ""
 +                positionViewAtEnd()
 +            }
-+            function schedule() { if (!moving) settle.restart() }
++            function schedule() {
++                if (!moving && !userScrolling && !settling && !settle.running) settle.start()
++            }
 +            function reconcile() {
-+                if (moving) return
++                if (moving || userScrolling) return
 +                settling = true
 +                if (scrollMode === "following") {
 +                    positionViewAtEnd()
@@ -1767,6 +1813,8 @@
 +            }
 +            onMovementStarted: navigate()
 +            onMovementEnded: {
++                userScrolling = false
++                gestureEnd.stop()
 +                if (atYEnd) { newTurnId = ""; scrollMode = "following" }
 +                remember()
 +            }
@@ -1776,13 +1824,21 @@
 +            onCountChanged: schedule()
 +            Timer { id: settle; interval: 16; onTriggered: timeline.reconcile() }
 +            Timer {
++                id: gestureEnd
++                interval: 150
++                onTriggered: {
++                    if (timeline.moving || timelineScrollBar.pressed) { restart(); return }
++                    timeline.userScrolling = false
++                    timeline.remember()
++                }
++            }
++            Timer {
 +                id: latestDelay
 +                interval: 150
 +                running: timeline.scrollMode === "reading" && !timeline.atYEnd
 +            }
-+            WheelHandler {
-+                onWheel: function(event) { timeline.navigate(); event.accepted = false }
-+            }
++            // Flickable owns wheel/trackpad input. A competing WheelHandler
++            // can grab the gesture without actually scrolling the view.
 +            Keys.onPressed: function(event) {
 +                if ([Qt.Key_Up, Qt.Key_Down, Qt.Key_PageUp, Qt.Key_PageDown,
 +                     Qt.Key_Home, Qt.Key_End].indexOf(event.key) >= 0) timeline.navigate()
@@ -1948,7 +2004,13 @@
 +                }
 +            }
 +
-+            ScrollBar.vertical: ScrollBar { id: timelineScrollBar }
++            ScrollBar.vertical: ScrollBar {
++                id: timelineScrollBar
++                onPressedChanged: {
++                    if (pressed) timeline.navigate()
++                    else { timeline.userScrolling = false; timeline.remember() }
++                }
++            }
 +        }
 +
 +        Rectangle {
@@ -3558,7 +3620,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,579 @@
+@@ -0,0 +1,623 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -3789,6 +3851,44 @@
 +    apply_edit({'op': 'update', 'row': dict(rows[-1], kind='assistant', body='Streaming output\n' * 20)})
 +    QtTest.QTest.qWait(100)
 +    assert timeline.property('anchorId') == anchor, 'Streaming pulled the reader to the bottom'
++    # A burst must update the data immediately but notify/re-layout only once
++    # per frame, and only invalidate the fields that actually changed.
++    notifications = []
++    def changed(first, last, changed_roles):
++        notifications.append(list(changed_roles))
++    model.dataChanged.connect(changed)
++    started = time.monotonic()
++    for i in range(250):
++        apply_edit({'op': 'update', 'row': dict(rows[-1], kind='assistant', body='Streaming output\n' * 20 + str(i))})
++    assert model.data(model.index(model.indexOfId('79'), 0), roles['body']).endswith('249')
++    QtTest.QTest.qWait(70)
++    assert 1 <= len(notifications) <= 3, f'Streaming caused {len(notifications)} model invalidations'
++    assert all(items == [roles['body']] for items in notifications), notifications
++    model.dataChanged.disconnect(changed)
++    print(f'ANTHRACITE_STREAM_BURST: 250 updates, {len(notifications)} notifications, {time.monotonic() - started:.3f}s', flush=True)
++    assert timeline.property('anchorId') == anchor
++    # Simulate the native wheel path, not a direct scroll-mode assignment.
++    center = timeline.mapToScene(QtCore.QPointF(timeline.width() / 2, timeline.height() / 2))
++    wheel = QtGui.QWheelEvent(center, center, QtCore.QPoint(), QtCore.QPoint(0, 120),
++                             QtCore.Qt.NoButton, QtCore.Qt.NoModifier,
++                             QtCore.Qt.NoScrollPhase, False)
++    def anchor_position():
++        expression = QtQml.QQmlExpression(quick_widget.rootContext(), timeline,
++            'itemAtIndex(model.indexOfId(' + json.dumps(anchor) + ')).y - contentY')
++        value = expression.evaluate()
++        assert not expression.hasError(), expression.error().toString()
++        return value[0] if isinstance(value, tuple) else value
++    before_wheel = anchor_position()
++    QtWidgets.QApplication.sendEvent(quick_widget, wheel)
++    QtTest.QTest.qWait(200)
++    after_wheel = anchor_position()
++    assert after_wheel > before_wheel, ('Wheel did not scroll the transcript', before_wheel, after_wheel,
++                                       timeline.property('scrollMode'), timeline.property('userScrolling'))
++    apply_edit({'op': 'update', 'row': dict(rows[-1], kind='assistant', body='More streaming\n' * 25)})
++    QtTest.QTest.qWait(100)
++    assert abs(anchor_position() - after_wheel) < 3, 'Streaming snapped back after a wheel gesture'
++    anchor = timeline.property('anchorId')
++    offset = timeline.property('anchorOffset')
 +    original_width = root.property('width')
 +    root.setProperty('width', 320)
 +    QtTest.QTest.qWait(100)
@@ -3972,7 +4072,13 @@
 +        assert quick_widget.hasFocus(), ('Picking did not return native keyboard focus to the sidebar',
 +                                        quick_widget.isVisible(), QtWidgets.QApplication.focusWidget())
 +        assert composer.property('activeFocus'), 'Picking did not focus the composer'
++        attachment_signals = []
++        def attachments_changed():
++            attachment_signals.append(True)
++        controller.attachmentsChanged.connect(attachments_changed)
 +        QtTest.QTest.keyClicks(QtWidgets.QApplication.focusWidget(), ' thinner')
++        controller.attachmentsChanged.disconnect(attachments_changed)
++        assert not attachment_signals, 'Typing rebuilt unchanged attachment previews'
 +        assert controller.property('draft').endswith(' thinner'), 'Typing after picking missed the composer'
 +        # Reset the typing undo group before checking atomic token deletion/undo.
 +        controller.setDraft(controller.property('draft').removesuffix(' thinner'))
@@ -4140,7 +4246,7 @@
 +QtCore.QTimer.singleShot(0, finish)
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Composer.cpp
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,202 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +// Native text-document glue: a CAD mention is one inline image character, not editable label text.
@@ -4204,7 +4310,9 @@
 +void SidebarController::readComposer()
 +{
 +    if (updatingComposer || !composerDocument) return;
-+    currentDraft = composerPlainText(composerDocument);
++    const QString nextDraft = composerPlainText(composerDocument);
++    const bool draftChangedValue = nextDraft != currentDraft;
++    currentDraft = nextDraft;
 +    QVariantList active;
 +    for (const auto& item : currentAttachments) {
 +        if (item.toMap().value("type").toString() != QLatin1String("cad")) active.append(item);
@@ -4220,10 +4328,13 @@
 +            }
 +        }
 +    }
-+    currentAttachments = active;
-+    Q_EMIT attachmentsChanged();
-+    Q_EMIT draftChanged();
-+    Q_EMIT draftEdited(currentDraft);
++    const bool attachmentsChangedValue = currentAttachments != active;
++    if (attachmentsChangedValue) {
++        currentAttachments = active;
++        Q_EMIT attachmentsChanged();
++    }
++    if (draftChangedValue) Q_EMIT draftChanged();
++    if (draftChangedValue || attachmentsChangedValue) Q_EMIT draftEdited(currentDraft);
 +}
 +
 +void SidebarController::insertComposerToken(QTextCursor& cursor, const QVariantMap& token)

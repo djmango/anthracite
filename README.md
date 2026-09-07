@@ -98,6 +98,24 @@ The picker remains usable during a run: model/effort changes apply to the next s
 and a harness change connects after the current run finishes. An unconnected harness's model
 catalog becomes available when it connects; the running harness's models are never substituted.
 Message text is selectable and supports normal keyboard copying, without per-response Copy buttons.
+
+The interaction standard is low acknowledgement latency and continuous, understandable state:
+
+- Acknowledge input immediately, targeting visible feedback within 100 ms. Show pressed,
+  selected, queued, or pending state without waiting for the provider; never imply CAD success
+  before validation confirms it.
+- Preserve reading position, focus, drafts, and spatial context. Transitions explain what changed;
+  do not hide state changes behind animation or make content teleport.
+- Discrete choices land crisply. Continuous motion uses short easing or restrained springs and
+  yields immediately to a new gesture. Respect reduced motion; feedback must not depend on motion,
+  sound, or haptics.
+- Keep gestures consistent. Show honest progress, distinguish waiting from failure, and make
+  errors explain a recovery action. Prefer feedback at the affected control over extra chat rows.
+- Test acknowledgement, interruption, focus, scroll anchors, and reduced-motion behavior under
+  streaming load. Track latency distributions and frame gaps separately from functional tests;
+  passing tests alone does not establish that the sidebar feels good. The 100 ms target is an
+  acceptance goal, not a measured guarantee of the current implementation.
+
 Long prompts and individual work entries expand on demand. History arrives in 60-message pages,
 with work details in 20-entry pages and bounded render thumbnails. Paging changes only the chat
 view, never the CAD document or its undo history. Rust still reconstructs the conversation from
