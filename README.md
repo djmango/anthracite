@@ -14,6 +14,9 @@ FreeCAD's responsibility. Model output is fallible code completion; the chat sid
 requests and observations.
 
 - a native, dockable QML sidebar alongside the 3D viewport
+- paste images with Cmd-V/Ctrl-V or use the composer’s attach button; previews are removable
+  and remain visible in sent messages and replayed history
+- an eyedropper-style CAD picker adds readable object/face/edge/vertex references to your draft
 - existing coding-agent installations instead of a new agent harness
 - streaming chat and CAD activity with approvals, requested input, plans and durable replay
 - completed runs show only the final answer beneath an expandable “Worked for Xm Ys”
@@ -69,6 +72,21 @@ Anthracite adds one CAD-specific tool to the selected agent:
 ```text
 freecad(<ordinary Python source>)
 ```
+
+Use the composer’s **+** button to attach images or files, or paste an image from the clipboard.
+Images are sent as native Codex/OpenCode image inputs, not text descriptions. The sidebar previews
+the exact normalized PNG sent to the agent. Other files are snapshotted under the XDG state
+directory and passed as named local paths for the agent’s existing file tools; attaching a CAD
+file does not automatically import it. Preparation runs off the GUI thread. Limits: eight
+attachments, 8 MiB per selected file, images scaled to fit 2048×2048, 24 MiB combined encoded images.
+Attachments persist with each thread’s draft. File snapshots remain until explicitly removed.
+
+Click the **eyedropper**, then click a face, edge, vertex, or object in the viewport. FreeCAD’s
+native selection resolves the hit; the composer shows its label, internal name and subelement.
+Escape or right-click cancels. The agent receives an exact revision-bound reference, geometry
+summary and picked point in mm. Stale references block sending until removed and picked again;
+the executor also rejects them if geometry changes later. Unsupported selections are reported,
+never guessed. Scroll up or expand a work summary to pause auto-scroll; **↓ Latest** resumes it.
 
 Inside that tool, `cad.render_views()` attaches axonometric, front, right, and top
 PNG views for visual inspection. Pass a list such as `cad.render_views(["front", "rear"])`

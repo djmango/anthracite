@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
-@@ -0,0 +1,844 @@
+@@ -0,0 +1,893 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "AgentBridge.h"
@@ -24,6 +24,7 @@
 +#include <App/Application.h>
 +#include <App/Document.h>
 +#include <Base/Console.h>
++#include <Gui/Selection/Selection.h>
 +
 +
 +using namespace AnthraciteGui;
@@ -99,6 +100,24 @@
 +    );
 +
 +    sidebar->restoreProvider(providerKind());
++    selectionConnection = Gui::Selection().signalSelectionChanged2.connect(
++        [this](const Gui::SelectionChanges& selection) {
++            if (!sidebar->picking() || selection.Type != Gui::SelectionChanges::AddSelection) return;
++            const auto gil = PyGILState_Ensure();
++            PyObject* module = PyImport_ImportModule("AnthraciteExecutor");
++            PyObject* result = module ? PyObject_CallMethod(module, "picked_reference_json", "sssddd",
++                selection.pDocName, selection.pObjectName, selection.pSubName,
++                double(selection.x), double(selection.y), double(selection.z)) : nullptr;
++            const char* encoded = result ? PyUnicode_AsUTF8(result) : nullptr;
++            const auto attachment = encoded ? QJsonDocument::fromJson(encoded).object() : QJsonObject();
++            const QString error = encoded ? QString() : pythonError();
++            Py_XDECREF(result);
++            Py_XDECREF(module);
++            PyGILState_Release(gil);
++            sidebar->setPicking(false);
++            if (!error.isEmpty()) sidebar->appendActivity(error + tr(" Pick a direct face, edge, vertex or object; nested references are not guessed."));
++            else sidebar->addAttachment(attachment.toVariantMap());
++        });
 +    QTimer::singleShot(0, this, [this]() {
 +        if (!providerPath().isEmpty() && QFileInfo::exists(runtimePath())) {
 +            ensureRuntime();
@@ -108,6 +127,7 @@
 +
 +AgentBridge::~AgentBridge()
 +{
++    sidebar->setPicking(false);
 +    draftTimer.stop();
 +    if (runtime.state() == QProcess::NotRunning) {
 +        return;
@@ -126,11 +146,27 @@
 +
 +void AgentBridge::submit(const QString& prompt)
 +{
++    queuedAttachments = QJsonArray::fromVariantList(sidebar->attachments());
++    const auto gil = PyGILState_Ensure();
++    PyObject* module = PyImport_ImportModule("AnthraciteExecutor");
++    const auto encoded = QJsonDocument(queuedAttachments).toJson(QJsonDocument::Compact);
++    PyObject* checked = module ? PyObject_CallMethod(module, "validate_picks_json", "s", encoded.constData()) : nullptr;
++    const QString error = checked ? QString() : pythonError();
++    Py_XDECREF(checked);
++    Py_XDECREF(module);
++    PyGILState_Release(gil);
++    if (!error.isEmpty()) {
++        queuedPrompt.clear();
++        queuedAttachments = {};
++        awaitingSubmission = false;
++        sidebar->failTurn(error + tr(" Remove the stale reference and pick again."));
++        return;
++    }
 +    queuedPrompt = prompt;
 +    stopping = false;
 +
 +    if (runtimeReady) {
-+        QJsonObject payload {{"prompt", queuedPrompt}};
++        QJsonObject payload {{"prompt", queuedPrompt}, {"attachments", queuedAttachments}};
 +        if (!selectedModel.isEmpty()) {
 +            payload.insert(QStringLiteral("model"), selectedModel);
 +        }
@@ -138,6 +174,7 @@
 +            payload.insert(QStringLiteral("effort"), selectedEffort);
 +        }
 +        send(QStringLiteral("turn.start"), payload);
++        awaitingSubmission = true;
 +        queuedPrompt.clear();
 +        return;
 +    }
@@ -148,6 +185,12 @@
 +void AgentBridge::stop()
 +{
 +    stopping = true;
++    if (!awaitingSubmission && (!queuedPrompt.isEmpty() || !queuedAttachments.isEmpty())) {
++        queuedPrompt.clear();
++        queuedAttachments = {};
++        sidebar->completeTurn();
++        return;
++    }
 +    send(QStringLiteral("turn.interrupt"));
 +}
 +
@@ -394,7 +437,8 @@
 +        return 0;
 +    }
 +    const qint64 saveId = nextDraftSaveId++;
-+    send(QStringLiteral("draft.save"), {{"body", pendingDraft}, {"saveId", saveId}});
++    send(QStringLiteral("draft.save"), {{"body", pendingDraft}, {"saveId", saveId},
++        {"attachments", QJsonArray::fromVariantList(sidebar->attachments())}});
 +    draftDirty = false;
 +    return saveId;
 +}
@@ -430,9 +474,11 @@
 +        sidebar->applyTimelineEdit(payload.toVariantMap());
 +    }
 +    else if (type == QLatin1String("draft.loaded")) {
++        if (sidebar->busy() || sidebar->processingAttachments() || draftDirty) return;
 +        pendingDraft = payload.value("body").toString();
 +        draftDirty = false;
 +        sidebar->loadDraft(pendingDraft);
++        sidebar->loadAttachments(payload.value("attachments").toArray().toVariantList());
 +    }
 +    else if (type == QLatin1String("draft.saved")) {
 +        const qint64 saveId = payload.value("saveId").toInteger();
@@ -466,16 +512,8 @@
 +        );
 +        sidebar->updateStatus(queuedPrompt.isEmpty() ? tr("Ready") : tr("Thinking"));
 +        persistDraft();
-+        if (!queuedPrompt.isEmpty()) {
-+            QJsonObject turnPayload {{"prompt", queuedPrompt}};
-+            if (!selectedModel.isEmpty()) {
-+                turnPayload.insert(QStringLiteral("model"), selectedModel);
-+            }
-+            if (!selectedEffort.isEmpty()) {
-+                turnPayload.insert(QStringLiteral("effort"), selectedEffort);
-+            }
-+            send(QStringLiteral("turn.start"), turnPayload);
-+            queuedPrompt.clear();
++        if (!queuedPrompt.isEmpty() || !queuedAttachments.isEmpty()) {
++            submit(queuedPrompt);
 +        }
 +    }
 +    else if (type == QLatin1String("content.delta")) {
@@ -542,8 +580,15 @@
 +            sidebar->completeTurn();
 +        }
 +    }
++    else if (type == QLatin1String("session.state") && payload.value("state").toString() == QLatin1String("running") && awaitingSubmission) {
++        awaitingSubmission = false;
++        queuedAttachments = {};
++        sidebar->acceptSubmission();
++    }
 +    else if (type == QLatin1String("runtime.error")) {
 +        queuedPrompt.clear();
++        queuedAttachments = {};
++        awaitingSubmission = false;
 +        sidebar->failTurn(payload.value("message").toString(tr("Unknown agent error.")), !payload.contains("timestampMs"));
 +    }
 +}
@@ -813,6 +858,8 @@
 +    }
 +
 +    queuedPrompt.clear();
++    queuedAttachments = {};
++    awaitingSubmission = false;
 +    draftTimer.stop();
 +    draftDirty = false;
 +    restartPending = false;
@@ -843,17 +890,20 @@
 +void AgentBridge::fail(const QString& message)
 +{
 +    queuedPrompt.clear();
++    queuedAttachments = {};
++    awaitingSubmission = false;
 +    sidebar->failTurn(message);
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.h
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,109 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_AGENTBRIDGE_H
 +#define ANTHRACITEGUI_AGENTBRIDGE_H
 +
 +#include <QJsonValue>
++#include <QJsonArray>
 +#include <QJsonObject>
 +#include <QHash>
 +#include <QObject>
@@ -927,6 +977,8 @@
 +    QProcess runtime;
 +    QByteArray standardOutputBuffer;
 +    QString queuedPrompt;
++    QJsonArray queuedAttachments;
++    bool awaitingSubmission = false;
 +    bool runtimeReady = false;
 +    bool stopping = false;
 +    bool createNewThread = false;
@@ -947,6 +999,7 @@
 +    boost::signals2::scoped_connection activeDocumentConnection;
 +    boost::signals2::scoped_connection savedDocumentConnection;
 +    boost::signals2::scoped_connection deletedDocumentConnection;
++    boost::signals2::scoped_connection selectionConnection;
 +    std::optional<int> documentRevision;
 +    QSet<QString> executedOperations;
 +};
@@ -1020,13 +1073,13 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,98 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +find_package(
 +    Qt${FREECAD_QT_MAJOR_VERSION}
 +    REQUIRED
-+    COMPONENTS Qml Quick QuickWidgets
++    COMPONENTS Qml Quick QuickWidgets Concurrent
 +)
 +
 +find_program(CARGO_EXECUTABLE cargo REQUIRED)
@@ -1056,6 +1109,7 @@
 +        ${AnthraciteRuntime_SOURCE_DIR}/Cargo.lock
 +        ${AnthraciteRuntime_SOURCE_DIR}/Cargo.toml
 +        ${AnthraciteRuntime_SOURCE_DIR}/src/main.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/composer.rs
 +        ${AnthraciteRuntime_SOURCE_DIR}/src/process.rs
 +        ${AnthraciteRuntime_SOURCE_DIR}/src/protocol.rs
 +        ${AnthraciteRuntime_SOURCE_DIR}/src/store.rs
@@ -1105,6 +1159,7 @@
 +    Qt${FREECAD_QT_MAJOR_VERSION}::Qml
 +    Qt${FREECAD_QT_MAJOR_VERSION}::Quick
 +    Qt${FREECAD_QT_MAJOR_VERSION}::QuickWidgets
++    Qt${FREECAD_QT_MAJOR_VERSION}::Concurrent
 +)
 +
 +if(FREECAD_WARN_ERROR)
@@ -1317,7 +1372,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,650 @@
+@@ -0,0 +1,780 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
@@ -1424,7 +1479,7 @@
 +                        Layout.fillWidth: true
 +                        model: anthraciteController.threads
 +                        textRole: "title"
-+                        enabled: !anthraciteController.busy && count > 0
++                        enabled: !anthraciteController.busy && !anthraciteController.processingAttachments && count > 0
 +
 +                        currentIndex: {
 +                            for (let index = 0; index < count; ++index) {
@@ -1444,7 +1499,7 @@
 +                        id: newThreadButton
 +                        objectName: "AnthraciteNewThread"
 +                        text: "+"
-+                        enabled: !anthraciteController.busy
++                        enabled: !anthraciteController.busy && !anthraciteController.processingAttachments
 +                        ToolTip.visible: hovered
 +                        ToolTip.text: qsTr("New conversation")
 +                        onClicked: anthraciteController.newThread()
@@ -1470,11 +1525,25 @@
 +            clip: true
 +            model: anthraciteController.messages
 +
-+            onCountChanged: positionViewAtEnd()
++            property bool followOutput: true
++            onMovementStarted: followOutput = false
++            onMovementEnded: followOutput = atYEnd
++            onCountChanged: if (followOutput) Qt.callLater(positionViewAtEnd)
++            onContentHeightChanged: if (followOutput) Qt.callLater(positionViewAtEnd)
++
++            ToolButton {
++                anchors.right: parent.right
++                anchors.bottom: parent.bottom
++                z: 2
++                visible: !timeline.followOutput && !timeline.atYEnd
++                text: qsTr("↓ Latest")
++                onClicked: { timeline.followOutput = true; timeline.positionViewAtEnd() }
++            }
 +
 +            delegate: Item {
 +                objectName: isWork ? "workSummary" : "timelineEntry"
 +                property bool activityExpanded: false
++                onActivityExpandedChanged: if (activityExpanded) timeline.followOutput = false
 +                property bool isActivity: kind === "activity"
 +                property bool isWork: kind === "work"
 +
@@ -1772,6 +1841,114 @@
 +                anchors.margins: 10
 +                spacing: 8
 +
++                ScrollView {
++                    Layout.fillWidth: true
++                    Layout.preferredHeight: anthraciteController.attachments.length > 0 ? 88 : 0
++                    visible: anthraciteController.attachments.length > 0
++                    clip: true
++                    Row {
++                        spacing: 6
++                        Repeater {
++                            model: anthraciteController.attachments
++                            delegate: Frame {
++                                width: 154
++                                height: 80
++                                padding: 4
++                                background: Rectangle {
++                                    radius: 6
++                                    color: Qt.rgba(0.5, 0.5, 0.5, 0.07)
++                                    border.color: systemPalette.mid
++                                }
++                                Column {
++                                    width: parent.width
++                                    Image {
++                                        width: parent.width - 24
++                                        height: modelData.type === "image" ? 42 : 0
++                                        source: modelData.type === "image" ? modelData.dataUrl : ""
++                                        fillMode: Image.PreserveAspectFit
++                                        MouseArea {
++                                            anchors.fill: parent
++                                            onClicked: { imagePreview.imageSource = parent.source; imagePreview.open() }
++                                        }
++                                    }
++                                    Label {
++                                        width: parent.width
++                                        text: modelData.name
++                                        elide: Text.ElideMiddle
++                                        font.pixelSize: 11
++                                    }
++                                    Label {
++                                        visible: modelData.type !== "image"
++                                        text: modelData.type === "cad" ? qsTr("Picked CAD geometry") : qsTr("File for agent tools")
++                                        font.pixelSize: 10
++                                        opacity: 0.65
++                                    }
++                                }
++                                ToolButton {
++                                    anchors.right: parent.right
++                                    anchors.top: parent.top
++                                    width: 24; height: 24
++                                    text: "×"
++                                    contentItem: Label {
++                                        text: "×"
++                                        color: systemPalette.windowText
++                                        horizontalAlignment: Text.AlignHCenter
++                                        verticalAlignment: Text.AlignVCenter
++                                    }
++                                    enabled: !anthraciteController.busy
++                                    Accessible.name: qsTr("Remove attachment")
++                                    onClicked: anthraciteController.removeAttachment(index)
++                                }
++                                ToolTip.visible: attachmentHover.hovered
++                                ToolTip.text: modelData.name
++                                HoverHandler { id: attachmentHover }
++                            }
++                        }
++                    }
++                }
++
++                RowLayout {
++                    Layout.fillWidth: true
++                    ToolButton {
++                        objectName: "AnthraciteAttachFiles"
++                        text: "+"
++                        enabled: !anthraciteController.busy
++                        Accessible.name: qsTr("Attach files")
++                        ToolTip.visible: hovered
++                        ToolTip.text: qsTr("Attach images or files (up to 8 MiB each). You can also paste images.")
++                        onClicked: anthraciteController.attachFiles()
++                    }
++                    ToolButton {
++                        objectName: "AnthraciteGeometryPicker"
++                        checked: anthraciteController.picking
++                        enabled: !anthraciteController.busy && !anthraciteController.processingAttachments
++                        Accessible.name: qsTr("Pick CAD geometry")
++                        ToolTip.visible: hovered
++                        ToolTip.text: qsTr("Pick a face, edge, vertex or object in the model. Escape cancels.")
++                        contentItem: Canvas {
++                            implicitWidth: 22; implicitHeight: 22
++                            onPaint: {
++                                const c = getContext("2d")
++                                c.reset(); c.strokeStyle = systemPalette.buttonText; c.lineWidth = 1.8
++                                c.beginPath(); c.moveTo(3,20); c.lineTo(5,15); c.lineTo(13,7)
++                                c.lineTo(17,11); c.lineTo(9,19); c.closePath(); c.stroke()
++                                c.beginPath(); c.moveTo(11,5); c.lineTo(19,13); c.stroke()
++                                c.beginPath(); c.moveTo(14,7); c.lineTo(16,5)
++                                c.quadraticCurveTo(20,1,21,4); c.quadraticCurveTo(23,7,18,10)
++                                c.closePath(); c.fillStyle = systemPalette.buttonText; c.fill()
++                            }
++                        }
++                        onClicked: anthraciteController.togglePicker()
++                    }
++                    Label {
++                        Layout.fillWidth: true
++                        wrapMode: Text.Wrap
++                        text: anthraciteController.processingAttachments ? qsTr("Preparing attachments…")
++                            : anthraciteController.picking ? qsTr("Click model geometry · Esc to cancel") : ""
++                        font.pixelSize: 11
++                    }
++                }
++
 +                TextArea {
 +                    id: composer
 +                    objectName: "AnthraciteComposer"
@@ -1783,6 +1960,10 @@
 +                    onTextChanged: anthraciteController.setDraft(text)
 +
 +                    Keys.onPressed: function(event) {
++                        if (event.matches(StandardKey.Paste) && anthraciteController.pasteAttachments()) {
++                            event.accepted = true
++                            return
++                        }
 +                        if ((event.modifiers & (Qt.ControlModifier | Qt.MetaModifier))
 +                                && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
 +                            send()
@@ -1793,6 +1974,10 @@
 +
 +                Connections {
 +                    target: anthraciteController
++
++                    function onPickingChanged() {
++                        if (!anthraciteController.picking) composer.forceActiveFocus()
++                    }
 +
 +                    function onDraftChanged() {
 +                        if (composer.text !== anthraciteController.draft) {
@@ -1915,7 +2100,7 @@
 +                        Layout.preferredWidth: Math.max(105, implicitWidth)
 +                        model: anthraciteController.providers
 +                        textRole: "name"
-+                        enabled: !anthraciteController.busy
++                        enabled: !anthraciteController.busy && !anthraciteController.processingAttachments
 +
 +                        currentIndex: {
 +                            for (let index = 0; index < count; ++index) {
@@ -1951,7 +2136,7 @@
 +                        visible: !anthraciteController.busy
 +                        text: qsTr("Send")
 +                        highlighted: true
-+                        enabled: composer.text.trim().length > 0
++                        enabled: !anthraciteController.processingAttachments && (composer.text.trim().length > 0 || anthraciteController.attachments.length > 0)
 +                        onClicked: send()
 +                    }
 +                }
@@ -1961,16 +2146,16 @@
 +
 +    function send() {
 +        const text = composer.text.trim()
-+        if (text.length === 0 || anthraciteController.busy) {
++        if ((text.length === 0 && anthraciteController.attachments.length === 0) || anthraciteController.busy) {
 +            return
 +        }
-+        composer.text = ""
++        timeline.followOutput = true
 +        anthraciteController.submit(text)
 +    }
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,695 @@
+@@ -0,0 +1,888 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "Sidebar.h"
@@ -1978,6 +2163,19 @@
 +#include "AgentBridge.h"
 +
 +#include <QDockWidget>
++#include <QApplication>
++#include <QClipboard>
++#include <QMimeData>
++#include <QImageReader>
++#include <QBuffer>
++#include <QFileDialog>
++#include <QSaveFile>
++#include <QStandardPaths>
++#include <QUuid>
++#include <QKeyEvent>
++#include <QMouseEvent>
++#include <QtConcurrent/QtConcurrentRun>
++#include <QFutureWatcher>
 +#include <QDir>
 +#include <QFileInfo>
 +#include <QFile>
@@ -2018,6 +2216,7 @@
 +    , conversation(this)
 +    , currentStatus(QStringLiteral("Ready"))
 +{
++    attachmentPool.setMaxThreadCount(1);
 +    showWelcome();
 +}
 +
@@ -2171,19 +2370,196 @@
 +void SidebarController::submit(const QString& prompt)
 +{
 +    const QString text = prompt.trimmed();
-+    if (text.isEmpty() || turnBusy) {
++    if ((text.isEmpty() && currentAttachments.isEmpty()) || turnBusy || processingAttachments()) {
 +        return;
 +    }
 +
 +    clearInteraction();
-+    if (!currentDraft.isEmpty()) {
-+        currentDraft.clear();
-+        Q_EMIT draftChanged();
-+        Q_EMIT draftEdited(currentDraft);
-+    }
++    setPicking(false);
 +    setBusy(true);
 +    setStatus(QStringLiteral("Starting agent"));
 +    Q_EMIT promptSubmitted(text);
++}
++
++void SidebarController::acceptSubmission()
++{
++    currentAttachments.clear();
++    currentDraft.clear();
++    Q_EMIT attachmentsChanged();
++    Q_EMIT draftChanged();
++    Q_EMIT draftEdited(currentDraft);
++}
++
++void SidebarController::loadAttachments(const QVariantList& attachments)
++{
++    ++composerGeneration;
++    currentAttachments = attachments;
++    Q_EMIT attachmentsChanged();
++}
++
++void SidebarController::addAttachment(const QVariantMap& attachment)
++{
++    if (currentAttachments.size() >= 8) {
++        appendActivity(tr("At most 8 attachments per message. Remove one first."));
++        return;
++    }
++    qsizetype size = attachment.value("dataUrl").toString().size();
++    for (const auto& item : currentAttachments) {
++        size += item.toMap().value("dataUrl").toString().size();
++    }
++    if (size > 24 * 1024 * 1024) {
++        appendActivity(tr("Images exceed the 24 MiB message limit."));
++        return;
++    }
++    currentAttachments.append(attachment);
++    Q_EMIT attachmentsChanged();
++    Q_EMIT draftEdited(currentDraft);
++    if (attachment.value("type").toString() == QLatin1String("cad")) {
++        setDraft(currentDraft + QStringLiteral(" @[%1] ").arg(attachment.value("name").toString()));
++        Q_EMIT draftChanged();
++    }
++}
++
++void SidebarController::removeAttachment(int index)
++{
++    if (index < 0 || index >= currentAttachments.size() || turnBusy) return;
++    const auto removed = currentAttachments.takeAt(index).toMap();
++    if (removed.value("type").toString() == QLatin1String("cad")) {
++        setDraft(currentDraft.replace(QStringLiteral("@[%1]").arg(removed.value("name").toString()), QString()));
++        Q_EMIT draftChanged();
++    }
++    Q_EMIT attachmentsChanged();
++    Q_EMIT draftEdited(currentDraft);
++}
++
++namespace {
++QVariantMap imageAttachment(QImage image, const QString& name)
++{
++    if (image.isNull()) return {};
++    if (image.width() > 2048 || image.height() > 2048) {
++        image = image.scaled(2048, 2048, Qt::KeepAspectRatio, Qt::SmoothTransformation);
++    }
++    QByteArray bytes;
++    QBuffer buffer(&bytes);
++    buffer.open(QIODevice::WriteOnly);
++    if (!image.save(&buffer, "PNG")) return {};
++    return {{"type", "image"}, {"name", name},
++            {"dataUrl", QStringLiteral("data:image/png;base64,") + QString::fromLatin1(bytes.toBase64())}};
++}
++}
++
++bool SidebarController::pasteAttachments()
++{
++    if (turnBusy) return false;
++    const auto* mime = QApplication::clipboard()->mimeData();
++    if (mime->hasImage()) {
++        const auto image = QApplication::clipboard()->image();
++        prepareAttachment([image]() { return imageAttachment(image, tr("Pasted image.png")); });
++        return true;
++    }
++    if (mime->hasUrls()) {
++        bool local = false;
++        for (const auto& url : mime->urls()) {
++            if (url.isLocalFile()) { attachFile(url.toLocalFile()); local = true; }
++        }
++        return local;
++    }
++    return false; // Let Qt handle ordinary text paste.
++}
++
++void SidebarController::attachFiles()
++{
++    if (turnBusy) return;
++    for (const auto& path : QFileDialog::getOpenFileNames(QApplication::activeWindow(), tr("Attach images or files"))) {
++        attachFile(path);
++    }
++}
++
++void SidebarController::attachFile(const QString& path)
++{
++    prepareAttachment([path]() -> QVariantMap {
++    QFile file(path);
++    const QFileInfo info(file);
++    if (!info.isFile() || info.size() > 8 * 1024 * 1024 || !file.open(QIODevice::ReadOnly)) {
++        return {{"error", tr("Cannot attach %1: choose a readable file up to 8 MiB.").arg(info.fileName())}};
++    }
++    QImageReader reader(path);
++    if (reader.canRead()) {
++        reader.setAutoTransform(true);
++        if (!reader.size().isValid() || qint64(reader.size().width()) * reader.size().height() > 64 * 1024 * 1024) {
++            return {{"error", tr("Image dimensions are too large or invalid.")}};
++        }
++        reader.setScaledSize(reader.size().scaled(2048, 2048, Qt::KeepAspectRatio));
++        const auto attachment = imageAttachment(reader.read(), info.fileName());
++        return attachment;
++    }
++    // Snapshot native file-dialog input so later edits to the original cannot change a sent attachment.
++    const QString root = qEnvironmentVariable("XDG_STATE_HOME", QDir::homePath() + QStringLiteral("/.local/state"));
++    const QString directory = QDir(root).filePath(QStringLiteral("anthracite/attachments/") + QUuid::createUuid().toString(QUuid::WithoutBraces));
++    if (!QDir().mkpath(directory)) return {{"error", tr("Cannot create attachment directory.")}};
++    const QString destination = QDir(directory).filePath(info.fileName());
++    QSaveFile saved(destination);
++    const auto bytes = file.read(8 * 1024 * 1024 + 1);
++    if (bytes.size() > 8 * 1024 * 1024 || !saved.open(QIODevice::WriteOnly)
++        || saved.write(bytes) != bytes.size() || !saved.commit()) {
++        return {{"error", tr("Cannot save attachment.")}};
++    }
++    return {{"type", "file"}, {"name", info.fileName()}, {"path", destination}};
++    });
++}
++
++void SidebarController::prepareAttachment(std::function<QVariantMap()> read)
++{
++    if (turnBusy) return;
++    setPicking(false);
++    if (currentAttachments.size() + pendingAttachments >= 8) {
++        appendActivity(tr("At most 8 attachments per message."));
++        return;
++    }
++    ++pendingAttachments;
++    Q_EMIT attachmentsChanged();
++    const auto generation = composerGeneration;
++    auto* watcher = new QFutureWatcher<QVariantMap>(this);
++    connect(watcher, &QFutureWatcher<QVariantMap>::finished, this, [this, watcher, generation]() {
++        --pendingAttachments;
++        const auto result = watcher->result();
++        watcher->deleteLater();
++        if (generation != composerGeneration) {
++            appendActivity(tr("Document changed while reading an attachment. Attach it again in the intended document."));
++        } else if (result.isEmpty() || result.contains("error")) {
++            appendActivity(result.value("error", tr("Could not decode image.")).toString());
++        } else {
++            addAttachment(result);
++        }
++        Q_EMIT attachmentsChanged();
++    });
++    watcher->setFuture(QtConcurrent::run(&attachmentPool, std::move(read)));
++}
++
++void SidebarController::togglePicker() { if (!turnBusy && !processingAttachments()) setPicking(!pickActive); }
++
++void SidebarController::setPicking(bool active)
++{
++    if (pickActive == active) return;
++    pickActive = active;
++    if (active) {
++        QApplication::setOverrideCursor(Qt::CrossCursor);
++        qApp->installEventFilter(this);
++    } else {
++        qApp->removeEventFilter(this);
++        QApplication::restoreOverrideCursor();
++    }
++    Q_EMIT pickingChanged();
++}
++
++bool SidebarController::eventFilter(QObject* watched, QEvent* event)
++{
++    if (pickActive && ((event->type() == QEvent::KeyPress && static_cast<QKeyEvent*>(event)->key() == Qt::Key_Escape)
++        || (event->type() == QEvent::MouseButtonPress && static_cast<QMouseEvent*>(event)->button() == Qt::RightButton))) {
++        setPicking(false);
++        return true;
++    }
++    return QObject::eventFilter(watched, event);
 +}
 +
 +void SidebarController::stop()
@@ -2201,7 +2577,7 @@
 +
 +void SidebarController::selectProvider(const QString& provider)
 +{
-+    if (turnBusy || (provider != QLatin1String("codex") && provider != QLatin1String("opencode"))
++    if (turnBusy || processingAttachments() || (provider != QLatin1String("codex") && provider != QLatin1String("opencode"))
 +        || provider == currentProvider) {
 +        return;
 +    }
@@ -2212,14 +2588,14 @@
 +
 +void SidebarController::newThread()
 +{
-+    if (!turnBusy) {
++    if (!turnBusy && !processingAttachments()) {
 +        Q_EMIT newThreadRequested();
 +    }
 +}
 +
 +void SidebarController::selectThread(const QString& threadId)
 +{
-+    if (!turnBusy && !threadId.isEmpty() && threadId != activeThreadId) {
++    if (!turnBusy && !processingAttachments() && !threadId.isEmpty() && threadId != activeThreadId) {
 +        Q_EMIT threadSelected(threadId);
 +    }
 +}
@@ -2453,6 +2829,8 @@
 +
 +void SidebarController::documentContextChanged()
 +{
++    setPicking(false);
++    loadAttachments({});
 +    clearInteraction();
 +    setBusy(false);
 +    resetHistory();
@@ -2668,7 +3046,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,209 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_SIDEBAR_H
@@ -2679,6 +3057,8 @@
 +#include <QVariantList>
 +#include <QVariantMap>
 +#include <QWidget>
++#include <functional>
++#include <QThreadPool>
 +
 +#include "ConversationModel.h"
 +
@@ -2704,6 +3084,9 @@
 +    Q_PROPERTY(QVariantList threads READ threads NOTIFY threadsChanged)
 +    Q_PROPERTY(QString currentThreadId READ currentThreadId NOTIFY threadsChanged)
 +    Q_PROPERTY(QString draft READ draft NOTIFY draftChanged)
++    Q_PROPERTY(QVariantList attachments READ attachments NOTIFY attachmentsChanged)
++    Q_PROPERTY(bool picking READ picking NOTIFY pickingChanged)
++    Q_PROPERTY(bool processingAttachments READ processingAttachments NOTIFY attachmentsChanged)
 +    Q_PROPERTY(QVariantList models READ models NOTIFY modelsChanged)
 +    Q_PROPERTY(QString selectedModel READ selectedModel NOTIFY modelsChanged)
 +    Q_PROPERTY(QVariantList reasoningEfforts READ reasoningEfforts NOTIFY modelsChanged)
@@ -2732,6 +3115,18 @@
 +    QVariantList threads() const;
 +    QString currentThreadId() const;
 +    QString draft() const;
++    QVariantList attachments() const { return currentAttachments; }
++    bool picking() const { return pickActive; }
++    bool processingAttachments() const { return pendingAttachments > 0; }
++    Q_INVOKABLE bool pasteAttachments();
++    Q_INVOKABLE void attachFiles();
++    Q_INVOKABLE void attachFile(const QString& path);
++    Q_INVOKABLE void removeAttachment(int index);
++    Q_INVOKABLE void togglePicker();
++    void setPicking(bool active);
++    void addAttachment(const QVariantMap& attachment);
++    void loadAttachments(const QVariantList& attachments);
++    void acceptSubmission();
 +    QVariantList models() const;
 +    QString selectedModel() const;
 +    QVariantList reasoningEfforts() const;
@@ -2798,11 +3193,15 @@
 +    void interactionChanged();
 +    void threadsChanged();
 +    void draftChanged();
++    void attachmentsChanged();
++    void pickingChanged();
 +    void modelsChanged();
 +    void usageChanged();
 +    void providerChanged();
 +
 +private:
++    bool eventFilter(QObject* watched, QEvent* event) override;
++    void prepareAttachment(std::function<QVariantMap()> read);
 +    void setStatus(QString status);
 +    void setBusy(bool busy);
 +    void applyModelSelection(const QString& model, const QString& effort, bool edited);
@@ -2818,6 +3217,11 @@
 +    QVariantList availableThreads;
 +    QString activeThreadId;
 +    QString currentDraft;
++    QVariantList currentAttachments;
++    bool pickActive = false;
++    int pendingAttachments = 0;
++    unsigned composerGeneration = 0;
++    QThreadPool attachmentPool;
 +    QVariantList availableModels;
 +    QVariantList availableEfforts;
 +    QString currentModel;
@@ -2854,11 +3258,13 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,275 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
 +import base64
++import json
++import time
 +from unittest.mock import patch
 +from pathlib import Path
 +import tempfile
@@ -2866,7 +3272,7 @@
 +import FreeCAD as App
 +import FreeCADGui as Gui
 +from PySide import QtCore, QtWidgets
-+from PySide6 import QtQuickWidgets, QtGui
++from PySide6 import QtQuickWidgets, QtGui, QtTest
 +
 +import AnthraciteExecutor
 +import AnthraciteGui  # noqa: F401 - importing registers the dock window
@@ -2947,6 +3353,65 @@
 +    if render_result["observation"]["render"]["width"] != 256:
 +        raise AssertionError("Viewport observation metadata is incomplete.")
 +    view = Gui.activeDocument().activeView()
++    Gui.updateGui()
++    root = quick_widget.rootObject()
++    assert root.findChild(QtCore.QObject, "AnthraciteAttachFiles") is not None
++    assert root.findChild(QtCore.QObject, "AnthraciteGeometryPicker") is not None
++    clipboard = QtWidgets.QApplication.clipboard()
++    def await_attachments():
++        deadline = time.monotonic() + 10
++        while controller.property('processingAttachments') and time.monotonic() < deadline:
++            QtWidgets.QApplication.processEvents()
++        assert not controller.property('processingAttachments')
++    previous_clipboard = QtCore.QMimeData()
++    for format_name in clipboard.mimeData().formats():
++        previous_clipboard.setData(format_name, clipboard.mimeData().data(format_name))
++    try:
++        image = QtGui.QImage(32, 24, QtGui.QImage.Format_RGB32)
++        image.fill(QtGui.QColor("red"))
++        clipboard.setImage(image)
++        assert controller.pasteAttachments()
++        await_attachments()
++        attached = controller.property("attachments")
++        assert attached[0]['type'] == 'image'
++        assert attached[0]['dataUrl'].startswith('data:image/png;base64,')
++        controller.removeAttachment(0)
++        composer = root.findChild(QtCore.QObject, 'AnthraciteComposer')
++        composer.forceActiveFocus()
++        QtTest.QTest.keySequence(quick_widget, QtGui.QKeySequence(QtGui.QKeySequence.Paste))
++        await_attachments()
++        assert len(controller.property('attachments')) == 1, 'Native paste shortcut did not attach the image'
++        controller.removeAttachment(0)
++        clipboard.setText("ordinary text")
++        assert not controller.pasteAttachments(), "Text paste must stay native"
++    finally:
++        clipboard.setMimeData(previous_clipboard)
++    with tempfile.TemporaryDirectory() as directory:
++        source = Path(directory) / 'reference.txt'
++        source.write_text('Original reference')
++        controller.attachFile(str(source))
++        await_attachments()
++        attached = controller.property('attachments')
++        source.write_text('Changed after attachment')
++        assert Path(attached[0]['path']).read_text() == 'Original reference'
++        controller.removeAttachment(0)
++    for subelement in ('Face1', 'Edge1', 'Vertex1', ''):
++        Gui.Selection.clearSelection()
++        controller.togglePicker()
++        assert controller.property('picking')
++        Gui.Selection.addSelection(render_document.Name, 'RenderBox', subelement, 1.0, 2.0, 3.0)
++        assert not controller.property('picking')
++        picked = controller.property('attachments')[0]
++        assert picked['reference']['subelement'] == subelement
++        assert picked['reference']['object'] == 'RenderBox'
++        assert picked['name'] in controller.property('draft')
++        assert AnthraciteExecutor.validate_picks_json(json.dumps([picked])) == 'ok'
++        controller.removeAttachment(0)
++    controller.togglePicker()
++    QtWidgets.QApplication.sendEvent(main_window, QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_Escape, QtCore.Qt.NoModifier))
++    assert not controller.property('picking')
++    picked = json.loads(AnthraciteExecutor.picked_reference_json(render_document.Name, 'RenderBox', 'Face1', 0, 0, 0))
++    controller.setDraft('')
 +    camera = view.getCamera()
 +    multi = AnthraciteExecutor.execute("cad.render_views(width=256, height=192)")
 +    assert multi["ok"], multi
@@ -2980,6 +3445,11 @@
 +    render_document.openTransaction('User rename')
 +    render_document.getObject('RenderBox').Label = 'User renamed box'
 +    render_document.commitTransaction()
++    try:
++        AnthraciteExecutor.validate_picks_json(json.dumps([picked]))
++        raise AssertionError('Stale picker reference accepted')
++    except ValueError as error:
++        assert 'Stale' in str(error)
 +    stale = AnthraciteExecutor.execute(
 +        f"cad.render(view='front', width=640, height=480, references=[{reference!r}])"
 +    )
@@ -3021,6 +3491,17 @@
 +    import AnthraciteInspect
 +    parametric = AnthraciteExecutor.execute(AnthraciteInspect.guide("partdesign")["code"])
 +    assert parametric["ok"], parametric
++    Gui.Selection.clearSelection()
++    controller.togglePicker()
++    Gui.Selection.addSelection(render_document.Name, 'Body', 'BasePad.Face1')
++    assert not controller.property('picking')
++    picked_pad = controller.property('attachments')[0]
++    assert picked_pad['reference']['object'] == 'BasePad', picked_pad
++    assert picked_pad['reference']['subelement'] == 'Face1', picked_pad
++    assert AnthraciteExecutor.validate_picks_json(json.dumps([picked_pad])) == 'ok'
++    controller.removeAttachment(0)
++    controller.setDraft('')
++    Gui.Selection.clearSelection()
 +    diagram = AnthraciteExecutor.execute("cad.render_sketch('BaseSketch')")
 +    assert diagram["ok"], diagram
 +    assert diagram["observation"]["renders"][0]["view"] == "sketch-local-XY"

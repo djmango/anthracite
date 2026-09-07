@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
-@@ -0,0 +1,992 @@
+@@ -0,0 +1,996 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
@@ -715,18 +715,20 @@
 +    fn emitter(&self) -> &Emitter {
 +        &self.emitter
 +    }
-+    fn start_turn(&mut self, prompt: &str, model: &str, effort: &str) -> Result<(), String> {
++    fn start_turn(
++        &mut self,
++        prompt: &str,
++        model: &str,
++        effort: &str,
++        attachments: &Value,
++    ) -> Result<(), String> {
 +        let thread_id = self
 +            .thread_id
 +            .clone()
 +            .ok_or_else(|| "Codex thread is not ready.".to_string())?;
 +        let mut params = json!({
 +            "threadId": thread_id,
-+            "input": [{
-+                "type": "text",
-+                "text": prompt,
-+                "textElements": []
-+            }]
++            "input": crate::composer::parts(prompt, attachments, "codex")?
 +        });
 +        if let Some(params) = params.as_object_mut() {
 +            if !model.is_empty() {
@@ -737,8 +739,10 @@
 +            }
 +        }
 +        self.request("turn/start", params)?;
-+        self.emitter
-+            .record("content.user", &json!({"text": prompt}));
++        self.emitter.record(
++            "content.user",
++            &json!({"text": prompt, "attachments": attachments}),
++        );
 +        self.emitter
 +            .emit("session.state", json!({"state": "running"}));
 +        Ok(())
@@ -995,7 +999,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,65 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +mod codex;
@@ -1008,7 +1012,13 @@
 +
 +pub trait ProviderAdapter {
 +    fn emitter(&self) -> &crate::protocol::Emitter;
-+    fn start_turn(&mut self, prompt: &str, model: &str, effort: &str) -> Result<(), String>;
++    fn start_turn(
++        &mut self,
++        prompt: &str,
++        model: &str,
++        effort: &str,
++        attachments: &Value,
++    ) -> Result<(), String>;
 +    fn return_tool_result(
 +        &mut self,
 +        request_id: Value,
@@ -1057,7 +1067,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/opencode.rs
-@@ -0,0 +1,892 @@
+@@ -0,0 +1,900 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
@@ -1376,13 +1386,19 @@
 +    fn emitter(&self) -> &Emitter {
 +        &self.emitter
 +    }
-+    fn start_turn(&mut self, prompt: &str, model: &str, effort: &str) -> Result<(), String> {
++    fn start_turn(
++        &mut self,
++        prompt: &str,
++        model: &str,
++        effort: &str,
++        attachments: &Value,
++    ) -> Result<(), String> {
 +        if self.active_turn {
 +            return Err("OpenCode is already running a turn.".to_string());
 +        }
 +        let mut body = json!({
 +            "system": Self::developer_instructions(),
-+            "parts": [{"type": "text", "text": prompt}]
++            "parts": crate::composer::parts(prompt, attachments, "opencode")?
 +        });
 +        if !model.is_empty() {
 +            let (provider_id, model_id) = model
@@ -1400,8 +1416,10 @@
 +            &self.server_password,
 +        )?;
 +        self.active_turn = true;
-+        self.emitter
-+            .record("content.user", &json!({"text": prompt}));
++        self.emitter.record(
++            "content.user",
++            &json!({"text": prompt, "attachments": attachments}),
++        );
 +        self.emitter.emit(
 +            "turn.started",
 +            json!({"turnId": self.session_id, "provider": "opencode"}),

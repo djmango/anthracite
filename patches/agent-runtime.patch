@@ -1002,9 +1002,10 @@
 +tempfile = "3"
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/main.rs
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,229 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
++mod composer;
 +mod process;
 +mod protocol;
 +mod providers;
@@ -1074,6 +1075,7 @@
 +                    payload.get("prompt").and_then(Value::as_str).unwrap_or(""),
 +                    payload.get("model").and_then(Value::as_str).unwrap_or(""),
 +                    payload.get("effort").and_then(Value::as_str).unwrap_or(""),
++                    &payload["attachments"],
 +                )
 +            }),
 +        "tool.prepare" => provider
@@ -1131,7 +1133,7 @@
 +            .ok_or_else(|| "Provider is not running.".to_string())
 +            .map(|provider| {
 +                provider.save_draft(
-+                    payload.get("body").and_then(Value::as_str).unwrap_or(""),
++                    &composer::draft(payload),
 +                    payload.get("saveId").unwrap_or(&Value::Null),
 +                );
 +            }),
@@ -1679,7 +1681,7 @@
 +            Err(error) => emit_warning(format!("Could not load conversation history: {error}")),
 +        }
 +        match emitter.store.draft() {
-+            Ok(body) => emit_raw("draft.loaded", json!({"body": body})),
++            Ok(body) => emit_raw("draft.loaded", crate::composer::load_draft(&body)),
 +            Err(error) => emit_warning(format!("Could not load composer draft: {error}")),
 +        }
 +        match emitter.store.model_selection() {
@@ -3512,7 +3514,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/timeline.rs
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,356 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +//! Provider-independent conversation projection. Qt only applies these row edits.
@@ -3608,6 +3610,21 @@
 +                    self.finish(timestamp, false, &mut edits);
 +                }
 +                self.append("You", text(payload, "text"), "user", &mut edits);
++                if let Some(attachments) = payload["attachments"].as_array() {
++                    for attachment in attachments {
++                        let image = attachment["type"] == "image";
++                        self.append(
++                            &text(attachment, "name"),
++                            if image {
++                                text(attachment, "dataUrl")
++                            } else {
++                                text(attachment, "name")
++                            },
++                            if image { "image" } else { "user" },
++                            &mut edits,
++                        );
++                    }
++                }
 +                self.run = Some((self.rows.len(), timestamp));
 +            }
 +            "content.delta" => {
@@ -3852,5 +3869,111 @@
 +            &json!({"streamKind":"reasoning_text", "messageId":"r", "text":" two"}),
 +        );
 +        assert_eq!(timeline.rows.last().unwrap()["body"], "One two");
++    }
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/composer.rs
+@@ -0,0 +1,103 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++//! Shared composer contract. Providers receive native image parts, not image descriptions.
++use serde_json::{Value, json};
++
++pub fn draft(payload: &Value) -> String {
++    let body = payload["body"].as_str().unwrap_or_default();
++    if body.is_empty() && payload["attachments"].as_array().is_none_or(Vec::is_empty) {
++        return String::new();
++    }
++    json!({"anthraciteDraft": 1, "body": body, "attachments": payload["attachments"]}).to_string()
++}
++
++pub fn load_draft(body: &str) -> Value {
++    match serde_json::from_str::<Value>(body) {
++        Ok(value) if value["anthraciteDraft"] == 1 => value,
++        _ => json!({"body": body, "attachments": []}),
++    }
++}
++
++pub fn parts(prompt: &str, attachments: &Value, provider: &str) -> Result<Vec<Value>, String> {
++    let empty = Vec::new();
++    let attachments = attachments.as_array().unwrap_or(&empty);
++    if attachments.len() > 8 {
++        return Err("At most 8 attachments per message.".into());
++    }
++    if prompt.trim().is_empty() && attachments.is_empty() {
++        return Err("Enter a message or attach an image/file.".into());
++    }
++    let mut text = prompt.to_owned();
++    let mut images = Vec::new();
++    let mut total = 0;
++    for attachment in attachments {
++        match attachment["type"].as_str() {
++            Some("image") => {
++                let url = attachment["dataUrl"].as_str().unwrap_or_default();
++                total += url.len();
++                if !url.starts_with("data:image/png;base64,") || total > 24 * 1024 * 1024 {
++                    return Err("Image attachments must be PNG and total at most 24 MiB encoded.".into());
++                }
++                images.push(if provider == "codex" {
++                    json!({"type": "image", "url": url})
++                } else {
++                    json!({"type": "file", "mime": "image/png", "filename": attachment["name"], "url": url})
++                });
++            }
++            Some("file") => {
++                let path = attachment["path"].as_str().unwrap_or_default();
++                if !std::path::Path::new(path).is_absolute() || !std::path::Path::new(path).is_file() {
++                    return Err("An attached file is missing. Remove it and attach it again.".into());
++                }
++                text.push_str(&format!("\nAttached file (use your normal file tools; not automatically imported into CAD): {}\n",
++                    json!({"name": attachment["name"], "path": path})));
++            }
++            Some("cad") => text.push_str(&format!(
++                "\nUser-picked CAD geometry: {attachment}\nUse cad.resolve_ref(reference) before editing. The point is a picked location in mm, not a topology identity. References expire after any document change; never guess a replacement.\n")),
++            _ => return Err("Unsupported attachment type.".into()),
++        }
++    }
++    let mut parts = Vec::new();
++    if !text.is_empty() {
++        parts.push(json!({"type": "text", "text": text}));
++    }
++    parts.extend(images);
++    Ok(parts)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn native_images_and_picks_survive_drafts_without_becoming_text_only() {
++        let input = json!({"body": "thin this wall", "attachments": [
++            {"type":"image", "name":"Paste.png", "dataUrl":"data:image/png;base64,aGVsbG8="},
++            {"type":"cad", "name":"Wall · Face3", "reference":{"revision":7}}
++        ]});
++        let restored = load_draft(&draft(&input));
++        assert_eq!(restored["attachments"], input["attachments"]);
++        let codex = parts("thin this wall", &restored["attachments"], "codex").unwrap();
++        assert_eq!(codex[1]["type"], "image");
++        assert_eq!(codex[1]["url"], input["attachments"][0]["dataUrl"]);
++        assert!(codex[0]["text"].as_str().unwrap().contains("never guess"));
++        let open = parts("", &json!([input["attachments"][0]]), "opencode").unwrap();
++        assert_eq!(open[0]["type"], "file");
++        assert_eq!(open[0]["mime"], "image/png");
++        assert!(parts("", &json!([]), "codex").is_err());
++        assert!(
++            parts(
++                "x",
++                &json!([{"type":"file", "path":"/missing/file"}]),
++                "codex"
++            )
++            .is_err()
++        );
++        assert_eq!(load_draft("ordinary draft")["body"], "ordinary draft");
++        let lookalike = r#"{"anthraciteDraft":1,"body":"do not substitute this"}"#;
++        assert_eq!(
++            load_draft(&draft(&json!({"body": lookalike})))["body"],
++            lookalike
++        );
 +    }
 +}

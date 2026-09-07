@@ -23,6 +23,9 @@ def provider_fixture():
         elif method in ("thread/start", "thread/resume"):
             send({"id": request, "result": {"thread": {"id": "smoke-thread"}}})
         elif method == "turn/start":
+            inputs = message['params']['input']
+            assert inputs[0]['type'] == 'text' and 'Attached file' in inputs[0]['text'], inputs
+            assert inputs[1]['type'] == 'image' and inputs[1]['url'].startswith('data:image/png;base64,'), inputs
             send({"id": request, "result": {"turn": {"id": "smoke-turn"}}})
             send({"id": 9001, "method": "item/tool/call", "params": {
                 "tool": "freecad", "arguments": {"code":
@@ -77,7 +80,7 @@ try:
         raise RuntimeError("Run this test through just test with an isolated profile")
     import FreeCAD as App
     import FreeCADGui as Gui
-    from PySide6 import QtCore, QtWidgets, QtQuickWidgets
+    from PySide6 import QtCore, QtWidgets, QtQuickWidgets, QtGui
 
     fixture_directory = tempfile.TemporaryDirectory(prefix="anthracite-provider-smoke-")
     python = Path(os.environ.get("ANTHRACITE_PYTHON", str(Path(sys.prefix) / "bin/python3")))
@@ -99,11 +102,36 @@ try:
     replay_phase = "live"
     saved_thread = ""
     saved_work = None
+    saved_attachments = None
     journal = Path(os.environ["XDG_STATE_HOME"]) / "anthracite/anthracite.events.jsonl"
 
     def check_result():
-        global submitted, expanded, replay_phase, saved_thread, saved_work
+        global submitted, expanded, replay_phase, saved_thread, saved_work, saved_attachments
         try:
+            if replay_phase == 'attaching':
+                if not controller.property('processingAttachments'):
+                    saved_attachments = controller.property('attachments')
+                    assert len(saved_attachments) == 2, saved_attachments
+                    controller.setDraft('Run the deterministic native bridge test')
+                    saved_thread = controller.property('currentThreadId')
+                    replay_phase = 'draft-new'
+                    controller.newThread()
+                return
+            if replay_phase == 'draft-new':
+                if controller.property('status') == 'Ready' and controller.property('currentThreadId') != saved_thread:
+                    assert not controller.property('attachments')
+                    controller.selectThread(saved_thread)
+                    replay_phase = 'draft-back'
+                return
+            if replay_phase == 'draft-back':
+                if controller.property('status') == 'Ready' and controller.property('currentThreadId') == saved_thread:
+                    assert controller.property('attachments') == saved_attachments
+                    assert controller.property('draft') == 'Run the deterministic native bridge test'
+                    assert dock.grab().save(str(Path(__file__).resolve().parent.parent / 'build/test-results/composer.png'))
+                    controller.submit(controller.property('draft'))
+                    submitted = True
+                    replay_phase = 'live'
+                return
             if replay_phase == "new":
                 if controller.property("currentThreadId") != saved_thread and controller.property("status") == "Ready":
                     controller.selectThread(saved_thread)
@@ -111,8 +139,15 @@ try:
                 return
             if not submitted:
                 if controller.property("status") == "Ready" and controller.property("currentThreadId"):
-                    controller.submit("Run the deterministic native bridge test")
-                    submitted = True
+                    image_path = Path(fixture_directory.name) / 'input.png'
+                    image = QtGui.QImage(48, 32, QtGui.QImage.Format_RGB32)
+                    image.fill(QtGui.QColor('blue'))
+                    assert image.save(str(image_path))
+                    file_path = Path(fixture_directory.name) / 'instructions.txt'
+                    file_path.write_text('Build an editable box')
+                    controller.attachFile(str(image_path))
+                    controller.attachFile(str(file_path))
+                    replay_phase = 'attaching'
                 return
             if not journal.exists():
                 return
@@ -132,6 +167,9 @@ try:
             if not work:
                 return
             assert len(work) == 1, rows
+            assert not controller.property('attachments'), 'Sent attachments were not cleared'
+            user_images = [row['body'] for row in rows if row['kind'] == 'image']
+            assert user_images == [saved_attachments[0]['dataUrl']], 'Input images lost in live/replayed timeline'
             assert work[0]['body'] == 'Created the editable box.', work
             assert work[0]['author'].startswith('Worked for ') and work[0]['author'].endswith('s'), work
             entries = work[0]['entries']
@@ -156,7 +194,7 @@ try:
                 return
             rendered = [item for item in items if item.objectName() == 'workImage'
                         and item.property('source').toString()]
-            assert len(rendered) == 4
+            assert len(rendered) == 4, [(item.property('source').toString()[:40], item.property('visible')) for item in rendered]
             assert [item.property('source').toString() for item in rendered] == images
             assert all(item.property('height') > 0 for item in rendered)
             if replay_phase == "live":
