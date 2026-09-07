@@ -2200,10 +2200,6 @@
 +                Connections {
 +                    target: anthraciteController
 +
-+                    function onPickingChanged() {
-+                        if (!anthraciteController.picking) composer.forceActiveFocus()
-+                    }
-+
 +                    function onComposerCursorRequested(position) {
 +                        composer.cursorPosition = position
 +                    }
@@ -2379,6 +2375,10 @@
 +        }
 +    }
 +
++    function focusComposer() {
++        if (composer.enabled) composer.forceActiveFocus()
++    }
++
 +    function send() {
 +        const text = anthraciteController.draft.trim()
 +        if ((text.length === 0 && anthraciteController.attachments.length === 0) || anthraciteController.busy) {
@@ -2390,7 +2390,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,941 @@
+@@ -0,0 +1,951 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "Sidebar.h"
@@ -2421,6 +2421,7 @@
 +#include <QQmlError>
 +#include <QQmlContext>
 +#include <QQuickWidget>
++#include <QQuickItem>
 +#include <QUrl>
 +#include <QVBoxLayout>
 +
@@ -3236,6 +3237,15 @@
 +    auto* layout = new QVBoxLayout(this);
 +    layout->setContentsMargins(0, 0, 0, 0);
 +    reloadUi();
++    connect(&sidebarController, &SidebarController::pickingChanged, this, [this]() {
++        if (sidebarController.picking() || !quickView || !quickView->isVisible()) return;
++        // Selection is emitted inside the viewport's mouse handler. Wait for it
++        // to finish, then transfer native keyboard focus as well as QML focus.
++        quickView->window()->activateWindow();
++        quickView->setFocus(Qt::OtherFocusReason);
++        if (auto* root = quickView->rootObject())
++            QMetaObject::invokeMethod(root, "focusComposer");
++    }, Qt::QueuedConnection);
 +}
 +
 +void Sidebar::reloadUi()
@@ -3568,7 +3578,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,380 @@
+@@ -0,0 +1,395 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -3772,11 +3782,20 @@
 +        assert Path(attached[0]['path']).read_text() == 'Original reference'
 +        controller.removeAttachment(0)
 +    for subelement in ('Face1', 'Edge1', 'Vertex1', ''):
++        dock.show()
++        main_window.activateWindow()
++        QtWidgets.QApplication.setActiveWindow(main_window)
 +        controller.setDraft('')
 +        Gui.Selection.clearSelection()
 +        controller.togglePicker()
 +        assert controller.property('picking')
++        # The viewport, not the QML widget, owns keyboard focus when picking.
++        viewport = main_window.findChild(QtWidgets.QMdiArea).activeSubWindow().widget()
++        viewport.setFocus(QtCore.Qt.MouseFocusReason)
 +        Gui.Selection.addSelection(render_document.Name, 'RenderBox', subelement, 1.0, 2.0, 3.0)
++        # Model the mouse handler finishing after it emitted SelectionChanged.
++        viewport.setFocus(QtCore.Qt.MouseFocusReason)
++        QtTest.QTest.qWait(50)
 +        assert not controller.property('picking')
 +        picked = controller.property('attachments')[0]
 +        assert picked['reference']['subelement'] == subelement
@@ -3786,7 +3805,13 @@
 +        composer = root.findChild(QtCore.QObject, 'AnthraciteComposer')
 +        assert composer.property('length') == 1, 'A CAD token must occupy exactly one editor character'
 +        assert not root.findChild(QtCore.QObject, 'AnthraciteAttachmentTray').property('visible'), 'CAD token duplicated in tray'
-+        composer.forceActiveFocus()
++        assert quick_widget.hasFocus(), ('Picking did not return native keyboard focus to the sidebar',
++                                        quick_widget.isVisible(), QtWidgets.QApplication.focusWidget())
++        assert composer.property('activeFocus'), 'Picking did not focus the composer'
++        QtTest.QTest.keyClicks(QtWidgets.QApplication.focusWidget(), ' thinner')
++        assert controller.property('draft').endswith(' thinner'), 'Typing after picking missed the composer'
++        # Reset the typing undo group before checking atomic token deletion/undo.
++        controller.setDraft(controller.property('draft').removesuffix(' thinner'))
 +        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Backspace)
 +        assert not controller.property('attachments'), 'Backspace left a hidden model reference'
 +        assert controller.property('draft') == ''
