@@ -134,11 +134,13 @@ just test
   must be identifiable and reloadable; native/executor changes still require checks.
 - Use Rust whenever the work is naturally self-contained and doing so does not
   make the FreeCAD patch stack harder to maintain.
-- Rust should own provider processes and protocol normalization, session/event
-  state, Turso persistence, durable activity records, and non-GUI background
-  work.
-- C++/Qt should own FreeCAD registration, QObject/QML integration, docking,
-  GUI-thread scheduling, and narrow bridges to FreeCAD `App` and `Gui`.
+- QML owns UI presentation and interaction, using native docking, restoration,
+  and theming. Rust owns providers, protocols, process control, persistence,
+  and conversation/run state (including grouping, timing, and replay).
+- Keep the Qt bridge thin: expose Rust state/actions to QML, not a parallel C++
+  application. C++ is for FreeCAD registration, docking/restoration hooks,
+  GUI-thread scheduling, and narrow `App`/`Gui` integration. Use Qt bridges or
+  `qmetaobject` where appropriate; do not add bindings merely to replace working glue.
 - Python remains the model-facing FreeCAD API. Do not create a large Rust
   binding layer where a direct FreeCAD Python call is clearer.
 - Keep the Rust/native boundary narrow and stable.

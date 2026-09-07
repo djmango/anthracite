@@ -188,10 +188,11 @@ Anthracite changes are explicit GNU Quilt patches under `patches/`, applied in t
 <details>
 <summary><strong>architecture</strong></summary>
 
-- QML and Qt Quick own the native sidebar experience.
-- Rust owns self-contained provider, protocol, session, event, persistence and background work when
-  that keeps the FreeCAD patch stack simple.
-- C++/Qt owns FreeCAD registration, docking, GUI-thread scheduling and narrow native bridges.
+- QML owns the UI, with native docking, restoration and theming.
+- Rust owns providers, protocols, process control, persistence and conversation/run state.
+  One reducer produces the live and replayed timeline, including grouping and timing.
+- A thin Qt bridge exposes Rust state/actions to QML. C++ is limited to FreeCAD registration,
+  docking/restoration hooks, GUI-thread scheduling and native integration—not application logic.
 - Python remains the model-facing FreeCAD action language.
 - Embedded [Turso](https://github.com/tursodatabase/turso) stores conversation events, provider
   thread state and document/session associations outside `.FCStd`. Any future in-document metadata

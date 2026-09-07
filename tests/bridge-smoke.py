@@ -167,6 +167,7 @@ try:
                 controller.newThread()
                 return
             assert work[0]['body'] == saved_work['body']
+            assert work[0]['author'] == saved_work['author']
             assert work[0]['entries'] == saved_work['entries']
             assert [result["status"] for result in results] == ["committed", "rolled_back", "committed", "committed", "committed"], results
             assert document.getObject("MustRollback") is None

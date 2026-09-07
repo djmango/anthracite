@@ -2455,7 +2455,7 @@
 +tempfile = "3"
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/main.rs
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,227 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +mod process;
@@ -2463,6 +2463,7 @@
 +mod providers;
 +mod store;
 +mod supervisor;
++mod timeline;
 +
 +use process::IoEvent;
 +use providers::ProviderAdapter;
@@ -2605,7 +2606,11 @@
 +    };
 +
 +    if let Err(error) = result {
-+        protocol::emit_error(error);
++        if let Some(provider) = provider {
++            provider.emitter().emit("runtime.error", serde_json::json!({"message": error}));
++        } else {
++            protocol::emit_error(error);
++        }
 +    }
 +    true
 +}
@@ -2651,7 +2656,7 @@
 +                    if let Some(provider) = &mut provider
 +                        && let Err(error) = provider.handle_message(message)
 +                    {
-+                        protocol::emit_error(error);
++                        provider.emitter().emit("runtime.error", serde_json::json!({"message": error}));
 +                    }
 +                }
 +                Err(error) => protocol::emit_error(format!("Invalid provider JSON: {error}")),
@@ -2663,14 +2668,16 @@
 +            }
 +            IoEvent::ProviderError(line) => eprintln!("provider: {line}"),
 +            IoEvent::ProviderClosed => {
-+                protocol::emit_error("Provider process closed its output.");
++                if let Some(provider) = &provider {
++                    provider.emitter().emit("runtime.error", serde_json::json!({"message": "Provider process closed its output."}));
++                }
 +                provider = None;
 +            }
 +            IoEvent::McpMessage { message, response } => {
 +                if let Some(provider) = &mut provider
 +                    && let Err(error) = provider.handle_mcp_message(message, response)
 +                {
-+                    protocol::emit_error(error);
++                    provider.emitter().emit("runtime.error", serde_json::json!({"message": error}));
 +                }
 +            }
 +        }
@@ -3047,7 +3054,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/protocol.rs
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,256 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use serde_json::{Value, json};
@@ -3056,6 +3063,13 @@
 +use std::io::{self, Write};
 +
 +use crate::store::Store;
++use crate::timeline::Timeline;
++
++fn timestamped(mut payload: Value) -> Value {
++    payload["timestampMs"] = json!(std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64);
++    payload
++}
 +
 +pub const VERSION: u64 = 2;
 +
@@ -3095,6 +3109,7 @@
 +pub struct Emitter {
 +    store: Store,
 +    operations: RefCell<HashMap<String, Value>>,
++    timeline: RefCell<Timeline>,
 +}
 +
 +impl Emitter {
@@ -3102,11 +3117,18 @@
 +        let emitter = Self {
 +            store,
 +            operations: RefCell::new(HashMap::new()),
++            timeline: RefCell::new(Timeline::default()),
 +        };
 +        emit_raw("thread.local.ready", emitter.store.summary());
 +        emitter.emit_thread_list();
 +        match emitter.store.history() {
-+            Ok(events) => emit_raw("history.snapshot", json!({"events": events})),
++            Ok(events) => {
++                let mut timeline = emitter.timeline.borrow_mut();
++                for event in events {
++                    timeline.apply(event["type"].as_str().unwrap_or_default(), &event["payload"]);
++                }
++                emit_raw("timeline.edit", timeline.snapshot());
++            }
 +            Err(error) => emit_warning(format!("Could not load conversation history: {error}")),
 +        }
 +        match emitter.store.draft() {
@@ -3177,19 +3199,27 @@
 +        })
 +    }
 +
-+    pub fn emit(&self, message_type: &str, mut payload: Value) {
-+        payload["timestampMs"] = json!(std::time::SystemTime::now()
-+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64);
++    fn project_timeline(&self, message_type: &str, payload: &Value) {
++        for edit in self.timeline.borrow_mut().apply(message_type, payload) {
++            emit_raw("timeline.edit", edit);
++        }
++    }
++
++    pub fn emit(&self, message_type: &str, payload: Value) {
++        let payload = timestamped(payload);
 +        if let Err(error) = self.store.record(message_type, &payload) {
 +            emit_warning(format!("Could not persist runtime event: {error}"));
 +        }
++        self.project_timeline(message_type, &payload);
 +        emit_raw(message_type, payload);
 +    }
 +
 +    pub fn record(&self, message_type: &str, payload: &Value) {
-+        if let Err(error) = self.store.record(message_type, payload) {
++        let payload = timestamped(payload.clone());
++        if let Err(error) = self.store.record(message_type, &payload) {
 +            emit_warning(format!("Could not persist runtime event: {error}"));
 +        }
++        self.project_timeline(message_type, &payload);
 +        if message_type == "content.user" {
 +            self.emit_thread_list();
 +        }
@@ -3283,7 +3313,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/store.rs
-@@ -0,0 +1,1256 @@
+@@ -0,0 +1,1259 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use serde_json::{Value, json};
@@ -4120,7 +4150,8 @@
 +                               'tool.observation',
 +                               'turn.completed',
 +                               'plan.updated',
-+                               'runtime.warning'
++                               'runtime.warning',
++                               'runtime.error'
 +                           )
 +                         ORDER BY id DESC",
 +                        params![self.thread_id.clone()],
@@ -4131,7 +4162,9 @@
 +                    let event_type = row.get::<String>(0)?;
 +                    let payload = row.get::<String>(1)?;
 +                    let mut payload = serde_json::from_str::<Value>(&payload).unwrap_or(json!({}));
-+                    payload["timestampMs"] = json!(row.get::<i64>(2)?);
++                    if payload.get("timestampMs").is_none() {
++                        payload["timestampMs"] = json!(row.get::<i64>(2)?);
++                    }
 +                    events.push(json!({
 +                        "type": event_type,
 +                        "payload": payload
@@ -4895,4 +4928,348 @@
 +        )
 +        .success()
 +    );
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/timeline.rs
+@@ -0,0 +1,341 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++//! Provider-independent conversation projection. Qt only applies these row edits.
++//! The same reducer consumes live events and the persisted event history.
++use serde_json::{Value, json};
++
++#[derive(Default)]
++pub struct Timeline {
++    rows: Vec<Value>,
++    next_id: u64,
++    run: Option<(usize, u64)>,
++    assistant: Option<(String, usize)>,
++    reasoning: Option<(String, usize)>,
++    plan: Option<usize>,
++}
++
++fn text(value: &Value, key: &str) -> String {
++    value[key].as_str().unwrap_or_default().to_owned()
++}
++
++impl Timeline {
++    pub fn snapshot(&self) -> Value {
++        json!({"op": "reset", "rows": self.rows})
++    }
++
++    fn append(
++        &mut self,
++        author: &str,
++        body: impl Into<String>,
++        kind: &str,
++        edits: &mut Vec<Value>,
++    ) {
++        self.next_id += 1;
++        let row = json!({"id": self.next_id.to_string(), "author": author,
++                         "body": body.into(), "kind": kind, "entries": []});
++        self.rows.push(row.clone());
++        edits.push(json!({"op": "append", "row": row}));
++    }
++
++    fn update(&self, row: usize, edits: &mut Vec<Value>) {
++        edits.push(json!({"op": "update", "row": self.rows[row]}));
++    }
++
++    fn finish(&mut self, timestamp: u64, success: bool, edits: &mut Vec<Value>) {
++        let Some((start, began)) = self.run.take() else {
++            return;
++        };
++        let final_row = if success {
++            self.assistant.as_ref().map(|(_, row)| *row)
++        } else {
++            None
++        };
++        let answer = final_row
++            .map(|row| text(&self.rows[row], "body"))
++            .unwrap_or_default();
++        let entries: Vec<_> = self
++            .rows
++            .iter()
++            .enumerate()
++            .skip(start)
++            .filter(|(row, _)| Some(*row) != final_row)
++            .map(|(_, row)| row.clone())
++            .collect();
++        let ids: Vec<_> = self.rows[start..]
++            .iter()
++            .map(|row| row["id"].clone())
++            .collect();
++        self.rows.truncate(start);
++        edits.push(json!({"op": "remove", "ids": ids}));
++        let seconds = timestamp.saturating_sub(began) / 1000;
++        self.append(
++            &format!("Worked for {}m {}s", seconds / 60, seconds % 60),
++            answer,
++            "work",
++            edits,
++        );
++        self.rows.last_mut().unwrap()["entries"] = json!(entries);
++        // Include the work entries once, in the append, not in a second image-heavy update.
++        edits.last_mut().unwrap()["row"] = self.rows.last().unwrap().clone();
++        self.assistant = None;
++        self.reasoning = None;
++        self.plan = None;
++    }
++
++    pub fn apply(&mut self, event: &str, payload: &Value) -> Vec<Value> {
++        let mut edits = Vec::new();
++        let timestamp = payload["timestampMs"].as_u64().unwrap_or_default();
++        match event {
++            "content.user" => {
++                // A previous unfinished run is interrupted, never presented as a final answer.
++                if self.run.is_some() {
++                    self.append("Activity", "Interrupted", "activity", &mut edits);
++                    self.finish(timestamp, false, &mut edits);
++                }
++                self.append("You", text(payload, "text"), "user", &mut edits);
++                self.run = Some((self.rows.len(), timestamp));
++            }
++            "content.delta" => {
++                let assistant = payload["streamKind"] == "assistant_text";
++                let id = text(payload, "messageId");
++                let stream = if assistant {
++                    &self.assistant
++                } else {
++                    &self.reasoning
++                };
++                let row = match stream {
++                    Some((previous, row)) if *previous == id => *row,
++                    _ => {
++                        let row = self.rows.len();
++                        self.append(
++                            if assistant { "Anthracite" } else { "Thinking" },
++                            "",
++                            if assistant { "assistant" } else { "activity" },
++                            &mut edits,
++                        );
++                        if assistant {
++                            self.assistant = Some((id, row));
++                        } else {
++                            self.reasoning = Some((id, row));
++                        }
++                        row
++                    }
++                };
++                self.rows[row]["body"] =
++                    json!(text(&self.rows[row], "body") + &text(payload, "text"));
++                self.update(row, &mut edits);
++            }
++            "tool.activity" => {
++                self.append(
++                    "Activity",
++                    format!("freecad\n{}", text(&payload["arguments"], "code")),
++                    "activity",
++                    &mut edits,
++                );
++            }
++            "tool.observation" => {
++                self.append(
++                    "Activity",
++                    format!("FreeCAD result\n{}", text(payload, "result")),
++                    "activity",
++                    &mut edits,
++                );
++                if let Some(images) = payload["images"].as_array() {
++                    for image in images {
++                        self.append(
++                            image["view"].as_str().unwrap_or("Model image"),
++                            image
++                                .as_str()
++                                .map(str::to_owned)
++                                .unwrap_or_else(|| text(image, "dataUrl")),
++                            "image",
++                            &mut edits,
++                        );
++                    }
++                }
++            }
++            "item.started" | "item.completed" => {
++                let title = text(payload, "title");
++                let detail = text(payload, "detail");
++                self.append(
++                    "Activity",
++                    if detail.is_empty() {
++                        title
++                    } else {
++                        format!("{title}: {detail}")
++                    },
++                    "activity",
++                    &mut edits,
++                );
++                for field in ["input", "output"] {
++                    if !payload[field].is_null() {
++                        self.append(
++                            "Activity",
++                            payload[field]
++                                .as_str()
++                                .map(str::to_owned)
++                                .unwrap_or_else(|| {
++                                    serde_json::to_string_pretty(&payload[field]).unwrap()
++                                }),
++                            "activity",
++                            &mut edits,
++                        );
++                    }
++                }
++            }
++            "plan.updated" => {
++                let mut lines = Vec::new();
++                let explanation = text(payload, "explanation");
++                if !explanation.trim().is_empty() {
++                    lines.extend([explanation.trim().to_owned(), String::new()]);
++                }
++                if let Some(steps) = payload["steps"].as_array() {
++                    for step in steps {
++                        let marker = match step["status"].as_str() {
++                            Some("completed") => "●",
++                            Some("inProgress") => "◐",
++                            _ => "○",
++                        };
++                        lines.push(format!("{marker} {}", text(step, "step")));
++                    }
++                }
++                if let Some(row) = self.plan {
++                    self.rows[row]["body"] = json!(lines.join("\n"));
++                    self.update(row, &mut edits);
++                } else {
++                    self.plan = Some(self.rows.len());
++                    self.append("Plan", lines.join("\n"), "plan", &mut edits);
++                }
++            }
++            "runtime.warning" => {
++                self.append("Activity", text(payload, "message"), "activity", &mut edits)
++            }
++            "runtime.error" => {
++                self.append("Error", text(payload, "message"), "error", &mut edits);
++                self.finish(timestamp, false, &mut edits);
++            }
++            "turn.completed" => {
++                let success = payload["status"] == "completed";
++                if !success {
++                    self.append(
++                        "Activity",
++                        if payload["status"] == "failed" {
++                            text(payload, "error")
++                        } else {
++                            "Interrupted".into()
++                        },
++                        "activity",
++                        &mut edits,
++                    );
++                }
++                self.finish(timestamp, success, &mut edits);
++            }
++            _ => {}
++        }
++        edits
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn groups_only_last_message_and_preserves_images_and_exact_elapsed_time() {
++        let events = [
++            (
++                "content.user",
++                json!({"text":"Make a box", "timestampMs":1000}),
++            ),
++            (
++                "content.delta",
++                json!({"streamKind":"assistant_text", "messageId":"progress", "text":"Checking"}),
++            ),
++            (
++                "tool.observation",
++                json!({"result":"ok", "images":["data:image/png;base64,exact"]}),
++            ),
++            (
++                "content.delta",
++                json!({"streamKind":"assistant_text", "messageId":"final", "text":"Done"}),
++            ),
++            (
++                "content.delta",
++                json!({"streamKind":"assistant_text", "messageId":"final", "text":"."}),
++            ),
++            (
++                "turn.completed",
++                json!({"status":"completed", "timestampMs":138000}),
++            ),
++        ];
++        let mut live = Timeline::default();
++        let mut replay = Timeline::default();
++        for (event, payload) in &events {
++            live.apply(event, payload);
++        }
++        for (event, payload) in &events {
++            replay.apply(event, payload);
++        }
++        assert_eq!(live.snapshot(), replay.snapshot());
++        let work = &live.rows[1];
++        assert_eq!(work["author"], "Worked for 2m 17s");
++        assert_eq!(work["body"], "Done.");
++        assert_eq!(work["entries"][0]["body"], "Checking");
++        assert_eq!(work["entries"][2]["body"], "data:image/png;base64,exact");
++        assert!(live.apply("turn.completed", &events[5].1).is_empty());
++    }
++
++    #[test]
++    fn failed_interrupted_and_followup_runs_do_not_promote_intermediate_text() {
++        for terminal in ["failed", "interrupted"] {
++            let mut timeline = Timeline::default();
++            timeline.apply("content.user", &json!({"text":"First", "timestampMs":2000}));
++            timeline.apply(
++                "content.delta",
++                &json!({"streamKind":"assistant_text", "text":"Working"}),
++            );
++            timeline.apply(
++                "turn.completed",
++                &json!({"status":terminal, "timestampMs":1000}),
++            );
++            assert_eq!(timeline.rows[1]["body"], "");
++            assert_eq!(timeline.rows[1]["author"], "Worked for 0m 0s");
++            timeline.apply("content.user", &json!({"text":"Next", "timestampMs":3000}));
++            timeline.apply(
++                "content.delta",
++                &json!({"streamKind":"assistant_text", "text":"Final"}),
++            );
++            timeline.apply(
++                "turn.completed",
++                &json!({"status":"completed", "timestampMs":4000}),
++            );
++            assert_eq!(timeline.rows.len(), 4);
++            assert_eq!(timeline.rows[3]["body"], "Final");
++        }
++    }
++
++    #[test]
++    fn streaming_edits_do_not_retransmit_previous_images() {
++        let mut timeline = Timeline::default();
++        timeline.apply("content.user", &json!({"text":"Render"}));
++        timeline.apply("tool.observation", &json!({"images":["large-image-bytes"]}));
++        let edits = timeline.apply(
++            "content.delta",
++            &json!({"streamKind":"assistant_text", "text":"Done"}),
++        );
++        assert!(
++            !serde_json::to_string(&edits)
++                .unwrap()
++                .contains("large-image-bytes")
++        );
++        timeline.apply(
++            "content.delta",
++            &json!({"streamKind":"reasoning_text", "messageId":"r", "text":"One"}),
++        );
++        timeline.apply(
++            "content.delta",
++            &json!({"streamKind":"reasoning_text", "messageId":"r", "text":" two"}),
++        );
++        assert_eq!(timeline.rows.last().unwrap()["body"], "One two");
++    }
 +}

@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
-@@ -0,0 +1,897 @@
+@@ -0,0 +1,844 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "AgentBridge.h"
@@ -426,25 +426,8 @@
 +            payload.value("threads").toArray().toVariantList()
 +        );
 +    }
-+    else if (type == QLatin1String("history.snapshot")) {
-+        const QJsonArray events = payload.value("events").toArray();
-+        sidebar->resetHistory();
-+        for (const auto& value : events) {
-+            const QJsonObject event = value.toObject();
-+            if (event.value("type").toString() == QLatin1String("content.user")) {
-+                sidebar->appendUserMessage(event.value("payload").toObject().value("text").toString());
-+                sidebar->restoreTurnStart(event.value("payload").toObject().value("timestampMs").toVariant().toLongLong());
-+            }
-+            else {
-+                handleMessage(event);
-+            }
-+        }
-+        if (events.isEmpty()) {
-+            sidebar->showWelcome();
-+        }
-+        if (!queuedPrompt.isEmpty()) {
-+            sidebar->appendUserMessage(queuedPrompt);
-+        }
++    else if (type == QLatin1String("timeline.edit")) {
++        sidebar->applyTimelineEdit(payload.toVariantMap());
 +    }
 +    else if (type == QLatin1String("draft.loaded")) {
 +        pendingDraft = payload.value("body").toString();
@@ -495,36 +478,8 @@
 +            queuedPrompt.clear();
 +        }
 +    }
-+    else if (type == QLatin1String("content.delta")
-+             && payload.value("streamKind").toString() == QLatin1String("assistant_text")) {
-+        sidebar->updateStatus(tr("Responding"));
-+        sidebar->beginAssistantMessage(payload.value("messageId").toString());
-+        sidebar->appendAssistantDelta(payload.value("text").toString());
-+    }
 +    else if (type == QLatin1String("content.delta")) {
-+        sidebar->appendReasoningDelta(payload.value("text").toString(), payload.value("messageId").toString());
-+    }
-+    else if (type == QLatin1String("tool.activity")) {
-+        sidebar->appendActivity(QStringLiteral("freecad\n") + payload.value("arguments").toObject().value("code").toString());
-+    }
-+    else if (type == QLatin1String("tool.observation")) {
-+        sidebar->appendActivity(QStringLiteral("FreeCAD result\n") + payload.value("result").toString());
-+        for (const auto& image : payload.value("images").toArray()) {
-+            const auto value = image.toObject();
-+            sidebar->appendImage(image.isString() ? image.toString() : value.value("dataUrl").toString(), value.value("view").toString(tr("Model image")));
-+        }
-+    }
-+    else if (type == QLatin1String("item.started") || type == QLatin1String("item.completed")) {
-+        const QString title = payload.value("title").toString();
-+        const QString detail = payload.value("detail").toString();
-+        sidebar->appendActivity(detail.isEmpty() ? title : tr("%1: %2").arg(title, detail));
-+        for (const QString field : {QStringLiteral("input"), QStringLiteral("output")}) {
-+            const auto value = payload.value(field);
-+            if (!value.isNull() && !value.isUndefined()) {
-+                sidebar->appendActivity(value.isString() ? value.toString()
-+                    : QString::fromUtf8(QJsonDocument::fromVariant(value.toVariant()).toJson(QJsonDocument::Indented)));
-+            }
-+        }
++        sidebar->updateStatus(tr("Responding"));
 +    }
 +    else if (type == QLatin1String("tool.call")) {
 +        // Inspect without executing model code. The runtime must durably acknowledge
@@ -573,13 +528,7 @@
 +            payload.value("questions").toArray().toVariantList()
 +        );
 +    }
-+    else if (type == QLatin1String("plan.updated")) {
-+        sidebar->updatePlan(
-+            payload.value("explanation").toString(),
-+            payload.value("steps").toArray().toVariantList()
-+        );
-+    }
-+    else if (type == QLatin1String("runtime.warning")) {
++    else if (type == QLatin1String("runtime.warning") && !payload.contains("timestampMs")) {
 +        sidebar->appendActivity(payload.value("message").toString());
 +    }
 +    else if (type == QLatin1String("turn.completed")) {
@@ -587,17 +536,15 @@
 +        if (status == QLatin1String("failed")) {
 +            queuedPrompt.clear();
 +            sidebar->failTurn(payload.value("error").toString(tr("The provider turn failed.")),
-+                              payload.value("timestampMs").toVariant().toLongLong());
++                              false);
 +        }
 +        else {
-+            if (status == QLatin1String("interrupted")) {
-+                sidebar->appendActivity(tr("Interrupted"));
-+            }
-+            sidebar->completeTurn(payload.value("timestampMs").toVariant().toLongLong(), status == QLatin1String("completed"));
++            sidebar->completeTurn();
 +        }
 +    }
 +    else if (type == QLatin1String("runtime.error")) {
-+        fail(payload.value("message").toString(tr("Unknown agent error.")));
++        queuedPrompt.clear();
++        sidebar->failTurn(payload.value("message").toString(tr("Unknown agent error.")), !payload.contains("timestampMs"));
 +    }
 +}
 +
@@ -1073,7 +1020,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,109 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +find_package(
@@ -1125,6 +1072,7 @@
 +        ${AnthraciteRuntime_SOURCE_DIR}/src/process.rs
 +        ${AnthraciteRuntime_SOURCE_DIR}/src/protocol.rs
 +        ${AnthraciteRuntime_SOURCE_DIR}/src/store.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/timeline.rs
 +        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/mod.rs
 +        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/codex.rs
 +        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/opencode.rs
@@ -1249,14 +1197,10 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/ConversationModel.cpp
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,77 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "ConversationModel.h"
-+
-+#include <utility>
-+#include <QDateTime>
-+
 +
 +using namespace AnthraciteGui;
 +
@@ -1271,135 +1215,69 @@
 +
 +QVariant ConversationModel::data(const QModelIndex& index, int role) const
 +{
-+    if (!index.isValid() || index.row() < 0 || index.row() >= static_cast<int>(messages.size())) {
++    if (!index.isValid() || index.row() < 0 || index.row() >= rowCount()) {
 +        return {};
 +    }
-+
-+    const auto& message = messages.at(static_cast<std::size_t>(index.row()));
-+    switch (role) {
-+        case AuthorRole:
-+            return message.author;
-+        case BodyRole:
-+            return message.body;
-+        case KindRole:
-+            return message.kind;
-+        case EntriesRole:
-+            return message.entries;
-+        default:
-+            return {};
-+    }
++    return messages[index.row()].value(QString::fromLatin1(roleNames().value(role)));
 +}
 +
 +QHash<int, QByteArray> ConversationModel::roleNames() const
 +{
-+    return {
-+        {AuthorRole, "author"},
-+        {BodyRole, "body"},
-+        {KindRole, "kind"},
-+        {EntriesRole, "entries"},
-+    };
++    return {{AuthorRole, "author"}, {BodyRole, "body"}, {KindRole, "kind"}, {EntriesRole, "entries"}};
 +}
 +
 +void ConversationModel::append(QString author, QString body, QString kind)
 +{
-+    const int row = static_cast<int>(messages.size());
-+    beginInsertRows({}, row, row);
-+    messages.push_back({std::move(author), std::move(body), std::move(kind)});
-+    endInsertRows();
++    apply({{"op", "append"}, {"row", QVariantMap {{"author", author}, {"body", body}, {"kind", kind}}}});
 +}
 +
 +void ConversationModel::clear()
 +{
-+    beginResetModel();
-+    messages.clear();
-+    assistantRow = -1;
-+    planRow = -1;
-+    turnStart = -1;
-+    reasoningRow = -1;
-+    endResetModel();
++    apply({{"op", "reset"}});
 +}
 +
-+void ConversationModel::beginTurn(qint64 timestamp)
++void ConversationModel::apply(const QVariantMap& edit)
 +{
-+    assistantRow = -1;
-+    planRow = -1;
-+    assistantId.clear();
-+    reasoningRow = -1;
-+    turnStart = static_cast<int>(messages.size());
-+    startedAt = timestamp > 0 ? timestamp : QDateTime::currentMSecsSinceEpoch();
-+}
-+
-+void ConversationModel::beginAssistantMessage(const QString& id)
-+{
-+    if (assistantRow >= 0 && id == assistantId) {
-+        return;
-+    }
-+    assistantId = id;
-+    assistantRow = static_cast<int>(messages.size());
-+    append(QStringLiteral("Anthracite"), {}, QStringLiteral("assistant"));
-+}
-+
-+void ConversationModel::completeTurn(qint64 timestamp, bool success)
-+{
-+    if (turnStart < 0) {
-+        return;
-+    }
-+    const qint64 elapsed = qMax<qint64>(0,
-+        ((timestamp > 0 ? timestamp : QDateTime::currentMSecsSinceEpoch()) - startedAt) / 1000);
-+    QVariantList entries;
-+    const QString answer = success && assistantRow >= turnStart ? messages[assistantRow].body : QString();
-+    for (int row = turnStart; row < static_cast<int>(messages.size()); ++row) {
-+        if (success && row == assistantRow) {
-+            continue;
++    // Generic row transport only. Message/run semantics belong to the Rust runtime.
++    const QString operation = edit.value("op").toString();
++    if (operation == QLatin1String("reset")) {
++        beginResetModel();
++        messages.clear();
++        for (const auto& row : edit.value("rows").toList()) {
++            messages.push_back(row.toMap());
 +        }
-+        const auto& message = messages[row];
-+        entries.append(QVariantMap {{"author", message.author}, {"body", message.body},
-+                                    {"kind", message.kind}});
++        endResetModel();
 +    }
-+    beginResetModel();
-+    messages.resize(turnStart);
-+    messages.push_back({tr("Worked for %1m %2s").arg(elapsed / 60).arg(elapsed % 60),
-+                        answer, QStringLiteral("work"), entries});
-+    turnStart = assistantRow = planRow = -1;
-+    reasoningRow = -1;
-+    endResetModel();
-+}
-+
-+void ConversationModel::appendAssistantDelta(const QString& delta)
-+{
-+    if (assistantRow < 0) {
-+        beginAssistantMessage();
++    else if (operation == QLatin1String("append")) {
++        const int row = rowCount();
++        beginInsertRows({}, row, row);
++        messages.push_back(edit.value("row").toMap());
++        endInsertRows();
 +    }
-+
-+    messages.at(static_cast<std::size_t>(assistantRow)).body += delta;
-+    Q_EMIT dataChanged(index(assistantRow), index(assistantRow), {BodyRole});
-+}
-+
-+void ConversationModel::upsertPlan(const QString& body)
-+{
-+    if (planRow < 0) {
-+        planRow = static_cast<int>(messages.size());
-+        append(QStringLiteral("Plan"), body, QStringLiteral("plan"));
-+        return;
++    else if (operation == QLatin1String("update")) {
++        const QVariantMap value = edit.value("row").toMap();
++        for (int row = 0; row < rowCount(); ++row) {
++            if (messages[row].value("id") == value.value("id")) {
++                messages[row] = value;
++                Q_EMIT dataChanged(index(row), index(row));
++                break;
++            }
++        }
 +    }
-+
-+    messages.at(static_cast<std::size_t>(planRow)).body = body;
-+    Q_EMIT dataChanged(index(planRow), index(planRow), {BodyRole});
-+}
-+
-+void ConversationModel::appendReasoningDelta(const QString& delta, const QString& id)
-+{
-+    if (reasoningRow < 0 || reasoningId != id) {
-+        reasoningId = id;
-+        reasoningRow = static_cast<int>(messages.size());
-+        append(tr("Thinking"), {}, QStringLiteral("activity"));
++    else if (operation == QLatin1String("remove")) {
++        const QVariantList ids = edit.value("ids").toList();
++        for (int row = rowCount() - 1; row >= 0; --row) {
++            if (ids.contains(messages[row].value("id"))) {
++                beginRemoveRows({}, row, row);
++                messages.erase(messages.begin() + row);
++                endRemoveRows();
++            }
++        }
 +    }
-+    messages[reasoningRow].body += delta;
-+    Q_EMIT dataChanged(index(reasoningRow), index(reasoningRow), {BodyRole});
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/ConversationModel.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,41 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_CONVERSATIONMODEL_H
@@ -1433,30 +1311,10 @@
 +
 +    void append(QString author, QString body, QString kind);
 +    void clear();
-+    void beginTurn(qint64 timestamp = 0);
-+    void beginAssistantMessage(const QString& id = {});
-+    void completeTurn(qint64 timestamp = 0, bool success = true);
-+    void appendAssistantDelta(const QString& delta);
-+    void appendReasoningDelta(const QString& delta, const QString& id);
-+    void upsertPlan(const QString& body);
++    void apply(const QVariantMap& edit);
 +
 +private:
-+    struct Message
-+    {
-+        QString author;
-+        QString body;
-+        QString kind;
-+        QVariantList entries;
-+    };
-+
-+    std::vector<Message> messages;
-+    int assistantRow = -1;
-+    int planRow = -1;
-+    int turnStart = -1;
-+    qint64 startedAt = 0;
-+    QString assistantId;
-+    QString reasoningId;
-+    int reasoningRow = -1;
++    std::vector<QVariantMap> messages;
 +};
 +}  // namespace AnthraciteGui
 +
@@ -2125,7 +1983,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,740 @@
+@@ -0,0 +1,695 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "Sidebar.h"
@@ -2330,8 +2188,6 @@
 +        return;
 +    }
 +
-+    conversation.append(QStringLiteral("You"), text, QStringLiteral("user"));
-+    conversation.beginTurn();
 +    clearInteraction();
 +    if (!currentDraft.isEmpty()) {
 +        currentDraft.clear();
@@ -2463,55 +2319,12 @@
 +    conversation.clear();
 +}
 +
-+void SidebarController::appendUserMessage(const QString& text)
++void SidebarController::applyTimelineEdit(const QVariantMap& edit)
 +{
-+    conversation.append(QStringLiteral("You"), text, QStringLiteral("user"));
-+    conversation.beginTurn();
-+}
-+
-+void SidebarController::restoreTurnStart(qint64 timestamp)
-+{
-+    conversation.beginTurn(timestamp);
-+}
-+
-+void SidebarController::appendImage(const QString& source, const QString& caption)
-+{
-+    conversation.append(caption, source, QStringLiteral("image"));
-+}
-+
-+void SidebarController::beginAssistantMessage(const QString& id)
-+{
-+    conversation.beginAssistantMessage(id);
-+}
-+
-+void SidebarController::appendAssistantDelta(const QString& delta)
-+{
-+    conversation.appendAssistantDelta(delta);
-+}
-+
-+void SidebarController::appendReasoningDelta(const QString& delta, const QString& id)
-+{
-+    conversation.appendReasoningDelta(delta, id);
-+}
-+
-+void SidebarController::updatePlan(const QString& explanation, const QVariantList& steps)
-+{
-+    QStringList lines;
-+    if (!explanation.trimmed().isEmpty()) {
-+        lines.append(explanation.trimmed());
-+        lines.append(QString());
++    conversation.apply(edit);
++    if (edit.value("op").toString() == QLatin1String("reset") && conversation.rowCount() == 0) {
++        showWelcome();
 +    }
-+    for (const auto& value : steps) {
-+        const QVariantMap step = value.toMap();
-+        const QString status = step.value(QStringLiteral("status")).toString();
-+        const QString marker = status == QLatin1String("completed") ? QStringLiteral("●")
-+            : status == QLatin1String("inProgress")                 ? QStringLiteral("◐")
-+                                                                    : QStringLiteral("○");
-+        lines.append(
-+            QStringLiteral("%1 %2").arg(marker, step.value(QStringLiteral("step")).toString())
-+        );
-+    }
-+    conversation.upsertPlan(lines.join(QLatin1Char('\n')));
 +}
 +
 +void SidebarController::showApproval(
@@ -2567,19 +2380,19 @@
 +    }
 +}
 +
-+void SidebarController::completeTurn(qint64 timestamp, bool success)
++void SidebarController::completeTurn()
 +{
-+    conversation.completeTurn(timestamp, success);
 +    clearInteraction();
 +    setBusy(false);
 +    setStatus(QStringLiteral("Ready"));
 +}
 +
-+void SidebarController::failTurn(const QString& error, qint64 timestamp)
++void SidebarController::failTurn(const QString& error, bool appendMessage)
 +{
 +    clearInteraction();
-+    conversation.append(QStringLiteral("Error"), error, QStringLiteral("error"));
-+    conversation.completeTurn(timestamp, false);
++    if (appendMessage) {
++        conversation.append(QStringLiteral("Error"), error, QStringLiteral("error"));
++    }
 +    setBusy(false);
 +    setStatus(QStringLiteral("Error"));
 +}
@@ -2868,7 +2681,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,183 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_SIDEBAR_H
@@ -2961,13 +2774,7 @@
 +    void appendActivity(const QString& text);
 +    void resetHistory();
 +    void showWelcome();
-+    void appendUserMessage(const QString& text);
-+    void beginAssistantMessage(const QString& id = {});
-+    void appendImage(const QString& source, const QString& caption);
-+    void restoreTurnStart(qint64 timestamp);
-+    void appendAssistantDelta(const QString& delta);
-+    void appendReasoningDelta(const QString& delta, const QString& id);
-+    void updatePlan(const QString& explanation, const QVariantList& steps);
++    void applyTimelineEdit(const QVariantMap& edit);
 +    void showApproval(
 +        const QString& requestId,
 +        const QString& title,
@@ -2976,8 +2783,8 @@
 +    );
 +    void showUserInput(const QString& requestId, const QVariantList& questions);
 +    void clearInteraction();
-+    void completeTurn(qint64 timestamp = 0, bool success = true);
-+    void failTurn(const QString& error, qint64 timestamp = 0);
++    void completeTurn();
++    void failTurn(const QString& error, bool appendMessage = true);
 +    void updateStatus(const QString& status);
 +    void updateThreads(const QString& currentThreadId, const QVariantList& threads);
 +    void loadDraft(const QString& body);
