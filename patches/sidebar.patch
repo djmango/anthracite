@@ -1114,7 +1114,7 @@
 +#endif  // ANTHRACITEGUI_AGENTBRIDGE_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AppAnthraciteGui.cpp
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,64 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include <QResource>
@@ -1127,6 +1127,7 @@
 +#include <Gui/Application.h>
 +
 +#include "Sidebar.h"
++#include "Chrome.h"
 +
 +
 +void CreateAnthraciteCommands();
@@ -1165,6 +1166,7 @@
 +    PyObject* module = AnthraciteGui::initModule();
 +    CreateAnthraciteCommands();
 +    AnthraciteGui::ensureSidebar();
++    QTimer::singleShot(0, []() { AnthraciteGui::installChrome(); });
 +
 +    auto preferences = App::GetApplication().GetParameterGroupByPath(
 +        "User parameter:BaseApp/Preferences/Mod/Anthracite"
@@ -1179,7 +1181,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,117 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +find_package(
@@ -1232,7 +1234,7 @@
 +# Content-address the resource path, not a URL query (Qt's disk-cache key strips
 +# queries). Fixed RCC timestamps must never reuse a previous component definition.
 +set(AnthraciteQml_FINGERPRINT "")
-+foreach(component Main TranscriptText ActivityEntry AgentSettings)
++foreach(component Main TranscriptText ActivityEntry AgentSettings StatusBar)
 +    set(qml_file ${CMAKE_CURRENT_SOURCE_DIR}/Resources/qml/${component}.qml)
 +    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${qml_file})
 +    file(SHA256 ${qml_file} qml_hash)
@@ -1248,6 +1250,8 @@
 +    AgentBridge.h
 +    AppAnthraciteGui.cpp
 +    Command.cpp
++    Chrome.cpp
++    Chrome.h
 +    ConversationModel.cpp
 +    Composer.cpp
 +    ConversationModel.h
@@ -1626,16 +1630,19 @@
 +#endif  // ANTHRACITEGUI_CONVERSATIONMODEL_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,18 @@
 +<!DOCTYPE RCC>
 +<RCC version="1.0">
 +    <qresource prefix="/Anthracite">
++        <file alias="overlay.qss">@CMAKE_CURRENT_SOURCE_DIR@/Resources/overlay.qss</file>
++        <file alias="qml/StatusBar.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/StatusBar.qml</file>
 +        <file alias="qml/AgentSettings.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/AgentSettings.qml</file>
 +        <file alias="qml/Main.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Main.qml</file>
 +        <file alias="qml/TranscriptText.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptText.qml</file>
 +        <file alias="qml/ActivityEntry.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ActivityEntry.qml</file>
 +    </qresource>
 +    <qresource prefix="/Anthracite/@AnthraciteQml_VERSION@">
++        <file alias="qml/StatusBar.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/StatusBar.qml</file>
 +        <file alias="qml/AgentSettings.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/AgentSettings.qml</file>
 +        <file alias="qml/Main.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Main.qml</file>
 +        <file alias="qml/TranscriptText.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptText.qml</file>
@@ -1644,7 +1651,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,940 @@
+@@ -0,0 +1,951 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
@@ -1927,9 +1934,9 @@
 +            }
 +            onMovementStarted: navigate()
 +            onMovementEnded: {
-+                userScrolling = false
-+                gestureEnd.stop()
-+                if (atYEnd) { newTurnId = ""; scrollMode = "following" }
++                // A trackpad gesture can contain several native movement bursts.
++                // Only the quiet-period timer may release manual-scroll ownership.
++                gestureEnd.restart()
 +                remember()
 +            }
 +            // ListView estimates total height from the delegates currently in
@@ -1956,6 +1963,8 @@
 +                    if (timeline.moving || timelineScrollBar.pressed) { restart(); return }
 +                    timeline.userScrolling = false
 +                    timeline.remember()
++                    if (timeline.atYEnd && !timeline.newTurnId.length)
++                        timeline.scrollMode = "following"
 +                }
 +            }
 +            Timer {
@@ -2040,7 +2049,7 @@
 +                    implicitHeight: messageColumn.implicitHeight + (isUser ? 24 : 12)
 +                    radius: 12
 +                    color: isUser
-+                           ? Qt.rgba(0.30, 0.52, 0.95, 0.16)
++                           ? Qt.rgba(0.627, 0.4, 0.4, 0.25)
 +                             : kind === "error"
 +                             ? Qt.rgba(0.90, 0.25, 0.25, 0.15)
 +                             : "transparent"
@@ -2415,6 +2424,15 @@
 +                    wrapMode: TextEdit.Wrap
 +                    textFormat: TextEdit.RichText
 +                    persistentSelection: true
++                    leftPadding: 12
++                    rightPadding: 12
++                    topPadding: 10
++                    background: Rectangle {
++                        radius: 10
++                        color: systemPalette.alternateBase
++                        border.width: 1
++                        border.color: composer.activeFocus ? systemPalette.highlight : systemPalette.mid
++                    }
 +                    enabled: !anthraciteController.submitting
 +                    // Keep the final text line above the overlaid actions.
 +                    bottomPadding: composerActions.height + 10
@@ -2540,7 +2558,7 @@
 +                            radius: 1
 +                            color: anthraciteController.usageFraction > 0.8
 +                                   ? Qt.rgba(0.90, 0.35, 0.25, 0.9)
-+                                   : Qt.rgba(0.30, 0.52, 0.95, 0.9)
++                                   : systemPalette.highlight
 +                        }
 +
 +                        ToolTip.visible: usageHover.containsMouse
@@ -3805,7 +3823,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,811 @@
+@@ -0,0 +1,880 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -4005,11 +4023,45 @@
 +
 +def run_smoke_test():
 +    main_window = Gui.getMainWindow()
++    QtTest.QTest.qWait(100)
++    chrome = main_window.findChild(QtCore.QObject, 'AnthraciteChrome')
++    assert chrome is not None
++    status = main_window.findChild(QtQuickWidgets.QQuickWidget, 'AnthraciteStatusBar')
++    assert status is not None and status.status() == QtQuickWidgets.QQuickWidget.Ready
++    assert QtWidgets.QApplication.palette().color(QtGui.QPalette.Highlight).name() == '#a06666'
++    assert QtWidgets.QApplication.palette().color(QtGui.QPalette.Window).name() == '#080808'
++    overlay = App.ParamGet('User parameter:BaseApp/MainWindow/DockWindows/OverlayLeft')
++    assert overlay.GetBool('Transparent') and 'Tree view' in overlay.GetString('Widgets')
 +    dock = main_window.findChild(QtWidgets.QDockWidget, "AnthraciteSidebar")
 +    if dock is None:
 +        raise AssertionError("AnthraciteSidebar was not registered as a dock window.")
 +    if dock.widget() is None:
 +        raise AssertionError("AnthraciteSidebar does not contain its native widget.")
++    dock.show()
++    assert dock.titleBarWidget() is not None and dock.titleBarWidget().height() == 0
++    chrome.toggleChat()
++    assert not dock.isVisible()
++    chrome.toggleChat()
++    assert dock.isVisible()
++    chrome.toggleFloating()
++    assert dock.isFloating() and dock.titleBarWidget() is None
++    chrome.toggleFloating()
++    assert not dock.isFloating() and dock.titleBarWidget().height() == 0
++    console_updates = []
++    def console_changed():
++        console_updates.append(chrome.property('latestMessage'))
++    chrome.changed.connect(console_changed)
++    App.Console.PrintMessage('Anthracite console status probe\n')
++    QtTest.QTest.qWait(100)
++    chrome.changed.disconnect(console_changed)
++    assert any('Anthracite console status probe' in message for message in console_updates), (chrome.property('latestMessage'), console_updates)
++    console_dock = main_window.findChild(QtWidgets.QDockWidget, 'Report view')
++    assert console_dock is not None
++    console_dock.hide()
++    chrome.toggleConsole()
++    assert console_dock.isVisible() and main_window.dockWidgetArea(console_dock) == QtCore.Qt.BottomDockWidgetArea
++    chrome.toggleConsole()
++    assert not console_dock.isVisible()
 +    quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
 +    if quick_widget is None:
 +        raise AssertionError("AnthraciteSidebar does not contain its QML surface.")
@@ -4318,6 +4370,36 @@
 +        for _ in range(15):
 +            QtTest.QTest.qWait(25)
 +            assert abs(timeline_value(position) - settled) < 3, 'Transcript oscillated after fast scrolling'
++    # Trackpads carry pixel deltas and momentum phases, unlike mouse-wheel
++    # angle steps. Down-only input must never reverse the visible transcript.
++    timeline.setProperty('scrollMode', 'reading')
++    timeline.positionViewAtIndex(1, 0)
++    QtTest.QTest.qWait(200)
++    def visible_progress():
++        return timeline_value('''
++            let first = null;
++            for (const item of contentItem.children) {
++                if (item.rowId && item.y + item.height > contentY && item.y < contentY + height
++                    && (!first || item.y < first.y)) first = item;
++            }
++            [model.indexOfId(first.rowId), contentY - first.y];
++        ''')
++    previous_progress = None
++    for i in range(50):
++        phase = QtCore.Qt.ScrollBegin if i == 0 else QtCore.Qt.ScrollMomentum if i > 30 else QtCore.Qt.ScrollUpdate
++        trackpad = QtGui.QWheelEvent(center, center, QtCore.QPoint(0, -80), QtCore.QPoint(),
++                                    QtCore.Qt.NoButton, QtCore.Qt.NoModifier, phase, False)
++        QtWidgets.QApplication.sendEvent(quick_widget, trackpad)
++        QtTest.QTest.qWait(16)
++        progress = visible_progress()
++        if hasattr(progress, 'toVariant'): progress = progress.toVariant()
++        if previous_progress is not None:
++            assert progress[0] > previous_progress[0] or (progress[0] == previous_progress[0] and progress[1] >= previous_progress[1] - 3), ('Downward trackpad input reversed', previous_progress, progress)
++        previous_progress = progress
++    end = QtGui.QWheelEvent(center, center, QtCore.QPoint(), QtCore.QPoint(), QtCore.Qt.NoButton,
++                           QtCore.Qt.NoModifier, QtCore.Qt.ScrollEnd, False)
++    QtWidgets.QApplication.sendEvent(quick_widget, end)
++    QtTest.QTest.qWait(350)
 +    apply_edit({'op': 'reset', 'rows': original})
 +    Gui.runCommand("Anthracite_ReloadSidebar")
 +    quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
@@ -4357,6 +4439,11 @@
 +        raise AssertionError("Viewport observation did not return an inline PNG.")
 +    if render_result["observation"]["render"]["width"] != 256:
 +        raise AssertionError("Viewport observation metadata is incomplete.")
++    QtTest.QTest.qWait(100)
++    capture = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/application-chrome.png'
++    tree_dock = main_window.findChild(QtWidgets.QDockWidget, 'Tree view')
++    assert tree_dock is not None and tree_dock.parentWidget() != main_window, 'Tree is docked outside the viewport instead of overlaid'
++    assert main_window.grab().save(str(capture))
 +    view = Gui.activeDocument().activeView()
 +    Gui.updateGui()
 +    camera_before_feedback = view.getCamera()
@@ -5186,3 +5273,346 @@
 +{
 +    return NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion;
 +}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Chrome.cpp
+@@ -0,0 +1,199 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "Chrome.h"
++#include "Sidebar.h"
++
++#include <QApplication>
++#include <QCursor>
++#include <QDockWidget>
++#include <QFile>
++#include <QLabel>
++#include <QPalette>
++#include <QQmlContext>
++#include <QQuickWidget>
++#include <QStatusBar>
++#include <QTextBlock>
++#include <QTextEdit>
++#include <QTimer>
++#include <App/Application.h>
++#include <Gui/Application.h>
++#include <Gui/MainWindow.h>
++#include <Gui/OverlayManager.h>
++#include <Gui/ReportView.h>
++#include <Gui/Selection/Selection.h>
++#include <Gui/View3DInventor.h>
++#include <Gui/View3DInventorViewer.h>
++
++using namespace AnthraciteGui;
++
++namespace {
++class HiddenTitleBar: public QWidget {
++public:
++    using QWidget::QWidget;
++    QSize sizeHint() const override { return {0, 0}; }
++    QSize minimumSizeHint() const override { return {0, 0}; }
++};
++}
++
++Chrome::Chrome(QDockWidget* dock) : QObject(Gui::getMainWindow()), chat(dock)
++{
++    setObjectName(QStringLiteral("AnthraciteChrome"));
++    latest = tr("Console · No messages yet");
++    position = QStringLiteral("X —   Y —   Z —");
++    connect(chat, &QDockWidget::visibilityChanged, this, &Chrome::changed);
++    connect(chat, &QDockWidget::topLevelChanged, this, [this]() { updateTitleBar(); Q_EMIT changed(); });
++    updateTitleBar();
++    if (auto* output = Gui::getMainWindow()->findChild<Gui::DockWnd::ReportOutput*>()) {
++        const auto update = [this, output]() {
++            auto block = output->document()->lastBlock();
++            while (block.isValid() && block.text().trimmed().isEmpty()) block = block.previous();
++            if (block.isValid()) {
++                latest = block.text().trimmed().left(2000);
++                Q_EMIT changed();
++            }
++        };
++        connect(output, &QTextEdit::textChanged, this, update);
++        update();
++    }
++    auto* timer = new QTimer(this);
++    timer->setInterval(33);
++    connect(timer, &QTimer::timeout, this, &Chrome::updatePosition);
++    timer->start();
++}
++
++bool Chrome::chatVisible() const { return chat && chat->isVisible(); }
++bool Chrome::chatFloating() const { return chat && chat->isFloating(); }
++void Chrome::toggleChat() { if (chat) { chat->setVisible(!chat->isVisible()); if (chat->isVisible()) chat->raise(); } }
++void Chrome::toggleFloating() { if (chat) { chat->setFloating(!chat->isFloating()); chat->show(); } }
++
++void Chrome::updateTitleBar()
++{
++    if (!chat) return;
++    auto* previous = chat->titleBarWidget();
++    if (chat->isFloating()) chat->setTitleBarWidget(nullptr);
++    else {
++        auto* empty = new HiddenTitleBar(chat);
++        empty->setObjectName(QStringLiteral("AnthraciteHiddenTitleBar"));
++        empty->setFixedHeight(0);
++        chat->setTitleBarWidget(empty);
++    }
++    if (previous) previous->deleteLater();
++}
++
++void Chrome::toggleConsole()
++{
++    auto* window = Gui::getMainWindow();
++    auto* output = window->findChild<Gui::DockWnd::ReportOutput*>();
++    if (!output) return;
++    QWidget* parent = output;
++    while (parent && !qobject_cast<QDockWidget*>(parent)) parent = parent->parentWidget();
++    auto* dock = qobject_cast<QDockWidget*>(parent);
++    if (!dock) return;
++    const bool show = !dock->isVisible();
++    if (show) {
++        dock->setFloating(false);
++        window->addDockWidget(Qt::BottomDockWidgetArea, dock);
++        dock->show();
++        dock->raise();
++        output->setFocus();
++    } else dock->hide();
++}
++
++void Chrome::updatePosition()
++{
++    QString next = QStringLiteral("X —   Y —   Z —");
++    QString origin = tr("Move the cursor over the 3D view");
++    auto* view = dynamic_cast<Gui::View3DInventor*>(Gui::Application::Instance->activeView());
++    if (view && view->isVisible() && qApp->applicationState() == Qt::ApplicationActive) {
++        auto* viewer = view->getViewer();
++        auto* viewport = viewer->viewport();
++        const QPoint local = viewport->mapFromGlobal(QCursor::pos());
++        if (viewport->rect().contains(local) && viewport->underMouse()) {
++            const auto& picked = Gui::Selection().getPreselection();
++            double x, y, z;
++            if (picked.pObjectName && *picked.pObjectName) {
++                x = picked.x; y = picked.y; z = picked.z;
++                origin = tr("Surface · world coordinates in millimetres");
++            } else {
++                const auto size = viewer->getSoRenderManager()->getViewportRegion().getViewportSizePixels();
++                const SbVec2s pixel(short(local.x() * size[0] / qMax(1, viewport->width())),
++                    short((viewport->height() - 1 - local.y()) * size[1] / qMax(1, viewport->height())));
++                const auto point = viewer->getPointOnFocalPlane(pixel);
++                x = point[0]; y = point[1]; z = point[2];
++                origin = tr("View plane · projected world coordinates in millimetres, not a surface hit");
++            }
++            next = QStringLiteral("X %1   Y %2   Z %3  mm").arg(x, 0, 'f', 2).arg(y, 0, 'f', 2).arg(z, 0, 'f', 2);
++        }
++    }
++    if (next != position || origin != source) { position = next; source = origin; Q_EMIT changed(); }
++}
++
++void AnthraciteGui::installChrome()
++{
++    auto* window = Gui::getMainWindow();
++    if (window->findChild<Chrome*>()) return;
++    auto preferences = App::GetApplication().GetParameterGroupByPath("User parameter:BaseApp/Preferences/Mod/Anthracite");
++    auto windowPreferences = App::GetApplication().GetParameterGroupByPath("User parameter:BaseApp/Preferences/MainWindow");
++    if (preferences->GetBool("UseAnthraciteTheme", true)) {
++        windowPreferences->SetASCII("OverlayActiveStyleSheet", ":/Anthracite/overlay.qss");
++        QPalette palette = qApp->palette();
++        palette.setColor(QPalette::Window, QColor("#080808"));
++        palette.setColor(QPalette::Base, QColor("#080808"));
++        palette.setColor(QPalette::AlternateBase, QColor("#242424"));
++        palette.setColor(QPalette::Button, QColor("#242424"));
++        palette.setColor(QPalette::WindowText, QColor("#E5E1DE"));
++        palette.setColor(QPalette::Text, QColor("#E5E1DE"));
++        palette.setColor(QPalette::ButtonText, QColor("#E5E1DE"));
++        palette.setColor(QPalette::Highlight, QColor("#A06666"));
++        palette.setColor(QPalette::HighlightedText, QColor("#FFFFFF"));
++        palette.setColor(QPalette::Link, QColor("#C99696"));
++        palette.setColor(QPalette::Mid, QColor("#38393D"));
++        qApp->setPalette(palette);
++        window->setPalette(palette);
++        qApp->setStyleSheet(qApp->styleSheet() + QStringLiteral(
++            "\nQStatusBar{background:#080808;border-top:1px solid #333333;}"
++            "QStatusBar::item{border:0;} QToolBar{border:0;spacing:4px;}"
++            "QMainWindow,QMenuBar,QMenu,QToolBar,QDockWidget{background:#080808;color:#E5E1DE;}"
++            "QTreeView{background:transparent;color:#E5E1DE;selection-background-color:#A06666;selection-color:white;}"
++            "QDockWidget::title{padding:5px;} QMenu{padding:4px;}"
++            "QDockWidget::close-button{image:url(qss:overlay/icons/close_light.svg);}"
++            "QDockWidget::float-button{image:url(qss:overlay/icons/float_light.svg);}"
++            "QToolButton:hover{background:#383034;border-radius:4px;}"
++            "QToolButton:checked{background:#704C4F;border-radius:4px;}"));
++    } else if (windowPreferences->GetASCII("OverlayActiveStyleSheet") == ":/Anthracite/overlay.qss") {
++        windowPreferences->SetASCII("OverlayActiveStyleSheet", "");
++    }
++    // One-time defaults for both fresh and existing Anthracite profiles. Later
++    // user adjustments remain authoritative; never reset layout on every launch.
++    if (!preferences->GetBool("ChromeDefaultsInitialized", false)) {
++        auto overlay = App::GetApplication().GetParameterGroupByPath("User parameter:BaseApp/MainWindow/DockWindows/OverlayLeft");
++        overlay->SetASCII("Widgets", "Tree view,Property view,");
++        overlay->SetBool("Transparent", true);
++        overlay->SetBool("AutoHide", false);
++        auto view = App::GetApplication().GetParameterGroupByPath("User parameter:BaseApp/Preferences/View");
++        view->SetBool("Simple", true);
++        view->SetBool("Gradient", false);
++        view->SetBool("RadialGradient", false);
++        view->SetUnsigned("BackgroundColor", 0x080808FF);
++        preferences->SetBool("ChromeDefaultsInitialized", true);
++        Gui::OverlayManager::instance()->reload();
++    }
++    auto* dock = qobject_cast<QDockWidget*>(ensureSidebar()->parentWidget());
++    auto* chrome = new Chrome(dock);
++    auto* bar = new QQuickWidget(window->statusBar());
++    bar->setObjectName(QStringLiteral("AnthraciteStatusBar"));
++    bar->setResizeMode(QQuickWidget::SizeRootObjectToView);
++    bar->setFixedHeight(30);
++    bar->rootContext()->setContextProperty(QStringLiteral("chrome"), chrome);
++    bar->setSource(QUrl(QStringLiteral("qrc:/Anthracite/" ANTHRACITE_QML_VERSION "/qml/StatusBar.qml")));
++    // Keep native command hints, progress, and navigation. Only the duplicate
++    // coordinate/measurement label is replaced by the QML coordinate display.
++    for (auto* label : window->statusBar()->findChildren<QLabel*>(QString(), Qt::FindDirectChildrenOnly)) {
++        window->statusBar()->removeWidget(label);
++        if (label->objectName() == QStringLiteral("rightSideLabel")) label->hide();
++        else {
++            label->setMaximumWidth(260);
++            window->statusBar()->addWidget(label, 0);
++        }
++    }
++    window->statusBar()->insertPermanentWidget(0, bar, 1);
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Chrome.h
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#pragma once
++
++#include <QObject>
++#include <QPointer>
++#include <QString>
++
++class QDockWidget;
++class QQuickWidget;
++
++namespace AnthraciteGui {
++// Native application integration only; StatusBar.qml owns presentation.
++class Chrome: public QObject
++{
++    Q_OBJECT
++    Q_PROPERTY(QString latestMessage READ latestMessage NOTIFY changed)
++    Q_PROPERTY(QString coordinates READ coordinates NOTIFY changed)
++    Q_PROPERTY(QString coordinateSource READ coordinateSource NOTIFY changed)
++    Q_PROPERTY(bool chatVisible READ chatVisible NOTIFY changed)
++    Q_PROPERTY(bool chatFloating READ chatFloating NOTIFY changed)
++public:
++    explicit Chrome(QDockWidget* dock);
++    QString latestMessage() const { return latest; }
++    QString coordinates() const { return position; }
++    QString coordinateSource() const { return source; }
++    bool chatVisible() const;
++    bool chatFloating() const;
++    Q_INVOKABLE void toggleChat();
++    Q_INVOKABLE void toggleConsole();
++    Q_INVOKABLE void toggleFloating();
++Q_SIGNALS:
++    void changed();
++private:
++    void updatePosition();
++    void updateTitleBar();
++    QPointer<QDockWidget> chat;
++    QString latest;
++    QString position;
++    QString source;
++};
++void installChrome();
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Resources/qml/StatusBar.qml
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++import QtQuick 2.15
++import QtQuick.Controls 2.15
++import QtQuick.Layouts 1.15
++
++Rectangle {
++    color: palette.window
++    SystemPalette { id: palette }
++    RowLayout {
++        anchors.fill: parent
++        spacing: 8
++        ToolButton {
++            objectName: "AnthraciteConsoleToggle"
++            Layout.fillWidth: true
++            Layout.minimumWidth: 60
++            Layout.fillHeight: true
++            text: chrome.latestMessage
++            contentItem: Text { text: "›_  " + parent.text; color: palette.windowText; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; font.pixelSize: 12 }
++            onClicked: chrome.toggleConsole()
++            ToolTip.visible: hovered
++            ToolTip.text: chrome.latestMessage + "\n" + qsTr("Click to toggle the console")
++            Accessible.name: qsTr("Toggle console")
++        }
++        Label {
++            visible: parent.width > 640
++            text: chrome.coordinates
++            color: palette.windowText
++            font.pixelSize: 12
++            ToolTip.visible: coordinateHover.hovered
++            ToolTip.text: chrome.coordinateSource
++            HoverHandler { id: coordinateHover }
++        }
++        ToolButton {
++            objectName: "AnthraciteChatToggle"
++            Layout.fillHeight: true
++            text: qsTr("Chat")
++            checkable: true
++            checked: chrome.chatVisible
++            onClicked: chrome.toggleChat()
++            ToolTip.visible: hovered
++            ToolTip.text: qsTr("Show or hide agent chat · Right-click for docking")
++            contentItem: Text { text: parent.text; color: chrome.chatVisible ? "#FFFFFF" : palette.windowText; verticalAlignment: Text.AlignVCenter; font.pixelSize: 12 }
++            background: Rectangle { radius: 4; color: chrome.chatVisible ? palette.highlight : "transparent" }
++            TapHandler { acceptedButtons: Qt.RightButton; onTapped: dockMenu.popup() }
++            Menu {
++                id: dockMenu
++                MenuItem { text: chrome.chatFloating ? qsTr("Dock chat") : qsTr("Float chat"); onTriggered: chrome.toggleFloating() }
++            }
++        }
++    }
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Resources/overlay.qss
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++Gui--OverlayTabWidget, Gui--OverlayProxyWidget,
++QDockWidget, Gui--TreePanel, Gui--TreePanel QTreeView,
++Gui--PropertyEditor--PropertyEditor, QAbstractScrollArea,
++QAbstractScrollArea > QWidget, QTabWidget::pane {
++    background-color: transparent;
++    color: #E5E1DE;
++    border: none;
++}
++Gui--OverlayTabWidget {
++    qproperty-effectColor: #080808;
++    qproperty-effectBlurRadius: 0;
++    qproperty-effectOffsetX: 0;
++    qproperty-effectOffsetY: 0;
++    qproperty-effectWidth: 1;
++    qproperty-effectHeight: 1;
++    qproperty-enableEffect: 1;
++}
++Gui--OverlayTitleBar, Gui--OverlaySplitterHandle {
++    background-color: #080808;
++    color: #E5E1DE;
++}
++QAbstractItemView {
++    background-color: transparent;
++    alternate-background-color: transparent;
++    selection-background-color: #A06666;
++    selection-color: white;
++    color: #E5E1DE;
++    border: none;
++}
++QAbstractItemView::item:hover { background-color: rgba(160, 102, 102, 35); }
++QAbstractItemView::item:selected { background-color: #A06666; color: white; }
++QHeaderView::section { background-color: #080808; color: #E5E1DE; border: none; }
++QTabBar::tab { background-color: #080808; color: #E5E1DE; padding: 5px; }
++QTabBar::tab:selected { border-bottom: 2px solid #A06666; }
++QScrollBar { background-color: transparent; }
++Gui--OverlayToolButton[objectName="OBTN Overlay"] { qproperty-icon: url(qss:overlay/icons/overlay_light.svg); }
++Gui--OverlayToolButton[objectName="OBTN Transparent"] { qproperty-icon: url(qss:overlay/icons/transparent_light.svg); }
++Gui--OverlayToolButton[objectName="OBTN AutoMode"] { qproperty-icon: url(qss:overlay/icons/mode_light.svg); }

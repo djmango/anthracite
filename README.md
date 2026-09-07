@@ -126,6 +126,14 @@ to the application. Tests write rendered-frame acknowledgement samples to
 `build/test-results/interaction-latency.json`; these are not display-scanout measurements or a
 guarantee during blocking native CAD execution.
 
+The default palette uses `#080808` backgrounds and `#A06666` accents. The left tree/property
+panel defaults to FreeCAD's transparent overlay; this is initialized once, so later layout
+choices persist. The bottom bar shows the latest native console message (click to toggle the
+bottom-docked Report View), cursor XYZ in mm, and a Chat toggle. Coordinate tooltips distinguish
+surface hits from projection onto the view plane. Right-click Chat to float/dock it; the redundant
+title bar is hidden while docked. `UseAnthraciteTheme=false` in the Anthracite preference group
+disables the application palette override.
+
 Long prompts and individual work entries expand on demand. History arrives in 60-message pages,
 with work details in 20-entry pages and bounded render thumbnails. Paging changes only the chat
 view, never the CAD document or its undo history. Rust still reconstructs the conversation from
