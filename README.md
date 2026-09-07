@@ -134,9 +134,9 @@ surface hits from projection onto the view plane. The icon-only Chat toggle show
 right sidebar; chat cannot float or undock. `UseAnthraciteTheme=false` in the Anthracite preference group
 disables the application palette override.
 Native controls and the Start page share Anthracite's FreeCAD theme parameters, with flat dark
-surfaces. Icons use bundled, MIT-licensed Iconoir assets and an explicit command mapping;
-unmatched specialized CAD icons remain native. Phosphor is the fallback when a meaningful
-equivalent is missing from Iconoir. No icons are downloaded at runtime.
+surfaces. Existing FreeCAD UI keeps its native icons. Anthracite's added agent panel and
+status-bar controls use bundled, MIT-licensed Iconoir icons, even when FreeCAD has an
+equivalent. FreeCAD's icons are not overridden. No icons are downloaded at runtime.
 
 Long prompts and individual work entries expand on demand. History arrives in 60-message pages,
 with work details in 20-entry pages and bounded render thumbnails. Paging changes only the chat
