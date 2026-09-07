@@ -90,6 +90,15 @@ summary and picked point in mm. Stale references block sending until removed and
 the executor also rejects them if geometry changes later. Unsupported selections are reported,
 never guessed. Scroll up or expand a work summary to pause auto-scroll; **↓ Latest** resumes it.
 
+New turns leave room for the answer beneath your prompt. Reading older messages, expanding
+activity, and resizing the dock preserve your reading position. You can draft the next message
+while the agent works; Send waits for the current run to finish (no automatic queue or replay).
+Narrow docks collapse secondary controls under Settings. Message text is selectable and copyable;
+long prompts and individual work entries expand on demand. History arrives in 60-message pages,
+with work details in 20-entry pages and bounded render thumbnails. Paging changes only the chat
+view, never the CAD document or its undo history. Rust still reconstructs the conversation from
+stored events; this bounds UI transport/rendering, not database replay memory.
+
 Inside that tool, `cad.render_views()` attaches axonometric, front, right, and top
 PNG views for visual inspection. Pass a list such as `cad.render_views(["front", "rear"])`
 to choose up to six views. `cad.render(view="current")` captures just one.

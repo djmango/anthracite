@@ -1002,7 +1002,7 @@
 +tempfile = "3"
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/main.rs
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,255 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +mod composer;
@@ -1128,6 +1128,23 @@
 +                    payload.get("answers").unwrap_or(&Value::Null),
 +                )
 +            }),
++        "timeline.earlier" => provider
++            .as_ref()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .map(|provider| {
++                provider
++                    .emitter()
++                    .timeline_earlier(payload["before"].as_str().unwrap_or_default())
++            }),
++        "timeline.details" => provider
++            .as_ref()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .map(|provider| {
++                provider.emitter().timeline_details(
++                    payload["id"].as_str().unwrap_or_default(),
++                    payload["offset"].as_u64().unwrap_or_default() as usize,
++                )
++            }),
 +        "draft.save" => provider
 +            .as_mut()
 +            .ok_or_else(|| "Provider is not running.".to_string())
@@ -1156,7 +1173,9 @@
 +
 +    if let Err(error) = result {
 +        if let Some(provider) = provider {
-+            provider.emitter().emit("runtime.error", serde_json::json!({"message": error}));
++            provider
++                .emitter()
++                .emit("runtime.error", serde_json::json!({"message": error}));
 +        } else {
 +            protocol::emit_error(error);
 +        }
@@ -1205,7 +1224,9 @@
 +                    if let Some(provider) = &mut provider
 +                        && let Err(error) = provider.handle_message(message)
 +                    {
-+                        provider.emitter().emit("runtime.error", serde_json::json!({"message": error}));
++                        provider
++                            .emitter()
++                            .emit("runtime.error", serde_json::json!({"message": error}));
 +                    }
 +                }
 +                Err(error) => protocol::emit_error(format!("Invalid provider JSON: {error}")),
@@ -1218,7 +1239,10 @@
 +            IoEvent::ProviderError(line) => eprintln!("provider: {line}"),
 +            IoEvent::ProviderClosed => {
 +                if let Some(provider) = &provider {
-+                    provider.emitter().emit("runtime.error", serde_json::json!({"message": "Provider process closed its output."}));
++                    provider.emitter().emit(
++                        "runtime.error",
++                        serde_json::json!({"message": "Provider process closed its output."}),
++                    );
 +                }
 +                provider = None;
 +            }
@@ -1226,7 +1250,9 @@
 +                if let Some(provider) = &mut provider
 +                    && let Err(error) = provider.handle_mcp_message(message, response)
 +                {
-+                    provider.emitter().emit("runtime.error", serde_json::json!({"message": error}));
++                    provider
++                        .emitter()
++                        .emit("runtime.error", serde_json::json!({"message": error}));
 +                }
 +            }
 +        }
@@ -1603,7 +1629,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/protocol.rs
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,274 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use serde_json::{Value, json};
@@ -1615,8 +1641,12 @@
 +use crate::timeline::Timeline;
 +
 +fn timestamped(mut payload: Value) -> Value {
-+    payload["timestampMs"] = json!(std::time::SystemTime::now()
-+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64);
++    payload["timestampMs"] = json!(
++        std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .unwrap_or_default()
++            .as_millis() as u64
++    );
 +    payload
 +}
 +
@@ -1674,9 +1704,12 @@
 +            Ok(events) => {
 +                let mut timeline = emitter.timeline.borrow_mut();
 +                for event in events {
-+                    timeline.apply(event["type"].as_str().unwrap_or_default(), &event["payload"]);
++                    timeline.apply(
++                        event["type"].as_str().unwrap_or_default(),
++                        &event["payload"],
++                    );
 +                }
-+                emit_raw("timeline.edit", timeline.snapshot());
++                emit_raw("timeline.edit", Timeline::transport(timeline.snapshot()));
 +            }
 +            Err(error) => emit_warning(format!("Could not load conversation history: {error}")),
 +        }
@@ -1750,8 +1783,19 @@
 +
 +    fn project_timeline(&self, message_type: &str, payload: &Value) {
 +        for edit in self.timeline.borrow_mut().apply(message_type, payload) {
-+            emit_raw("timeline.edit", edit);
++            emit_raw("timeline.edit", Timeline::transport(edit));
 +        }
++    }
++
++    pub fn timeline_earlier(&self, before: &str) {
++        emit_raw(
++            "timeline.edit",
++            Timeline::transport(self.timeline.borrow().earlier(before)),
++        );
++    }
++
++    pub fn timeline_details(&self, id: &str, offset: usize) {
++        emit_raw("timeline.edit", self.timeline.borrow().details(id, offset));
 +    }
 +
 +    pub fn emit(&self, message_type: &str, payload: Value) {
@@ -3514,7 +3558,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/timeline.rs
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,493 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +//! Provider-independent conversation projection. Qt only applies these row edits.
@@ -3537,7 +3581,53 @@
 +
 +impl Timeline {
 +    pub fn snapshot(&self) -> Value {
-+        json!({"op": "reset", "rows": self.rows})
++        let start = self.rows.len().saturating_sub(60);
++        json!({"op": "reset", "rows": self.rows[start..], "hasEarlier": start > 0})
++    }
++
++    pub fn earlier(&self, before: &str) -> Value {
++        let end = self
++            .rows
++            .iter()
++            .position(|row| row["id"] == before)
++            .unwrap_or(0);
++        let start = end.saturating_sub(60);
++        json!({"op":"prepend", "rows":self.rows[start..end], "hasEarlier":start > 0})
++    }
++
++    pub fn details(&self, id: &str, offset: usize) -> Value {
++        let entries = self
++            .rows
++            .iter()
++            .find(|row| row["id"] == id)
++            .and_then(|row| row["entries"].as_array());
++        let page: Vec<_> = entries
++            .into_iter()
++            .flatten()
++            .skip(offset)
++            .take(20)
++            .cloned()
++            .collect();
++        json!({"op":"details", "id":id, "offset":offset, "entries":page})
++    }
++
++    /// Work details (especially render bytes) cross the UI boundary only on demand.
++    pub fn transport(mut edit: Value) -> Value {
++        fn compact(row: &mut Value) {
++            if row["kind"] == "work" {
++                row["entryCount"] = json!(row["entries"].as_array().map_or(0, Vec::len));
++                row["entries"] = json!([]);
++            }
++        }
++        if let Some(rows) = edit["rows"].as_array_mut() {
++            for row in rows {
++                compact(row);
++            }
++        }
++        if let Some(row) = edit.get_mut("row") {
++            compact(row);
++        }
++        edit
 +    }
 +
 +    fn append(
@@ -3550,6 +3640,16 @@
 +        self.next_id += 1;
 +        let row = json!({"id": self.next_id.to_string(), "author": author,
 +                         "body": body.into(), "kind": kind, "entries": []});
++        let mut row = row;
++        row["title"] = json!(
++            text(&row, "body")
++                .lines()
++                .next()
++                .unwrap_or(author)
++                .chars()
++                .take(120)
++                .collect::<String>()
++        );
 +        self.rows.push(row.clone());
 +        edits.push(json!({"op": "append", "row": row}));
 +    }
@@ -3612,6 +3712,10 @@
 +                self.append("You", text(payload, "text"), "user", &mut edits);
 +                if let Some(attachments) = payload["attachments"].as_array() {
 +                    for attachment in attachments {
++                        // CAD references already appear as inline tokens in the user message.
++                        if attachment["type"] == "cad" {
++                            continue;
++                        }
 +                        let image = attachment["type"] == "image";
 +                        self.append(
 +                            &text(attachment, "name"),
@@ -3664,14 +3768,32 @@
 +                    "activity",
 +                    &mut edits,
 +                );
++                self.rows.last_mut().unwrap()["content"] =
++                    json!(text(&payload["arguments"], "code"));
++                edits.last_mut().unwrap()["row"] = self.rows.last().unwrap().clone();
 +            }
 +            "tool.observation" => {
++                let result = text(payload, "result");
++                let title = match serde_json::from_str::<Value>(&result) {
++                    Ok(value) if value["ok"] == true => "FreeCAD result · passed execution checks",
++                    Ok(value) if value["rolledBack"] == true => "FreeCAD result · rolled back",
++                    Ok(value) if value["ok"] == false => {
++                        "FreeCAD result · failed — inspect details"
++                    }
++                    _ => "FreeCAD result",
++                };
 +                self.append(
 +                    "Activity",
-+                    format!("FreeCAD result\n{}", text(payload, "result")),
++                    format!("{title}\n{result}"),
 +                    "activity",
 +                    &mut edits,
 +                );
++                self.rows.last_mut().unwrap()["content"] = json!(
++                    serde_json::from_str::<Value>(&result)
++                        .map(|value| serde_json::to_string_pretty(&value).unwrap())
++                        .unwrap_or(result)
++                );
++                edits.last_mut().unwrap()["row"] = self.rows.last().unwrap().clone();
 +                if let Some(images) = payload["images"].as_array() {
 +                    for image in images {
 +                        self.append(
@@ -3771,6 +3893,65 @@
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
++
++    #[test]
++    fn cad_details_copy_exact_python_and_readable_json_without_display_labels() {
++        let mut timeline = Timeline::default();
++        let source = "cad.action('Resize')\ndoc.getObject('Pad').Length = 12";
++        timeline.apply("tool.activity", &json!({"arguments":{"code":source}}));
++        assert_eq!(timeline.rows[0]["content"], source);
++        timeline.apply(
++            "tool.observation",
++            &json!({"result":"{\"ok\":false,\"rolledBack\":true}"}),
++        );
++        assert_eq!(timeline.rows[1]["title"], "FreeCAD result · rolled back");
++        assert_eq!(
++            serde_json::from_str::<Value>(timeline.rows[1]["content"].as_str().unwrap()).unwrap(),
++            json!({"ok":false,"rolledBack":true})
++        );
++    }
++
++    #[test]
++    fn history_and_work_details_are_bounded_and_read_only() {
++        let mut timeline = Timeline::default();
++        for _ in 0..75 {
++            timeline.apply("content.user", &json!({"text":"Inspect"}));
++            for _ in 0..25 {
++                timeline.apply(
++                    "tool.observation",
++                    &json!({"result":"ok", "images":["large-image-bytes"]}),
++                );
++            }
++            timeline.apply("turn.completed", &json!({"status":"completed"}));
++        }
++        let snapshot = timeline.snapshot();
++        assert_eq!(snapshot["rows"].as_array().unwrap().len(), 60);
++        assert_eq!(snapshot["hasEarlier"], true);
++        let compact = Timeline::transport(snapshot.clone());
++        assert!(!compact.to_string().contains("large-image-bytes"));
++        let before = compact["rows"][0]["id"].as_str().unwrap();
++        let page = timeline.earlier(before);
++        assert_eq!(page["rows"].as_array().unwrap().len(), 60);
++        assert_eq!(timeline.earlier("missing")["hasEarlier"], false);
++        let work = compact["rows"][1]["id"].as_str().unwrap();
++        assert_eq!(compact["rows"][1]["entryCount"], 50);
++        assert_eq!(
++            timeline.details(work, 0)["entries"]
++                .as_array()
++                .unwrap()
++                .len(),
++            20
++        );
++        assert_eq!(
++            timeline.details(work, 40)["entries"]
++                .as_array()
++                .unwrap()
++                .len(),
++            10
++        );
++        assert_eq!(timeline.details(work, usize::MAX)["entries"], json!([]));
++        assert_eq!(timeline.snapshot(), snapshot);
++    }
 +
 +    #[test]
 +    fn groups_only_last_message_and_preserves_images_and_exact_elapsed_time() {

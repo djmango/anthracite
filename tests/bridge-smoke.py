@@ -103,6 +103,15 @@ try:
     saved_thread = ""
     saved_work = None
     saved_attachments = None
+    drafted_while_running = False
+    def prepare_followup():
+        global drafted_while_running
+        if controller.property('busy') and not controller.property('submitting') and not drafted_while_running:
+            composer = quick.rootObject().findChild(QtCore.QObject, 'AnthraciteComposer')
+            assert composer.property('enabled'), 'Composer is disabled during execution'
+            controller.setDraft('Next: make the wall thinner')
+            drafted_while_running = True
+    controller.busyChanged.connect(prepare_followup)
     journal = Path(os.environ["XDG_STATE_HOME"]) / "anthracite/anthracite.events.jsonl"
 
     def check_result():
@@ -171,14 +180,9 @@ try:
             user_images = [row['body'] for row in rows if row['kind'] == 'image']
             assert user_images == [saved_attachments[0]['dataUrl']], 'Input images lost in live/replayed timeline'
             assert work[0]['body'] == 'Created the editable box.', work
+            assert drafted_while_running, 'No editable composer during the run'
+            assert controller.property('draft') == 'Next: make the wall thinner', 'Run completion or replay erased the next draft'
             assert work[0]['author'].startswith('Worked for ') and work[0]['author'].endswith('s'), work
-            entries = work[0]['entries']
-            assert any(entry['body'] == 'Intermediate update: checking the box.' for entry in entries)
-            assert any(entry['body'].startswith('freecad\n') for entry in entries)
-            images = [entry['body'] for entry in entries if entry['kind'] == 'image']
-            observations = [record['payload'] for record in map(json.loads, lines)
-                            if record['type'] == 'tool.observation']
-            assert len(images) == 4 and images == observations[0]['images']
             def visual_items(item):
                 yield item
                 for child in item.childItems():
@@ -188,15 +192,28 @@ try:
             if not summaries:
                 return
             if not expanded:
+                assert not work[0]['entries'], 'Collapsed work eagerly transported its images'
                 assert not summaries[0].property('activityExpanded')
-                summaries[0].setProperty('activityExpanded', True)
+                summaries[0].toggleWork()
                 expanded = True
                 return
+            entries = work[0]['entries']
+            if len(entries) < work[0]['entryCount']:
+                model.loadDetails(work[0]['entryId'])
+                return
+            assert any(entry['body'] == 'Intermediate update: checking the box.' for entry in entries)
+            assert any(entry['body'].startswith('freecad\n') for entry in entries)
+            images = [entry['body'] for entry in entries if entry['kind'] == 'image']
+            observations = [record['payload'] for record in map(json.loads, lines)
+                            if record['type'] == 'tool.observation']
+            assert len(images) == 4 and images == observations[0]['images']
             rendered = [item for item in items if item.objectName() == 'workImage'
                         and item.property('source').toString()]
             assert len(rendered) == 4, [(item.property('source').toString()[:40], item.property('visible')) for item in rendered]
             assert [item.property('source').toString() for item in rendered] == images
             assert all(item.property('height') > 0 for item in rendered)
+            capture = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/thread-expanded.png'
+            assert dock.grab().save(str(capture))
             if replay_phase == "live":
                 saved_thread = controller.property("currentThreadId")
                 saved_work = work[0]

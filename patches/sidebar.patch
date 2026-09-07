@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
-@@ -0,0 +1,893 @@
+@@ -0,0 +1,901 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "AgentBridge.h"
@@ -66,6 +66,14 @@
 +    , sidebar(controller)
 +{
 +    connect(sidebar, &SidebarController::promptSubmitted, this, &AgentBridge::submit);
++    connect(qobject_cast<ConversationModel*>(sidebar->messages()), &ConversationModel::earlierRequested,
++            this, [this](const QString& before) {
++                send(QStringLiteral("timeline.earlier"), {{"before", before}});
++            });
++    connect(qobject_cast<ConversationModel*>(sidebar->messages()), &ConversationModel::detailsRequested,
++            this, [this](const QString& id, int offset) {
++                send(QStringLiteral("timeline.details"), {{"id", id}, {"offset", offset}});
++            });
 +    connect(sidebar, &SidebarController::stopRequested, this, &AgentBridge::stop);
 +    connect(sidebar, &SidebarController::chooseProviderRequested, this, &AgentBridge::chooseProvider);
 +    connect(sidebar, &SidebarController::providerSelected, this, &AgentBridge::selectProvider);
@@ -1073,7 +1081,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,108 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +find_package(
@@ -1123,10 +1131,18 @@
 +
 +add_custom_target(AnthraciteRuntime ALL DEPENDS ${AnthraciteRuntime_BINARY})
 +
-+qt_add_resources(
-+    AnthraciteGui_QRC
-+    Resources/Anthracite.qrc
-+)
++# Content-address the resource path, not a URL query (Qt's disk-cache key strips
++# queries). Fixed RCC timestamps must never reuse a previous component definition.
++set(AnthraciteQml_FINGERPRINT "")
++foreach(component Main TranscriptText ActivityEntry)
++    set(qml_file ${CMAKE_CURRENT_SOURCE_DIR}/Resources/qml/${component}.qml)
++    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${qml_file})
++    file(SHA256 ${qml_file} qml_hash)
++    string(APPEND AnthraciteQml_FINGERPRINT ${qml_hash})
++endforeach()
++string(SHA256 AnthraciteQml_VERSION ${AnthraciteQml_FINGERPRINT})
++configure_file(Resources/Anthracite.qrc ${CMAKE_CURRENT_BINARY_DIR}/Anthracite.qrc @ONLY)
++qt_add_resources(AnthraciteGui_QRC ${CMAKE_CURRENT_BINARY_DIR}/Anthracite.qrc)
 +
 +set(AnthraciteGui_SRCS
 +    ${AnthraciteGui_QRC}
@@ -1142,6 +1158,7 @@
 +)
 +
 +add_library(AnthraciteGui SHARED ${AnthraciteGui_SRCS})
++target_compile_definitions(AnthraciteGui PRIVATE ANTHRACITE_QML_VERSION="${AnthraciteQml_VERSION}")
 +add_dependencies(AnthraciteGui AnthraciteRuntime)
 +
 +target_include_directories(
@@ -1240,10 +1257,11 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/ConversationModel.cpp
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,138 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "ConversationModel.h"
++#include <QUuid>
 +
 +using namespace AnthraciteGui;
 +
@@ -1261,17 +1279,54 @@
 +    if (!index.isValid() || index.row() < 0 || index.row() >= rowCount()) {
 +        return {};
 +    }
-+    return messages[index.row()].value(QString::fromLatin1(roleNames().value(role)));
++    return messages[index.row()].value(role == IdRole ? QStringLiteral("id")
++        : QString::fromLatin1(roleNames().value(role)));
 +}
 +
 +QHash<int, QByteArray> ConversationModel::roleNames() const
 +{
-+    return {{AuthorRole, "author"}, {BodyRole, "body"}, {KindRole, "kind"}, {EntriesRole, "entries"}};
++    return {{AuthorRole, "author"}, {BodyRole, "body"}, {KindRole, "kind"},
++            {EntriesRole, "entries"}, {IdRole, "entryId"}, {TitleRole, "title"},
++            {EntryCountRole, "entryCount"}, {ContentRole, "content"}};
++}
++
++int ConversationModel::indexOfId(const QString& id) const
++{
++    for (int row = 0; row < rowCount(); ++row)
++        if (messages[row].value("id").toString() == id) return row;
++    return -1;
++}
++
++QString ConversationModel::idAt(int row) const
++{
++    return row >= 0 && row < rowCount() ? messages[row].value("id").toString() : QString();
++}
++
++QString ConversationModel::kindAt(int row) const
++{
++    return row >= 0 && row < rowCount() ? messages[row].value("kind").toString() : QString();
++}
++
++void ConversationModel::loadEarlier()
++{
++    if (!earlier || messages.empty()) return;
++    earlier = false;
++    Q_EMIT historyChanged();
++    Q_EMIT earlierRequested(idAt(0));
++}
++
++void ConversationModel::loadDetails(const QString& id)
++{
++    const int row = indexOfId(id);
++    if (row < 0) return;
++    Q_EMIT detailsRequested(id, messages[row].value("entries").toList().size());
 +}
 +
 +void ConversationModel::append(QString author, QString body, QString kind)
 +{
-+    apply({{"op", "append"}, {"row", QVariantMap {{"author", author}, {"body", body}, {"kind", kind}}}});
++    apply({{"op", "append"}, {"row", QVariantMap {{"id", QUuid::createUuid().toString()},
++        {"author", author}, {"body", body}, {"kind", kind}, {"title", author},
++        {"entries", QVariantList()}, {"entryCount", 0}}}});
 +}
 +
 +void ConversationModel::clear()
@@ -1283,6 +1338,10 @@
 +{
 +    // Generic row transport only. Message/run semantics belong to the Rust runtime.
 +    const QString operation = edit.value("op").toString();
++    if (edit.contains("hasEarlier") || operation == QLatin1String("reset")) {
++        earlier = edit.value("hasEarlier").toBool();
++        Q_EMIT historyChanged();
++    }
 +    if (operation == QLatin1String("reset")) {
 +        beginResetModel();
 +        messages.clear();
@@ -1290,6 +1349,25 @@
 +            messages.push_back(row.toMap());
 +        }
 +        endResetModel();
++    }
++    else if (operation == QLatin1String("prepend")) {
++        const auto rows = edit.value("rows").toList();
++        if (rows.isEmpty()) return;
++        beginInsertRows({}, 0, rows.size() - 1);
++        std::vector<QVariantMap> prefix;
++        for (const auto& row : rows) prefix.push_back(row.toMap());
++        messages.insert(messages.begin(), prefix.begin(), prefix.end());
++        endInsertRows();
++    }
++    else if (operation == QLatin1String("details")) {
++        const int row = indexOfId(edit.value("id").toString());
++        if (row < 0) return;
++        auto entries = messages[row].value("entries").toList();
++        // Duplicate or stale page responses must not duplicate activity.
++        if (entries.size() != edit.value("offset").toInt()) return;
++        entries.append(edit.value("entries").toList());
++        messages[row]["entries"] = entries;
++        Q_EMIT dataChanged(index(row), index(row), {EntriesRole});
 +    }
 +    else if (operation == QLatin1String("append")) {
 +        const int row = rowCount();
@@ -1320,7 +1398,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/ConversationModel.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,58 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_CONVERSATIONMODEL_H
@@ -1336,6 +1414,7 @@
 +class ConversationModel: public QAbstractListModel
 +{
 +    Q_OBJECT
++    Q_PROPERTY(bool hasEarlier READ hasEarlier NOTIFY historyChanged)
 +
 +public:
 +    enum Role
@@ -1343,7 +1422,11 @@
 +        AuthorRole = Qt::UserRole + 1,
 +        BodyRole,
 +        KindRole,
-+        EntriesRole
++        EntriesRole,
++        IdRole,
++        TitleRole,
++        EntryCountRole,
++        ContentRole
 +    };
 +
 +    explicit ConversationModel(QObject* parent = nullptr);
@@ -1354,36 +1437,58 @@
 +
 +    void append(QString author, QString body, QString kind);
 +    void clear();
-+    void apply(const QVariantMap& edit);
++    Q_INVOKABLE void apply(const QVariantMap& edit);
++    bool hasEarlier() const { return earlier; }
++    Q_INVOKABLE int indexOfId(const QString& id) const;
++    Q_INVOKABLE QString idAt(int row) const;
++    Q_INVOKABLE QString kindAt(int row) const;
++    Q_INVOKABLE void loadEarlier();
++    Q_INVOKABLE void loadDetails(const QString& id);
++
++Q_SIGNALS:
++    void historyChanged();
++    void earlierRequested(const QString& before);
++    void detailsRequested(const QString& id, int offset);
 +
 +private:
 +    std::vector<QVariantMap> messages;
++    bool earlier = false;
 +};
 +}  // namespace AnthraciteGui
 +
 +#endif  // ANTHRACITEGUI_CONVERSATIONMODEL_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc
-@@ -0,0 +1,6 @@
+@@ -0,0 +1,13 @@
 +<!DOCTYPE RCC>
 +<RCC version="1.0">
 +    <qresource prefix="/Anthracite">
-+        <file>qml/Main.qml</file>
++        <file alias="qml/Main.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Main.qml</file>
++        <file alias="qml/TranscriptText.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptText.qml</file>
++        <file alias="qml/ActivityEntry.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ActivityEntry.qml</file>
++    </qresource>
++    <qresource prefix="/Anthracite/@AnthraciteQml_VERSION@">
++        <file alias="qml/Main.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Main.qml</file>
++        <file alias="qml/TranscriptText.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptText.qml</file>
++        <file alias="qml/ActivityEntry.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ActivityEntry.qml</file>
 +    </qresource>
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,792 @@
+@@ -0,0 +1,912 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
 +import QtQuick.Layouts 1.15
++import "qrc:/Anthracite/qml" as Transcript
 +
 +Pane {
 +    id: root
 +
 +    padding: 0
++    property bool compact: width < 440
++    property bool settingsExpanded: false
 +
 +    Popup {
 +        id: imagePreview
@@ -1519,6 +1624,7 @@
 +
 +        ListView {
 +            id: timeline
++            objectName: "AnthraciteTimeline"
 +            Layout.fillWidth: true
 +            Layout.fillHeight: true
 +            Layout.margins: 10
@@ -1526,25 +1632,144 @@
 +            clip: true
 +            model: anthraciteController.messages
 +
-+            property bool followOutput: true
-+            onMovementStarted: followOutput = false
-+            onMovementEnded: followOutput = atYEnd
-+            onCountChanged: if (followOutput) Qt.callLater(positionViewAtEnd)
-+            onContentHeightChanged: if (followOutput) Qt.callLater(positionViewAtEnd)
++            // Only user navigation changes intent. Geometry changes preserve an anchor.
++            property string scrollMode: "following"
++            property bool followOutput: scrollMode !== "reading"
++            property string anchorId: ""
++            property real anchorOffset: 0
++            property string newTurnId: ""
++            property bool pendingTurn: false
++            property bool settling: false
++            property var expandedRows: ({})
++            property var expandedEntries: ({})
++            cacheBuffer: 240
 +
++            function remember() {
++                if (settling || moving) return
++                const row = indexAt(1, contentY + 2)
++                const item = itemAtIndex(row)
++                if (item) { anchorId = item.rowId; anchorOffset = item.y - contentY }
++            }
++            function pauseAt(item) {
++                scrollMode = "reading"
++                pendingTurn = false
++                anchorId = item.rowId
++                anchorOffset = item.y - contentY
++            }
++            function toggleEntry(id) {
++                const state = Object.assign({}, expandedEntries)
++                state[id] = !state[id]
++                expandedEntries = state
++            }
++            function navigate() {
++                scrollMode = "reading"
++                pendingTurn = false
++                // Keep the reserved space during a gesture; removing it clamps the viewport.
++                settle.stop()
++            }
++            function latest() {
++                scrollMode = "following"
++                newTurnId = ""
++                positionViewAtEnd()
++            }
++            function schedule() { if (!moving) settle.restart() }
++            function reconcile() {
++                if (moving) return
++                settling = true
++                if (scrollMode === "following") {
++                    positionViewAtEnd()
++                } else if (scrollMode === "new-turn") {
++                    const row = model.indexOfId(newTurnId)
++                    if (row >= 0) {
++                        positionViewAtIndex(row, ListView.Beginning)
++                        // Keep the prompt at the top until the answer outgrows the viewport.
++                        const last = itemAtIndex(count - 1)
++                        if (!last) positionViewAtIndex(count - 1, ListView.End)
++                        else if (last.y + last.height > contentY + height)
++                            contentY = last.y + last.height - height
++                    }
++                } else if (anchorId.length) {
++                    const row = model.indexOfId(anchorId)
++                    if (row >= 0) {
++                        positionViewAtIndex(row, ListView.Visible)
++                        const item = itemAtIndex(row)
++                        if (item) contentY = item.y - anchorOffset
++                    }
++                }
++                settling = false
++                remember()
++            }
++            onMovementStarted: navigate()
++            onMovementEnded: {
++                if (atYEnd) { newTurnId = ""; scrollMode = "following" }
++                remember()
++            }
++            onContentHeightChanged: schedule()
++            onHeightChanged: schedule()
++            onWidthChanged: schedule()
++            onCountChanged: schedule()
++            Timer { id: settle; interval: 16; onTriggered: timeline.reconcile() }
++            Timer {
++                id: latestDelay
++                interval: 150
++                running: timeline.scrollMode === "reading" && !timeline.atYEnd
++            }
++            WheelHandler {
++                onWheel: function(event) { timeline.navigate(); event.accepted = false }
++            }
++            Keys.onPressed: function(event) {
++                if ([Qt.Key_Up, Qt.Key_Down, Qt.Key_PageUp, Qt.Key_PageDown,
++                     Qt.Key_Home, Qt.Key_End].indexOf(event.key) >= 0) timeline.navigate()
++            }
++            Connections {
++                target: anthraciteController.messages
++                function onRowsInserted(parent, first, last) {
++                    if (timeline.pendingTurn && anthraciteController.messages.kindAt(last) === "user") {
++                        timeline.newTurnId = anthraciteController.messages.idAt(last)
++                        timeline.pendingTurn = false
++                        timeline.scrollMode = "new-turn"
++                    }
++                }
++                function onModelReset() {
++                    timeline.anchorId = ""
++                    timeline.expandedRows = ({})
++                    timeline.expandedEntries = ({})
++                    timeline.latest()
++                }
++            }
++            header: Button {
++                objectName: "loadEarlier"
++                visible: anthraciteController.messages.hasEarlier
++                height: visible ? implicitHeight : 0
++                text: qsTr("Load earlier messages")
++                onClicked: { timeline.navigate(); timeline.remember(); anthraciteController.messages.loadEarlier() }
++            }
++            footer: Item {
++                // Retain end space while reading: removing it would clamp the scroll position.
++                height: timeline.newTurnId.length ? Math.max(0, timeline.height - 80) : 0
++            }
 +            ToolButton {
 +                anchors.right: parent.right
 +                anchors.bottom: parent.bottom
 +                z: 2
-+                visible: !timeline.followOutput && !timeline.atYEnd
++                visible: timeline.scrollMode === "reading" && !timeline.atYEnd && !latestDelay.running
 +                text: qsTr("↓ Latest")
-+                onClicked: { timeline.followOutput = true; timeline.positionViewAtEnd() }
++                onClicked: timeline.latest()
 +            }
 +
 +            delegate: Item {
++                id: timelineRow
++                property string rowId: entryId || ""
 +                objectName: isWork ? "workSummary" : "timelineEntry"
-+                property bool activityExpanded: false
-+                onActivityExpandedChanged: if (activityExpanded) timeline.followOutput = false
++                property bool activityExpanded: timeline.expandedRows[rowId] || false
++                function toggleWork() {
++                    timeline.pauseAt(timelineRow)
++                    if (!activityExpanded && entries.length === 0 && entryCount > 0)
++                        anthraciteController.messages.loadDetails(rowId)
++                    const state = Object.assign({}, timeline.expandedRows)
++                    state[rowId] = !activityExpanded
++                    timeline.expandedRows = state
++                }
 +                property bool isActivity: kind === "activity"
 +                property bool isWork: kind === "work"
 +
@@ -1576,7 +1801,7 @@
 +
 +                        Label {
 +                            visible: !isActivity && !isWork
-+                            text: author
++                            text: author || ""
 +                            font.pixelSize: 11
 +                            font.weight: Font.DemiBold
 +                            color: systemPalette.windowText
@@ -1592,42 +1817,25 @@
 +                            MouseArea {
 +                                anchors.fill: parent
 +                                cursorShape: Qt.PointingHandCursor
-+                                onClicked: activityExpanded = !activityExpanded
++                                onClicked: timelineRow.toggleWork()
 +                            }
 +                        }
 +
 +                        Repeater {
 +                            model: isWork && activityExpanded ? entries : []
-+                            delegate: Column {
++                            delegate: Transcript.ActivityEntry {
 +                                width: messageColumn.width
-+                                spacing: 5
-+                                Label {
-+                                    width: parent.width
-+                                    text: modelData.author
-+                                    opacity: 0.65
-+                                    color: systemPalette.windowText
-+                                }
-+                                Label {
-+                                    visible: modelData.kind !== "image"
-+                                    width: parent.width
-+                                    text: visible ? modelData.body : ""
-+                                    wrapMode: Text.Wrap
-+                                    textFormat: Text.PlainText
-+                                    color: systemPalette.windowText
-+                                }
-+                                Image {
-+                                    objectName: "workImage"
-+                                    visible: modelData.kind === "image"
-+                                    width: parent.width
-+                                    height: visible && sourceSize.width > 0 ? width * sourceSize.height / sourceSize.width : 0
-+                                    source: visible ? modelData.body : ""
-+                                    fillMode: Image.PreserveAspectFit
-+                                    MouseArea {
-+                                        anchors.fill: parent
-+                                        onClicked: { imagePreview.imageSource = parent.source; imagePreview.open() }
-+                                    }
-+                                }
++                                entry: modelData
++                                expanded: timeline.expandedEntries[modelData.id] || false
++                                onToggle: timeline.toggleEntry(modelData.id)
++                                onResizing: timeline.pauseAt(timelineRow)
++                                onPreview: function(source) { imagePreview.imageSource = source; imagePreview.open() }
 +                            }
++                        }
++                        Button {
++                            visible: isWork && activityExpanded && entryCount > entries.length
++                            text: qsTr("Show more activity")
++                            onClicked: { timeline.pauseAt(timelineRow); anthraciteController.messages.loadDetails(rowId) }
 +                        }
 +
 +                        Rectangle {
@@ -1642,7 +1850,10 @@
 +                            objectName: "chatImage"
 +                            visible: kind === "image"
 +                            width: parent.width
-+                            height: visible && sourceSize.width > 0 ? width * sourceSize.height / sourceSize.width : 0
++                            height: visible ? Math.min(180, width * 0.75) : 0
++                            sourceSize.width: 480
++                            sourceSize.height: 360
++                            asynchronous: true
 +                            source: visible ? body : ""
 +                            fillMode: Image.PreserveAspectFit
 +                            MouseArea {
@@ -1651,25 +1862,24 @@
 +                            }
 +                        }
 +
-+                        Label {
-+                            visible: kind !== "image" && body.length > 0
++                        Transcript.ActivityEntry {
++                            visible: isActivity
 +                            width: parent.width
-+                            text: kind === "image" ? "" : isActivity ? (activityExpanded ? "⌄  " : "›  ") + body : body
-+                            wrapMode: Text.Wrap
-+                            maximumLineCount: isActivity && !activityExpanded ? 1 : 1000
-+                            elide: isActivity && !activityExpanded ? Text.ElideRight : Text.ElideNone
-+                            textFormat: kind === "assistant" || isWork ? Text.MarkdownText : Text.PlainText
-+                            color: systemPalette.windowText
-+                            opacity: isActivity ? 0.78 : 1.0
++                            entry: ({kind: kind, title: title, author: author, body: body, content: model.content})
++                            expanded: timeline.expandedEntries[rowId] || false
++                            onToggle: timeline.toggleEntry(rowId)
++                            onResizing: timeline.pauseAt(timelineRow)
++                        }
++                        Transcript.TranscriptText {
++                            visible: !isActivity && kind !== "image" && body.length > 0
++                            width: parent.width
++                            body: visible ? model.body : ""
++                            markdown: kind === "assistant" || isWork
++                            foldLong: kind === "user"
++                            onResizing: timeline.pauseAt(timelineRow)
 +                        }
 +                    }
 +
-+                    MouseArea {
-+                        anchors.fill: parent
-+                        visible: isActivity
-+                        cursorShape: Qt.PointingHandCursor
-+                        onClicked: activityExpanded = !activityExpanded
-+                    }
 +                }
 +            }
 +
@@ -1963,7 +2173,7 @@
 +                    wrapMode: TextEdit.Wrap
 +                    textFormat: TextEdit.RichText
 +                    persistentSelection: true
-+                    enabled: !anthraciteController.busy
++                    enabled: !anthraciteController.submitting
 +                    Component.onCompleted: anthraciteController.bindComposer(textDocument)
 +                    onSelectionStartChanged: anthraciteController.setComposerSelection(selectionStart, selectionEnd)
 +                    onSelectionEndChanged: anthraciteController.setComposerSelection(selectionStart, selectionEnd)
@@ -1999,11 +2209,12 @@
 +                    }
 +                }
 +
-+                RowLayout {
++                GridLayout {
 +                    id: modelControls
++                    columns: root.compact ? 1 : 3
 +                    objectName: "AnthraciteModelControls"
-+                    visible: anthraciteController.modelControlsAvailable
-+                             || anthraciteController.usageVisible
++                    visible: (!root.compact || root.settingsExpanded) && (anthraciteController.modelControlsAvailable
++                             || anthraciteController.usageVisible)
 +                    Layout.fillWidth: true
 +
 +                    ComboBox {
@@ -2105,10 +2316,12 @@
 +                }
 +
 +                RowLayout {
++                    visible: !root.compact || root.settingsExpanded
 +                    Layout.fillWidth: true
 +
 +                    ComboBox {
 +                        id: providerPicker
++                        Layout.fillWidth: true
 +                        objectName: "AnthraciteProviderPicker"
 +                        Layout.preferredWidth: Math.max(105, implicitWidth)
 +                        model: anthraciteController.providers
@@ -2134,7 +2347,16 @@
 +                        flat: true
 +                        onClicked: anthraciteController.chooseProvider()
 +                    }
++                }
 +
++                RowLayout {
++                    Layout.fillWidth: true
++                    ToolButton {
++                        objectName: "compactSettings"
++                        visible: root.compact
++                        text: qsTr("Settings")
++                        onClicked: root.settingsExpanded = !root.settingsExpanded
++                    }
 +                    Item {
 +                        Layout.fillWidth: true
 +                    }
@@ -2162,13 +2384,13 @@
 +        if ((text.length === 0 && anthraciteController.attachments.length === 0) || anthraciteController.busy) {
 +            return
 +        }
-+        timeline.followOutput = true
++        timeline.pendingTurn = true
 +        anthraciteController.submit(text)
 +    }
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,910 @@
+@@ -0,0 +1,941 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "Sidebar.h"
@@ -2178,6 +2400,7 @@
 +#include <QDockWidget>
 +#include <QApplication>
 +#include <QClipboard>
++#include <QQmlAbstractUrlInterceptor>
 +#include <QMimeData>
 +#include <QImageReader>
 +#include <QBuffer>
@@ -2194,6 +2417,7 @@
 +#include <QFileInfo>
 +#include <QFile>
 +#include <QQmlComponent>
++#include <QQmlEngine>
 +#include <QQmlError>
 +#include <QQmlContext>
 +#include <QQuickWidget>
@@ -2210,6 +2434,25 @@
 +
 +
 +using namespace AnthraciteGui;
++
++namespace {
++// Reproducible RCC timestamps cannot invalidate Qt's disk cache. Give only our
++// embedded components content-addressed URLs; leave FreeCAD's other QML alone.
++class SidebarQmlUrls final : public QObject, public QQmlAbstractUrlInterceptor
++{
++public:
++    explicit SidebarQmlUrls(QObject* parent) : QObject(parent) {}
++    QUrl intercept(const QUrl& url, DataType type) override
++    {
++        if (type != QmlFile || url.scheme() != QLatin1String("qrc")
++            || !url.path().startsWith(QLatin1String("/Anthracite/qml/"))) return url;
++        QUrl versioned(url);
++        versioned.setPath(QStringLiteral("/Anthracite/" ANTHRACITE_QML_VERSION)
++            + url.path().mid(QStringLiteral("/Anthracite").size()));
++        return versioned;
++    }
++};
++}
 +
 +namespace
 +{
@@ -2396,6 +2639,7 @@
 +
 +    clearInteraction();
 +    setPicking(false);
++    submissionPending = true;
 +    setBusy(true);
 +    setStatus(QStringLiteral("Starting agent"));
 +    Q_EMIT promptSubmitted(text);
@@ -2403,6 +2647,7 @@
 +
 +void SidebarController::acceptSubmission()
 +{
++    submissionPending = false;
 +    currentAttachments.clear();
 +    currentDraft.clear();
 +    composerTokens.clear();
@@ -2410,6 +2655,12 @@
 +    Q_EMIT attachmentsChanged();
 +    Q_EMIT draftChanged();
 +    Q_EMIT draftEdited(currentDraft);
++    Q_EMIT busyChanged();
++}
++
++void SidebarController::copyText(const QString& text)
++{
++    QApplication::clipboard()->setText(text);
 +}
 +
 +void SidebarController::loadAttachments(const QVariantList& attachments)
@@ -2965,6 +3216,7 @@
 +
 +void SidebarController::setBusy(bool busy)
 +{
++    if (!busy) submissionPending = false;
 +    if (turnBusy == busy) {
 +        return;
 +    }
@@ -2999,6 +3251,7 @@
 +        : QUrl(QStringLiteral("qrc:/Anthracite/qml/Main.qml"));
 +    auto* replacement = new QQuickWidget(this);
 +    replacement->setResizeMode(QQuickWidget::SizeRootObjectToView);
++    replacement->engine()->addUrlInterceptor(new SidebarQmlUrls(replacement));
 +    replacement->rootContext()->setContextProperty(
 +        QStringLiteral("anthraciteController"),
 +        &sidebarController
@@ -3081,7 +3334,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,231 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_SIDEBAR_H
@@ -3111,6 +3364,7 @@
 +    Q_PROPERTY(QAbstractItemModel* messages READ messages CONSTANT)
 +    Q_PROPERTY(QString status READ status NOTIFY statusChanged)
 +    Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
++    Q_PROPERTY(bool submitting READ submitting NOTIFY busyChanged)
 +    Q_PROPERTY(bool interactionPending READ interactionPending NOTIFY interactionChanged)
 +    Q_PROPERTY(QString interactionKind READ interactionKind NOTIFY interactionChanged)
 +    Q_PROPERTY(QString interactionTitle READ interactionTitle NOTIFY interactionChanged)
@@ -3142,6 +3396,7 @@
 +    QAbstractItemModel* messages();
 +    QString status() const;
 +    bool busy() const;
++    bool submitting() const { return submissionPending; }
 +    bool interactionPending() const;
 +    QString interactionKind() const;
 +    QString interactionTitle() const;
@@ -3162,6 +3417,7 @@
 +    Q_INVOKABLE void bindComposer(QObject* quickDocument);
 +    Q_INVOKABLE void setComposerSelection(int start, int end);
 +    Q_INVOKABLE void copyComposerSelection(bool cut);
++    Q_INVOKABLE void copyText(const QString& text);
 +    Q_INVOKABLE void pasteComposerText();
 +    Q_INVOKABLE void togglePicker();
 +    void setPicking(bool active);
@@ -3284,6 +3540,7 @@
 +    double currentUsageFraction = 0.0;
 +    bool pendingAllowSession = false;
 +    bool turnBusy = false;
++    bool submissionPending = false;
 +    QString currentProvider = QStringLiteral("codex");
 +};
 +
@@ -3311,7 +3568,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,380 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -3325,7 +3582,7 @@
 +import FreeCAD as App
 +import FreeCADGui as Gui
 +from PySide import QtCore, QtWidgets
-+from PySide6 import QtQuickWidgets, QtGui, QtTest
++from PySide6 import QtQuickWidgets, QtGui, QtTest, QtQml
 +
 +import AnthraciteExecutor
 +import AnthraciteGui  # noqa: F401 - importing registers the dock window
@@ -3367,6 +3624,72 @@
 +        raise AssertionError("Anthracite QML does not expose the provider picker.")
 +
 +    controller = quick_widget.rootContext().contextProperty("anthraciteController")
++    QtTest.QTest.qWait(500)  # Drain document-switch notifications from executor tests.
++    # Exercise the native QML list with deterministic rows; no provider or CAD actions.
++    model = controller.property('messages')
++    def apply_edit(edit):
++        # Convert nested maps through QML, matching the native JSON transport rather
++        # than PySide's opaque Python-object QVariant conversion for nested dicts.
++        expression = QtQml.QQmlExpression(quick_widget.rootContext(), root,
++            'anthraciteController.messages.apply(' + json.dumps(edit) + ')')
++        expression.evaluate()
++        assert not expression.hasError(), expression.error().toString()
++    roles = {bytes(name).decode(): role for role, name in model.roleNames().items()}
++    original = [{name: model.data(model.index(row, 0), role) for name, role in roles.items()}
++                for row in range(model.rowCount())]
++    for row in original:
++        row['id'] = row.pop('entryId')
++    rows = [{'id': str(i), 'author': 'You', 'kind': 'user', 'body': 'Message ' + str(i),
++             'title': '', 'entries': [], 'entryCount': 0} for i in range(80)]
++    apply_edit({'op': 'reset', 'rows': rows, 'hasEarlier': True})
++    timeline = root.findChild(QtCore.QObject, 'AnthraciteTimeline')
++    assert timeline is not None
++    QtTest.QTest.qWait(100)
++    assert model.indexOfId('40') == 40 and model.idAt(40) == '40', (model.rowCount(), model.indexOfId('40'), model.idAt(40))
++    timeline.setProperty('scrollMode', 'reading')
++    timeline.setProperty('anchorId', '40')
++    timeline.setProperty('anchorOffset', 0)
++    timeline.reconcile()
++    QtTest.QTest.qWait(100)
++    anchor = timeline.property('anchorId')
++    offset = timeline.property('anchorOffset')
++    apply_edit({'op': 'prepend', 'rows': [dict(rows[0], id='earlier')], 'hasEarlier': False})
++    QtTest.QTest.qWait(100)
++    assert timeline.property('scrollMode') == 'reading'
++    assert timeline.property('anchorId') == anchor, 'Loading history lost the visible message'
++    assert abs(timeline.property('anchorOffset') - offset) < 3, 'Loading history moved the visible message'
++    apply_edit({'op': 'update', 'row': dict(rows[-1], kind='assistant', body='Streaming output\n' * 20)})
++    QtTest.QTest.qWait(100)
++    assert timeline.property('anchorId') == anchor, 'Streaming pulled the reader to the bottom'
++    original_width = root.property('width')
++    root.setProperty('width', 320)
++    QtTest.QTest.qWait(100)
++    assert root.property('compact'), 'Narrow dock did not compact its controls'
++    assert timeline.property('anchorId') == anchor, 'Dock resize lost the reading anchor'
++    assert abs(timeline.property('anchorOffset') - offset) < 3
++    root.setProperty('width', original_width)
++    timeline.latest()
++    QtTest.QTest.qWait(100)
++    assert timeline.property('atYEnd'), 'Latest failed to resume end following'
++    timeline.setProperty('pendingTurn', True)
++    apply_edit({'op': 'append', 'row': dict(rows[0], id='new-prompt')})
++    QtTest.QTest.qWait(100)
++    assert timeline.property('scrollMode') == 'new-turn'
++    assert timeline.property('newTurnId') == 'new-prompt'
++    top = timeline.property('contentY')
++    apply_edit({'op': 'append', 'row': dict(rows[0], id='answer', kind='assistant', body='Short answer')})
++    QtTest.QTest.qWait(100)
++    assert abs(timeline.property('contentY') - top) < 3, 'Short answer moved the new prompt'
++    # Detail responses are append-only pages and duplicate responses are ignored.
++    apply_edit({'op': 'append', 'row': dict(rows[0], id='work', kind='work', entryCount=2)})
++    details = {'op': 'details', 'id': 'work', 'offset': 0,
++               'entries': [{'kind': 'activity', 'author': 'Activity', 'body': 'freecad\npass'}]}
++    apply_edit(details)
++    apply_edit(details)
++    assert len(model.data(model.index(model.rowCount()-1, 0), roles['entries'])) == 1
++    controller.copyText('exact Python\npass')
++    assert QtWidgets.QApplication.clipboard().text() == 'exact Python\npass'
++    apply_edit({'op': 'reset', 'rows': original})
 +    Gui.runCommand("Anthracite_ReloadSidebar")
 +    quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
 +    if quick_widget.rootContext().contextProperty("anthraciteController") != controller:
@@ -3825,4 +4148,111 @@
 +    insertComposerText(cursor, QApplication::clipboard()->text());
 +    cursor.endEditBlock();
 +    Q_EMIT composerCursorRequested(cursor.position());
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Resources/qml/ActivityEntry.qml
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++import QtQuick 2.15
++import QtQuick.Controls 2.15
++
++Column {
++    id: root
++    property var entry: ({})
++    property bool expanded: false
++    signal resizing()
++    signal toggle()
++    signal preview(url source)
++    SystemPalette { id: colors }
++    spacing: 4
++    ToolButton {
++        width: parent.width
++        visible: root.entry.kind !== "image"
++        text: (root.expanded ? "⌄  " : "›  ") + (root.entry.title || root.entry.author || qsTr("Activity"))
++        contentItem: Text {
++            text: parent.text
++            color: colors.text
++            elide: Text.ElideRight
++            verticalAlignment: Text.AlignVCenter
++        }
++        onClicked: { root.resizing(); root.toggle() }
++    }
++    Loader {
++        width: parent.width
++        active: root.expanded && root.entry.kind !== "image"
++        sourceComponent: TranscriptText {
++            body: root.entry.content !== undefined ? root.entry.content : (root.entry.body || "")
++            onResizing: root.resizing()
++        }
++    }
++    Image {
++        objectName: "workImage"
++        visible: root.entry.kind === "image"
++        width: parent.width
++        height: visible ? Math.min(180, width * 0.75) : 0
++        source: visible ? root.entry.body : ""
++        sourceSize.width: 480
++        sourceSize.height: 360
++        asynchronous: true
++        fillMode: Image.PreserveAspectFit
++        MouseArea {
++            anchors.fill: parent
++            onClicked: root.preview(parent.source)
++        }
++    }
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Resources/qml/TranscriptText.qml
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++import QtQuick 2.15
++import QtQuick.Controls 2.15
++
++Column {
++    id: root
++    property string body: ""
++    property bool markdown: false
++    property bool foldLong: false
++    property bool expanded: false
++    signal resizing()
++    SystemPalette { id: colors }
++    spacing: 4
++    TextEdit {
++        id: messageText
++        objectName: "transcriptText"
++        width: parent.width
++        height: root.foldLong && !root.expanded ? Math.min(contentHeight, 120) : contentHeight
++        clip: true
++        text: root.body
++        textFormat: root.markdown ? TextEdit.MarkdownText : TextEdit.PlainText
++        readOnly: true
++        selectByMouse: true
++        onSelectedTextChanged: if (selectedText.length) root.resizing()
++        wrapMode: TextEdit.Wrap
++        color: colors.text
++        Accessible.name: root.body
++    }
++    Row {
++        spacing: 6
++        ToolButton {
++            visible: root.foldLong && messageText.contentHeight > 120
++            text: root.expanded ? qsTr("Show less") : qsTr("Show full message")
++            onClicked: { root.resizing(); root.expanded = !root.expanded }
++        }
++        ToolButton {
++            objectName: "copyMessage"
++            font.pixelSize: 11
++            implicitHeight: 24
++            Accessible.name: qsTr("Copy message")
++            text: copied.running ? qsTr("Copied") : qsTr("Copy")
++            contentItem: Text {
++                text: parent.text
++                font: parent.font
++                color: colors.text
++                verticalAlignment: Text.AlignVCenter
++            }
++            onClicked: { anthraciteController.copyText(root.body); copied.restart() }
++            Timer { id: copied; interval: 1000 }
++        }
++    }
 +}
