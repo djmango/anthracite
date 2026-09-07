@@ -5747,7 +5747,7 @@
 +            "QToolButton:hover{background:palette(mid);border-radius:4px;}"
 +            "QToolButton:checked{background:palette(highlight);color:palette(highlighted-text);border-radius:4px;}"));
 +        qApp->setStyleSheet(qApp->styleSheet() + QStringLiteral(
-+            "#WbTabBar QTabBar::tab:selected{color:palette(highlight);border-bottom:2px solid palette(highlight);}"
++            "#WbTabBar QTabBar::tab:selected{color:palette(window-text);border-bottom:2px solid palette(highlight);}"
 +            "#WbTabBar QTabBar::tab:!selected{border-bottom:2px solid transparent;}"));
 +        // Tooltips use their own palette roles (including the inactive group).
 +        qApp->setStyleSheet(qApp->styleSheet() + QStringLiteral(
