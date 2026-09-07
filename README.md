@@ -225,9 +225,11 @@ The development build lives in `build/src/build/debug` on macOS and `build/nativ
 `just run` launches it without invoking CMake.
 `just build` prepares compiler/dependency settings and CMake build files automatically,
 then compiles incrementally. There is no separate configure command.
-`just test` runs `tests/runtests.nu`, checking launcher signals, the executor, workbenches, QML reload and durable bridge using an isolated
+`just test` runs Rust runtime and launcher-signal tests with cargo-nextest, then checks
+the executor, workbenches, QML reload and durable bridge using an isolated
 profile and a deterministic local provider, without contacting a model service.
-Workflow scripts and test orchestration use Nushell. `tests/` holds the smoke tests;
+Workflow scripts and `tests/runtests.nu` orchestration use Nushell. Rust tests live
+with the runtime (the `test-fixtures` feature enables its process-test executable);
 assertions executed inside FreeCAD remain Python to use its embedded API directly.
 The Nushell launcher uses the Rust runtime's small process supervisor to turn terminal
 Ctrl-C into SIGTERM, with a five-second forced-stop fallback; it does not start an agent.

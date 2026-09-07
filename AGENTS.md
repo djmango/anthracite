@@ -43,8 +43,11 @@ live in `tests/`, while FreeCAD-embedded assertions remain Python.
 - `nix develop` (or direnv) supplies tools for subsequent commands.
 - `just build` prepares/updates CMake settings automatically, then compiles
   incrementally. `just run` launches without building. No separate configure step.
-- `just test` runs `tests/runtests.nu`: isolated application/executor/bridge
+- `just test` runs `tests/runtests.nu`: Rust tests via cargo-nextest, then isolated
+  application/executor/bridge
   tests, no real model calls. Failure logs remain under `build/test-results/`.
+  Runtime and process tests belong in Rust; only FreeCAD-embedded assertions
+  need Python. Nushell handles orchestration and workflow-contract tests.
 - `just status` shows source changes and patch state.
 - macOS build: `build/src/build/debug`; Linux development build: `build/native`.
   Linux also supports packaged `nix build` / `nix run`.

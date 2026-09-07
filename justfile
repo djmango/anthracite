@@ -15,7 +15,7 @@ build: _require-source
 run:
     nix develop --command nu --no-config-file '{{root}}/devutils/native.nu' exec nu --no-config-file '{{root}}/devutils/launch.nu' '{{build_dir}}/bin/FreeCAD'
 
-# Isolated GUI, executor, and provider-bridge tests.
+# Rust (cargo-nextest) and isolated GUI, executor, and provider-bridge tests.
 test:
     nix develop --command nu --no-config-file '{{root}}/tests/runtests.nu'
 

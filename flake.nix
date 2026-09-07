@@ -15,7 +15,7 @@
         in {
           devShells.default = (if linux then pkgs.mkShell else pkgs.mkShellNoCC) ({
             inputsFrom = lib.optionals linux [ build.package ];
-            packages = (with pkgs; [ git just quilt nushell cmake ninja pkg-config cargo rustc swig ])
+            packages = (with pkgs; [ git just quilt nushell cmake ninja pkg-config cargo cargo-nextest rustc rustfmt swig ])
               ++ lib.optionals (!linux) [ pkgs.pixi ];
           } // lib.optionalAttrs linux {
             cmakeFlags = build.package.cmakeFlags;

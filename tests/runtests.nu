@@ -15,18 +15,22 @@ def main [] {
     $env.XDG_CACHE_HOME = $directory | path join cache
     $env.ANTHRACITE_SMOKE = "1"
     let build = if (sys host | get name) == "Darwin" { $root | path join build src build debug } else { $root | path join build native }
-    let signals = ^nu --no-config-file ($root | path join devutils native.nu) exec python ($root | path join tests signals.py) ($build | path join Mod Anthracite anthracite-runtime) ($root | path join devutils launch.nu) $nu.current-exe | complete
-    print $signals.stdout
-    if $signals.exit_code != 0 { error make {msg: $signals.stderr} }
+    $env.ANTHRACITE_TEST_LAUNCHER = $root | path join devutils launch.nu
+    $env.ANTHRACITE_TEST_NU = $nu.current-exe
+    let rust = ^nu --no-config-file ($root | path join devutils native.nu) exec cargo nextest run --locked --features test-fixtures --manifest-path ($root | path join build src src Mod Anthracite Runtime Cargo.toml) | complete
+    let rust_output = $rust.stdout + $rust.stderr
+    $rust_output | save ($directory | path join nextest.log)
+    print $rust_output
+    if $rust.exit_code != 0 { error make {msg: $"Rust tests failed. Logs retained at ($directory)"} }
     for test in [[script executable marker]; [executor.py FreeCADCmd ANTHRACITE_EXECUTOR_TESTS_OK] [smoke.py FreeCAD ANTHRACITE_GUI_SMOKE_OK] [bridge-smoke.py FreeCAD ANTHRACITE_BRIDGE_SMOKE_OK]] {
         let result = ^nu --no-config-file ($root | path join devutils native.nu) exec $nu.current-exe --no-config-file ($root | path join devutils launch.nu) ($build | path join bin $test.executable) ($root | path join tests $test.script) | complete
         let output = $result.stdout + $result.stderr
         $output | save ($directory | path join $"($test.script).log")
         print $output
         if $result.exit_code != 0 or not ($output | str contains $test.marker) or ($output =~ 'TypeError:|QProcess: Destroyed while process') {
-            error make {msg: $"($test.script) failed. Logs and isolated profile retained at ($directory)"}
+            error make {msg: $"($test.script) failed \(exit ($result.exit_code)\). Logs and isolated profile retained at ($directory)"}
         }
     }
     rm -r $directory
-    print "All FreeCAD integration tests passed."
+    print "All Rust and FreeCAD integration tests passed."
 }

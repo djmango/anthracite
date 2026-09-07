@@ -58,7 +58,7 @@ def --wrapped main [command: string, ...arguments: string] {
             $env.GIT_OPTIONAL_LOCKS = "0"
             let revision = pin
             if $revision !~ '^[0-9a-f]{40}$' { error make {msg: 'Invalid upstream commit hash.'} }
-            let commands = [nix nu git just quilt cmake ninja cargo rustc] | append (if (sys host | get name) == "Darwin" { [pixi] } else { [] })
+            let commands = [nix nu git just quilt cmake ninja cargo cargo-nextest rustc] | append (if (sys host | get name) == "Darwin" { [pixi] } else { [] })
             mut missing = []
             for name in $commands {
                 let found = which $name
