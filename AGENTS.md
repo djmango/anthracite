@@ -155,6 +155,12 @@ just test
 
 ## Reference repositories
 
+- [Blender MCP](https://github.com/ahujasid/blender-mcp): learn from agent-facing
+  scene/object inspection, viewport images, and Python actions into the real app.
+  Keep Anthracite's checked executor, rollback, and topology safeguards.
+- [FreeCAD MCP](https://github.com/neka-nat/freecad-mcp): reference native FreeCAD
+  API integration and agent-facing model inspection. Adapt useful patterns into
+  the existing `freecad(<python>)` tool, not a parallel executor or tool catalog.
 - [vcad](https://github.com/ecto/vcad): modern, ground-up agentic CAD. Learn from
   its visual inspection feedback: model images from multiple viewpoints alongside
   structured observations. Use FreeCAD's viewport and APIs, not its replacement kernel.

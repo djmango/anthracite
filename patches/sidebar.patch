@@ -3881,7 +3881,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,998 @@
+@@ -0,0 +1,1031 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -4103,6 +4103,39 @@
 +    assert dimensions, 'Native viewport dimension widget not found'
 +    assert dimensions[0].minimumWidth() >= dimensions[0].fontMetrics().horizontalAdvance('9999.99 mm x 9999.99 mm') + 32, (dimensions[0].minimumWidth(), dimensions[0].fontMetrics().horizontalAdvance('9999.99 mm x 9999.99 mm'))
 +    assert '#WbTabBar QTabBar::tab:selected' in QtWidgets.QApplication.instance().styleSheet()
++    workbenches = main_window.findChild(QtWidgets.QWidget, 'WbTabBar').findChild(QtWidgets.QTabBar)
++    QtWidgets.QApplication.sendEvent(workbenches, QtCore.QEvent(QtCore.QEvent.Leave))
++    active = workbenches.currentIndex()
++    assert workbenches.tabText(active) == workbenches.tabData(active)
++    inactive = next(i for i in range(workbenches.count())
++                    if i != active and not workbenches.tabIcon(i).isNull())
++    assert workbenches.tabText(inactive) == ''
++    collapsed_width = workbenches.tabRect(inactive).width()
++    position = QtCore.QPointF(workbenches.tabRect(inactive).center())
++    hover = QtGui.QMouseEvent(QtCore.QEvent.MouseMove, position,
++                             QtCore.QPointF(workbenches.mapToGlobal(position.toPoint())),
++                             QtCore.Qt.NoButton, QtCore.Qt.NoButton, QtCore.Qt.NoModifier)
++    QtWidgets.QApplication.sendEvent(workbenches, hover)
++    assert workbenches.tabText(inactive) == workbenches.tabData(inactive)
++    assert workbenches.tabRect(inactive).width() > collapsed_width
++    assert workbenches.currentIndex() == active, 'Hover must not activate a workbench'
++    QtWidgets.QApplication.sendEvent(workbenches, QtCore.QEvent(QtCore.QEvent.Leave))
++    assert workbenches.tabText(inactive) == ''
++    assert workbenches.tabText(active) == workbenches.tabData(active)
++    original_icon = workbenches.tabIcon(inactive)
++    marker = QtGui.QPixmap(workbenches.iconSize())
++    marker.fill(QtGui.QColor('#00ff80'))
++    try:
++        workbenches.setTabIcon(inactive, QtGui.QIcon(marker))
++        rendered = workbenches.grab(workbenches.tabRect(inactive)).toImage()
++        pixels = [(x, y) for y in range(rendered.height()) for x in range(rendered.width())
++                  if rendered.pixelColor(x, y).name() == '#00ff80']
++        assert pixels, 'Collapsed tab icon was not painted'
++        for axis, extent in ((0, rendered.width()), (1, rendered.height())):
++            midpoint = (min(p[axis] for p in pixels) + max(p[axis] for p in pixels)) / 2
++            assert abs(midpoint - (extent - 1) / 2) <= rendered.devicePixelRatio(), 'Tab icon is off-center'
++    finally:
++        workbenches.setTabIcon(inactive, original_icon)
 +    assert QtWidgets.QApplication.palette().color(QtGui.QPalette.Highlight).name() == '#a06666'
 +    assert QtWidgets.QApplication.palette().color(QtGui.QPalette.Window).name() == '#080808'
 +    cube = App.ParamGet('User parameter:BaseApp/Preferences/NaviCube')
@@ -6404,3 +6437,117 @@
 +        }
 +    }
 +}
+--- a/src/Gui/WorkbenchSelector.cpp
++++ b/src/Gui/WorkbenchSelector.cpp
+@@ -358,11 +358,13 @@ int WorkbenchTabWidget::addWorkbenchTab(
+     }
+ 
+     tabBar->setTabToolTip(tabIndex, action->toolTip());
++    tabBar->setTabData(tabIndex, action->text());
+ 
+     if (action->isChecked()) {
+         tabBar->setCurrentIndex(tabIndex);
+     }
+ 
++    tabBar->updateLabels();
+     return tabIndex;
+ }
+ 
+--- a/src/Gui/WorkbenchSelector.h
++++ b/src/Gui/WorkbenchSelector.h
+@@ -25,6 +25,7 @@
+ 
+ #include <QComboBox>
+ #include <QTabBar>
++#include <QStylePainter>
+ #include <QMenu>
+ #include <QToolButton>
+ #include <QLayout>
+@@ -75,13 +76,77 @@ class GuiExport WorkbenchTabWidget: publ
+     public:
+         explicit WbTabBar(QWidget* parent)
+             : QTabBar(parent)
+-        {}
++        {
++            setMouseTracking(true);
++            connect(this, &QTabBar::currentChanged, this, [this] { updateLabels(); });
++        }
++
++        void updateLabels()
++        {
++            for (int i = 0; i < count(); ++i) {
++                const auto name = tabData(i).toString();
++                if (name.isEmpty()) {
++                    continue;
++                }
++                const bool expanded = i == currentIndex() || i == hoveredTab || tabIcon(i).isNull();
++                setTabText(i, expanded ? name : QString());
++                setAccessibleTabName(i, name);
++            }
++            updateGeometry();
++        }
++
++        void mouseMoveEvent(QMouseEvent* event) override
++        {
++            const int index = tabAt(event->pos());
++            if (index != hoveredTab) {
++                hoveredTab = index;
++                updateLabels();
++            }
++            QTabBar::mouseMoveEvent(event);
++        }
++
++        void leaveEvent(QEvent* event) override
++        {
++            hoveredTab = -1;
++            updateLabels();
++            QTabBar::leaveEvent(event);
++        }
++
++        void paintEvent(QPaintEvent*) override
++        {
++            QStylePainter painter(this);
++            const auto drawTab = [this, &painter](int index) {
++                QStyleOptionTab option;
++                initStyleOption(&option, index);
++                if (!option.text.isEmpty() || option.icon.isNull()) {
++                    painter.drawControl(QStyle::CE_TabBarTab, option);
++                    return;
++                }
++                // Native tab labels reserve space to the right of the icon even
++                // without text. Paint the native frame, then center the icon in
++                // its actual tab rectangle, independently of stylesheet padding.
++                painter.drawControl(QStyle::CE_TabBarTabShape, option);
++                QRect iconRect(QPoint(), option.iconSize);
++                iconRect.moveCenter(option.rect.center());
++                option.icon.paint(&painter, iconRect, Qt::AlignCenter,
++                                  isTabEnabled(index) ? QIcon::Normal : QIcon::Disabled,
++                                  index == currentIndex() ? QIcon::On : QIcon::Off);
++            };
++            for (int i = 0; i < count(); ++i) {
++                if (i != currentIndex()) {
++                    drawTab(i);
++                }
++            }
++            if (currentIndex() >= 0) {
++                drawTab(currentIndex());
++            }
++        }
+ 
+         QSize tabSizeHint(int index) const override
+         {
+             auto sizeFromParent = QTabBar::tabSizeHint(index);
+ 
+-            if (itemStyle() != WorkbenchItemStyle::IconOnly) {
++            if (!tabText(index).isEmpty()) {
+                 return sizeFromParent;
+             }
+ 
+@@ -139,6 +204,7 @@ class GuiExport WorkbenchTabWidget: publ
+         }
+ 
+     private:
++        int hoveredTab {-1};
+         WorkbenchItemStyle _itemStyle {WorkbenchItemStyle::IconAndText};
+ 
+         static const char* workbenchItemStyleToString(WorkbenchItemStyle style)
