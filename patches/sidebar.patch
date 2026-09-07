@@ -1234,7 +1234,7 @@
 +# Content-address the resource path, not a URL query (Qt's disk-cache key strips
 +# queries). Fixed RCC timestamps must never reuse a previous component definition.
 +set(AnthraciteQml_FINGERPRINT "")
-+foreach(component Main TranscriptText ActivityEntry AgentSettings StatusBar)
++foreach(component Main TranscriptView TranscriptText ActivityEntry AgentSettings StatusBar)
 +    set(qml_file ${CMAKE_CURRENT_SOURCE_DIR}/Resources/qml/${component}.qml)
 +    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${qml_file})
 +    file(SHA256 ${qml_file} qml_hash)
@@ -1630,10 +1630,11 @@
 +#endif  // ANTHRACITEGUI_CONVERSATIONMODEL_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,20 @@
 +<!DOCTYPE RCC>
 +<RCC version="1.0">
 +    <qresource prefix="/Anthracite">
++        <file alias="qml/TranscriptView.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptView.qml</file>
 +        <file alias="overlay.qss">@CMAKE_CURRENT_SOURCE_DIR@/Resources/overlay.qss</file>
 +        <file alias="qml/StatusBar.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/StatusBar.qml</file>
 +        <file alias="qml/AgentSettings.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/AgentSettings.qml</file>
@@ -1642,6 +1643,7 @@
 +        <file alias="qml/ActivityEntry.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ActivityEntry.qml</file>
 +    </qresource>
 +    <qresource prefix="/Anthracite/@AnthraciteQml_VERSION@">
++        <file alias="qml/TranscriptView.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptView.qml</file>
 +        <file alias="qml/StatusBar.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/StatusBar.qml</file>
 +        <file alias="qml/AgentSettings.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/AgentSettings.qml</file>
 +        <file alias="qml/Main.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Main.qml</file>
@@ -1651,11 +1653,12 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,951 @@
+@@ -0,0 +1,953 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
++import QtQuick.Controls.Basic
 +import QtQuick.Layouts 1.15
 +import "qrc:/Anthracite/qml" as Transcript
 +
@@ -1824,7 +1827,7 @@
 +            }
 +        }
 +
-+        ListView {
++        Transcript.TranscriptView {
 +            id: timeline
 +            objectName: "AnthraciteTimeline"
 +            Layout.fillWidth: true
@@ -1844,17 +1847,16 @@
 +            property bool settling: false
 +            property var expandedRows: ({})
 +            property var expandedEntries: ({})
-+            cacheBuffer: 240
 +            boundsBehavior: Flickable.StopAtBounds
 +            property bool userScrolling: false
 +
 +            function remember() {
 +                if (settling || moving) return
-+                // The top can fall in ListView spacing. Do not keep a stale
++                // The top can fall in message spacing. Do not keep a stale
 +                // anchor from another screen merely because indexAt misses it.
 +                let item = itemAtIndex(indexAt(1, contentY + 2))
 +                if (!item) {
-+                    const children = contentItem.children
++                    const children = rowItems
 +                    for (let i = 0; i < children.length; ++i) {
 +                        const candidate = children[i]
 +                        if (candidate.rowId && candidate.y + candidate.height > contentY
@@ -1921,10 +1923,6 @@
 +                } else if (anchorId.length) {
 +                    const row = model.indexOfId(anchorId)
 +                    if (row >= 0) {
-+                        // Never scroll to instantiate an old reading anchor.
-+                        // With variable-height delegates that changes ListView's
-+                        // size estimate, schedules another correction, and can
-+                        // oscillate between distant screens after a fast flick.
 +                        const item = itemAtIndex(row)
 +                        if (item) contentY = item.y - anchorOffset
 +                    }
@@ -1939,9 +1937,7 @@
 +                gestureEnd.restart()
 +                remember()
 +            }
-+            // ListView estimates total height from the delegates currently in
-+            // view. Scrolling changes that estimate even when no message changed.
-+            // Feeding it back into reading-anchor restoration fights the gesture.
++            // Only real layout changes affect the exact content height.
 +            onContentHeightChanged: { if (scrollMode !== "reading") schedule() }
 +            onHeightChanged: schedule()
 +            onWidthChanged: schedule()
@@ -1976,7 +1972,14 @@
 +            // can grab the gesture without actually scrolling the view.
 +            Keys.onPressed: function(event) {
 +                if ([Qt.Key_Up, Qt.Key_Down, Qt.Key_PageUp, Qt.Key_PageDown,
-+                     Qt.Key_Home, Qt.Key_End].indexOf(event.key) >= 0) timeline.navigate()
++                     Qt.Key_Home, Qt.Key_End].indexOf(event.key) >= 0) {
++                    timeline.navigate()
++                    const step = event.key === Qt.Key_PageUp || event.key === Qt.Key_PageDown ? height * 0.9 : 40
++                    const target = event.key === Qt.Key_Home ? 0 : event.key === Qt.Key_End ? contentHeight
++                        : contentY + ([Qt.Key_Up, Qt.Key_PageUp].indexOf(event.key) >= 0 ? -step : step)
++                    contentY = Math.max(0, Math.min(Math.max(0, contentHeight - height), target))
++                    event.accepted = true
++                }
 +            }
 +            Connections {
 +                target: anthraciteController.messages
@@ -2010,6 +2013,7 @@
 +                height: timeline.newTurnId.length ? timeline.height : 0
 +            }
 +            ToolButton {
++                parent: timeline
 +                anchors.right: parent.right
 +                anchors.bottom: parent.bottom
 +                z: 2
@@ -2049,7 +2053,7 @@
 +                    implicitHeight: messageColumn.implicitHeight + (isUser ? 24 : 12)
 +                    radius: 12
 +                    color: isUser
-+                           ? Qt.rgba(0.627, 0.4, 0.4, 0.25)
++                           ? Qt.rgba(systemPalette.highlight.r, systemPalette.highlight.g, systemPalette.highlight.b, 0.25)
 +                             : kind === "error"
 +                             ? Qt.rgba(0.90, 0.25, 0.25, 0.15)
 +                             : "transparent"
@@ -3823,7 +3827,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,880 @@
+@@ -0,0 +1,893 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -4343,17 +4347,17 @@
 +    timeline.positionViewAtIndex(50, 0)
 +    QtTest.QTest.qWait(200)
 +    timeline.remember()
-+    # An evicted anchor must never cause navigation to a different screen.
++    # Every loaded message has measured geometry, including offscreen messages.
 +    def timeline_value(source):
 +        expression = QtQml.QQmlExpression(quick_widget.rootContext(), timeline, source)
 +        value = expression.evaluate()
 +        assert not expression.hasError(), expression.error().toString()
 +        return value[0] if isinstance(value, tuple) else value
-+    assert timeline_value('itemAtIndex(0) === null')
++    assert timeline_value('itemAtIndex(0) !== null')
 +    visible_before = timeline_value('itemAtIndex(50).y - contentY')
-+    timeline.setProperty('anchorId', 'mixed-0')
 +    timeline.reconcile()
-+    assert abs(timeline_value('itemAtIndex(50).y - contentY') - visible_before) < 3, 'Stale anchor teleported the viewport'
++    assert abs(timeline_value('itemAtIndex(50).y - contentY') - visible_before) < 3, 'Reading anchor teleported the viewport'
++    measured_height = timeline.property('contentHeight')
 +    center = timeline.mapToScene(QtCore.QPointF(timeline.width() / 2, timeline.height() / 2))
 +    for direction in (-1, 1, -1, 1):
 +        for _ in range(12):
@@ -4370,34 +4374,47 @@
 +        for _ in range(15):
 +            QtTest.QTest.qWait(25)
 +            assert abs(timeline_value(position) - settled) < 3, 'Transcript oscillated after fast scrolling'
-+    # Trackpads carry pixel deltas and momentum phases, unlike mouse-wheel
-+    # angle steps. Down-only input must never reverse the visible transcript.
++            assert abs(timeline.property('contentHeight') - measured_height) < 1, 'Scrolling changed transcript geometry'
++    # Trackpads carry pixel deltas, momentum phases, and the platform-synthesized
++    # source flag. Qt treats NotSynthesized as angle-only wheel input even with
++    # pixel deltas: a no-motion test could otherwise pass the monotonic assertion.
++    # Down-only input must traverse the history without reversing it.
 +    timeline.setProperty('scrollMode', 'reading')
 +    timeline.positionViewAtIndex(1, 0)
 +    QtTest.QTest.qWait(200)
 +    def visible_progress():
 +        return timeline_value('''
 +            let first = null;
-+            for (const item of contentItem.children) {
++            for (const item of rowItems) {
 +                if (item.rowId && item.y + item.height > contentY && item.y < contentY + height
 +                    && (!first || item.y < first.y)) first = item;
 +            }
 +            [model.indexOfId(first.rowId), contentY - first.y];
 +        ''')
 +    previous_progress = None
-+    for i in range(50):
++    # Native wheel scaling depends on display/style; drive to the actual end,
++    # with a bounded budget rather than assuming one input pixel = one scene unit.
++    steps = 4 * int(max(0, timeline.property('contentHeight') - timeline.height() - timeline.property('contentY')) / 160) + 32
++    for i in range(steps):
 +        phase = QtCore.Qt.ScrollBegin if i == 0 else QtCore.Qt.ScrollMomentum if i > 30 else QtCore.Qt.ScrollUpdate
-+        trackpad = QtGui.QWheelEvent(center, center, QtCore.QPoint(0, -80), QtCore.QPoint(),
-+                                    QtCore.Qt.NoButton, QtCore.Qt.NoModifier, phase, False)
++        trackpad = QtGui.QWheelEvent(center, center, QtCore.QPoint(0, -160), QtCore.QPoint(),
++                                    QtCore.Qt.NoButton, QtCore.Qt.NoModifier, phase, False,
++                                    QtCore.Qt.MouseEventSynthesizedBySystem)
 +        QtWidgets.QApplication.sendEvent(quick_widget, trackpad)
 +        QtTest.QTest.qWait(16)
++        assert abs(timeline.property('contentHeight') - measured_height) < 1, 'Trackpad input changed message layout'
 +        progress = visible_progress()
 +        if hasattr(progress, 'toVariant'): progress = progress.toVariant()
 +        if previous_progress is not None:
 +            assert progress[0] > previous_progress[0] or (progress[0] == previous_progress[0] and progress[1] >= previous_progress[1] - 3), ('Downward trackpad input reversed', previous_progress, progress)
 +        previous_progress = progress
++        if timeline.property('atYEnd'):
++            break
++    assert timeline.property('atYEnd'), ('Downward trackpad gesture did not traverse the loaded history',
++                                       timeline.property('contentY'), timeline.property('contentHeight'), steps)
 +    end = QtGui.QWheelEvent(center, center, QtCore.QPoint(), QtCore.QPoint(), QtCore.Qt.NoButton,
-+                           QtCore.Qt.NoModifier, QtCore.Qt.ScrollEnd, False)
++                           QtCore.Qt.NoModifier, QtCore.Qt.ScrollEnd, False,
++                           QtCore.Qt.MouseEventSynthesizedBySystem)
 +    QtWidgets.QApplication.sendEvent(quick_widget, end)
 +    QtTest.QTest.qWait(350)
 +    apply_edit({'op': 'reset', 'rows': original})
@@ -4911,10 +4928,11 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/ActivityEntry.qml
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,50 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
++import QtQuick.Controls.Basic
 +
 +Column {
 +    id: root
@@ -4963,10 +4981,11 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/TranscriptText.qml
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,36 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
++import QtQuick.Controls.Basic
 +
 +Column {
 +    id: root
@@ -5001,10 +5020,11 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/AgentSettings.qml
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,262 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
++import QtQuick.Controls.Basic
 +import QtQuick.Layouts 1.15
 +
 +Popup {
@@ -5275,7 +5295,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Chrome.cpp
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,202 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +#include "Chrome.h"
 +#include "Sidebar.h"
@@ -5425,18 +5445,21 @@
 +        palette.setColor(QPalette::HighlightedText, QColor("#FFFFFF"));
 +        palette.setColor(QPalette::Link, QColor("#C99696"));
 +        palette.setColor(QPalette::Mid, QColor("#38393D"));
++        palette.setColor(QPalette::PlaceholderText, QColor("#96918E"));
++        for (const auto role : {QPalette::WindowText, QPalette::Text, QPalette::ButtonText})
++            palette.setColor(QPalette::Disabled, role, QColor("#827D7A"));
 +        qApp->setPalette(palette);
 +        window->setPalette(palette);
 +        qApp->setStyleSheet(qApp->styleSheet() + QStringLiteral(
-+            "\nQStatusBar{background:#080808;border-top:1px solid #333333;}"
++            "\nQStatusBar{background:palette(window);border-top:1px solid palette(mid);}"
 +            "QStatusBar::item{border:0;} QToolBar{border:0;spacing:4px;}"
-+            "QMainWindow,QMenuBar,QMenu,QToolBar,QDockWidget{background:#080808;color:#E5E1DE;}"
-+            "QTreeView{background:transparent;color:#E5E1DE;selection-background-color:#A06666;selection-color:white;}"
++            "QMainWindow,QMenuBar,QMenu,QToolBar,QDockWidget{background:palette(window);color:palette(window-text);}"
++            "QTreeView{background:transparent;color:palette(text);selection-background-color:palette(highlight);selection-color:palette(highlighted-text);}"
 +            "QDockWidget::title{padding:5px;} QMenu{padding:4px;}"
 +            "QDockWidget::close-button{image:url(qss:overlay/icons/close_light.svg);}"
 +            "QDockWidget::float-button{image:url(qss:overlay/icons/float_light.svg);}"
-+            "QToolButton:hover{background:#383034;border-radius:4px;}"
-+            "QToolButton:checked{background:#704C4F;border-radius:4px;}"));
++            "QToolButton:hover{background:palette(mid);border-radius:4px;}"
++            "QToolButton:checked{background:palette(highlight);color:palette(highlighted-text);border-radius:4px;}"));
 +    } else if (windowPreferences->GetASCII("OverlayActiveStyleSheet") == ":/Anthracite/overlay.qss") {
 +        windowPreferences->SetASCII("OverlayActiveStyleSheet", "");
 +    }
@@ -5522,10 +5545,11 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/StatusBar.qml
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,52 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
++import QtQuick.Controls.Basic
 +import QtQuick.Layouts 1.15
 +
 +Rectangle {
@@ -5583,7 +5607,7 @@
 +Gui--PropertyEditor--PropertyEditor, QAbstractScrollArea,
 +QAbstractScrollArea > QWidget, QTabWidget::pane {
 +    background-color: transparent;
-+    color: #E5E1DE;
++    color: palette(window-text);
 +    border: none;
 +}
 +Gui--OverlayTabWidget {
@@ -5596,23 +5620,80 @@
 +    qproperty-enableEffect: 1;
 +}
 +Gui--OverlayTitleBar, Gui--OverlaySplitterHandle {
-+    background-color: #080808;
-+    color: #E5E1DE;
++    background-color: palette(window);
++    color: palette(window-text);
 +}
 +QAbstractItemView {
 +    background-color: transparent;
 +    alternate-background-color: transparent;
-+    selection-background-color: #A06666;
-+    selection-color: white;
-+    color: #E5E1DE;
++    selection-background-color: palette(highlight);
++    selection-color: palette(highlighted-text);
++    color: palette(text);
 +    border: none;
 +}
-+QAbstractItemView::item:hover { background-color: rgba(160, 102, 102, 35); }
-+QAbstractItemView::item:selected { background-color: #A06666; color: white; }
-+QHeaderView::section { background-color: #080808; color: #E5E1DE; border: none; }
-+QTabBar::tab { background-color: #080808; color: #E5E1DE; padding: 5px; }
-+QTabBar::tab:selected { border-bottom: 2px solid #A06666; }
++QAbstractItemView::item:hover { background-color: palette(mid); }
++QAbstractItemView::item:selected { background-color: palette(highlight); color: palette(highlighted-text); }
++QHeaderView::section { background-color: palette(window); color: palette(window-text); border: none; }
++QTabBar::tab { background-color: palette(window); color: palette(window-text); padding: 5px; }
++QTabBar::tab:selected { border-bottom: 2px solid palette(highlight); }
 +QScrollBar { background-color: transparent; }
 +Gui--OverlayToolButton[objectName="OBTN Overlay"] { qproperty-icon: url(qss:overlay/icons/overlay_light.svg); }
 +Gui--OverlayToolButton[objectName="OBTN Transparent"] { qproperty-icon: url(qss:overlay/icons/transparent_light.svg); }
 +Gui--OverlayToolButton[objectName="OBTN AutoMode"] { qproperty-icon: url(qss:overlay/icons/mode_light.svg); }
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Resources/qml/TranscriptView.qml
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++import QtQuick 2.15
++
++// Exact geometry for the loaded history page. Moving the viewport must not
++// instantiate delegates, remeasure text, or change the scroll range. History
++// and activity pagination belong to the conversation model, not the viewport.
++Flickable {
++    id: view
++    property alias model: rows.model
++    property alias delegate: rows.delegate
++    property alias count: rows.count
++    property alias spacing: layout.spacing
++    property alias header: headerLoader.sourceComponent
++    property alias footer: footerLoader.sourceComponent
++    readonly property alias rowItems: layout.children
++    contentWidth: width
++    contentHeight: layout.height
++    flickableDirection: Flickable.VerticalFlick
++
++    function itemAtIndex(index) { return rows.itemAt(index) }
++    function indexAt(x, y) {
++        for (let i = 0; i < count; ++i) {
++            const item = rows.itemAt(i)
++            if (item && y >= item.y && y < item.y + item.height) return i
++        }
++        return -1
++    }
++    function forceLayout() { layout.forceLayout() }
++    function positionViewAtEnd() {
++        forceLayout()
++        contentY = Math.max(0, contentHeight - height)
++    }
++    function positionViewAtIndex(index, mode) {
++        forceLayout()
++        const item = itemAtIndex(index)
++        if (item) contentY = Math.max(0, Math.min(contentHeight - height,
++            mode === ListView.End ? item.y + item.height - height : item.y))
++    }
++    Column {
++        id: layout
++        width: view.width
++        Loader {
++            id: headerLoader
++            width: parent.width
++            visible: height > 0
++        }
++        Repeater { id: rows }
++        Loader {
++            id: footerLoader
++            width: parent.width
++            visible: height > 0
++        }
++    }
++}

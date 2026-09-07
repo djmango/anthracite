@@ -27,7 +27,7 @@ def main [] {
         let output = $result.stdout + $result.stderr
         $output | save ($directory | path join $"($test.script).log")
         print $output
-        if $result.exit_code != 0 or not ($output | str contains $test.marker) or ($output =~ 'TypeError:|QProcess: Destroyed while process') {
+        if $result.exit_code != 0 or not ($output | str contains $test.marker) or ($output =~ 'TypeError:|QProcess: Destroyed while process|The current style does not support customization') {
             error make {msg: $"($test.script) failed \(exit ($result.exit_code)\). Logs and isolated profile retained at ($directory)"}
         }
     }

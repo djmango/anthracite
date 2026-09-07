@@ -137,7 +137,12 @@ disables the application palette override.
 Long prompts and individual work entries expand on demand. History arrives in 60-message pages,
 with work details in 20-entry pages and bounded render thumbnails. Paging changes only the chat
 view, never the CAD document or its undo history. Rust still reconstructs the conversation from
-stored events; this bounds UI transport/rendering, not database replay memory.
+stored events; this bounds UI transport per request, not database replay memory.
+The transcript keeps measured layouts for loaded messages in a Flickable, rather than estimating
+offscreen message heights. Scrolling must not change message geometry. Loading more history
+increases retained UI memory; this is not an unlimited-history virtualization scheme.
+Anthracite's QML controls use Qt's customizable Basic style locally, with shared palette colors;
+FreeCAD's native widget style is not replaced.
 
 Inside that tool, `cad.render_views()` attaches axonometric, front, right, and top
 PNG views for visual inspection. Pass a list such as `cad.render_views(["front", "rear"])`
