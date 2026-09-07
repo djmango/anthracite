@@ -136,8 +136,14 @@ disables the application palette override.
 Native controls and the Start page share Anthracite's FreeCAD theme parameters, with flat dark
 surfaces. Existing FreeCAD UI keeps its native icons. Anthracite's added agent panel and
 status-bar controls use bundled, MIT-licensed Iconoir icons, even when FreeCAD has an
-equivalent; the robot uses the Phosphor fallback. FreeCAD's icons are not overridden.
+equivalent. FreeCAD's icons are not overridden.
 No icons are downloaded at runtime.
+The notification indicator is hidden by default, but notification delivery remains active:
+user-only and translated notifications are not duplicated in the console. Re-enable
+Notification Area from the status bar's context menu; FreeCAD remembers that choice.
+The bottom panel has Console and User notifications tabs. The latter collects user-only
+and translated native messages for the current session, excluding ordinary console output.
+The status preview fills the space between its dividers and truncates long lines.
 
 Long prompts and individual work entries expand on demand. History arrives in 60-message pages,
 with work details in 20-entry pages and bounded render thumbnails. Paging changes only the chat

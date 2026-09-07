@@ -1234,7 +1234,7 @@
 +# Content-address the resource path, not a URL query (Qt's disk-cache key strips
 +# queries). Fixed RCC timestamps must never reuse a previous component definition.
 +set(AnthraciteQml_FINGERPRINT "")
-+foreach(component Main TranscriptView TranscriptText ActivityEntry AgentSettings StatusBar Hint)
++foreach(component Main TranscriptView TranscriptText ActivityEntry AgentSettings StatusBar Hint UserNotifications ConsoleNavigation)
 +    set(qml_file ${CMAKE_CURRENT_SOURCE_DIR}/Resources/qml/${component}.qml)
 +    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${qml_file})
 +    file(SHA256 ${qml_file} qml_hash)
@@ -1242,7 +1242,7 @@
 +endforeach()
 +string(SHA256 AnthraciteQml_VERSION ${AnthraciteQml_FINGERPRINT})
 +set(AnthraciteIcon_RESOURCES "")
-+foreach(icon robot color-picker plus nav-arrow-down nav-arrow-left nav-arrow-right arrow-down check xmark terminal)
++foreach(icon hexagon color-picker plus nav-arrow-down nav-arrow-left nav-arrow-right arrow-down check xmark terminal)
 +    string(APPEND AnthraciteIcon_RESOURCES "<file alias=\"${icon}.svg\">${CMAKE_CURRENT_SOURCE_DIR}/Resources/icons/${icon}.svg</file>\n")
 +endforeach()
 +configure_file(Resources/Anthracite.qrc ${CMAKE_CURRENT_BINARY_DIR}/Anthracite.qrc @ONLY)
@@ -1634,16 +1634,17 @@
 +#endif  // ANTHRACITEGUI_CONVERSATIONMODEL_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,32 @@
 +<!DOCTYPE RCC>
 +<RCC version="1.0">
 +    <qresource prefix="/Anthracite/icons">
 +        @AnthraciteIcon_RESOURCES@
 +        <file alias="map.json">@CMAKE_CURRENT_SOURCE_DIR@/Resources/icons/map.json</file>
 +        <file alias="LICENSE-Iconoir">@CMAKE_CURRENT_SOURCE_DIR@/Resources/icons/LICENSE-Iconoir</file>
-+        <file alias="LICENSE-Phosphor">@CMAKE_CURRENT_SOURCE_DIR@/Resources/icons/LICENSE-Phosphor</file>
 +    </qresource>
 +    <qresource prefix="/Anthracite">
++        <file alias="qml/ConsoleNavigation.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ConsoleNavigation.qml</file>
++        <file alias="qml/UserNotifications.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/UserNotifications.qml</file>
 +        <file alias="theme.yaml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/theme.yaml</file>
 +        <file alias="qml/Hint.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Hint.qml</file>
 +        <file alias="qml/TranscriptView.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptView.qml</file>
@@ -1655,6 +1656,8 @@
 +        <file alias="qml/ActivityEntry.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ActivityEntry.qml</file>
 +    </qresource>
 +    <qresource prefix="/Anthracite/@AnthraciteQml_VERSION@">
++        <file alias="qml/ConsoleNavigation.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ConsoleNavigation.qml</file>
++        <file alias="qml/UserNotifications.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/UserNotifications.qml</file>
 +        <file alias="qml/Hint.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Hint.qml</file>
 +        <file alias="qml/TranscriptView.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptView.qml</file>
 +        <file alias="qml/StatusBar.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/StatusBar.qml</file>
@@ -3878,7 +3881,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,937 @@
+@@ -0,0 +1,998 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -4083,6 +4086,23 @@
 +    assert chrome is not None
 +    status = main_window.findChild(QtQuickWidgets.QQuickWidget, 'AnthraciteStatusBar')
 +    assert status is not None and status.status() == QtQuickWidgets.QQuickWidget.Ready
++    def visual_items(item):
++        yield item
++        for child in item.childItems():
++            yield from visual_items(child)
++    status_items = {item.objectName(): item for item in visual_items(status.rootObject())}
++    for index, axis in enumerate(('x', 'y', 'z')):
++        label = status_items['AnthraciteAxis' + str(index)]
++        value = status_items['AnthraciteCoordinateValue' + str(index)]
++        assert label.property('text') == axis
++        assert label.property('color').name() == '#a06666'
++        metrics = QtGui.QFontMetrics(value.property('font'))
++        assert value.property('width') >= metrics.horizontalAdvance('-9999.99') - 1
++    dimensions = [widget for widget in QtWidgets.QApplication.allWidgets()
++                  if widget.inherits('Gui::DimensionWidget')]
++    assert dimensions, 'Native viewport dimension widget not found'
++    assert dimensions[0].minimumWidth() >= dimensions[0].fontMetrics().horizontalAdvance('9999.99 mm x 9999.99 mm') + 32, (dimensions[0].minimumWidth(), dimensions[0].fontMetrics().horizontalAdvance('9999.99 mm x 9999.99 mm'))
++    assert '#WbTabBar QTabBar::tab:selected' in QtWidgets.QApplication.instance().styleSheet()
 +    assert QtWidgets.QApplication.palette().color(QtGui.QPalette.Highlight).name() == '#a06666'
 +    assert QtWidgets.QApplication.palette().color(QtGui.QPalette.Window).name() == '#080808'
 +    cube = App.ParamGet('User parameter:BaseApp/Preferences/NaviCube')
@@ -4110,12 +4130,12 @@
 +    assert QtWidgets.QApplication.palette().color(QtGui.QPalette.Button).name() == '#111111'
 +    chat_toggle = status.rootObject().findChild(QtCore.QObject, 'AnthraciteChatToggle')
 +    assert not chat_toggle.property('text'), 'Chat toggle should be icon-only'
-+    assert QtCore.QFile.exists(':/Anthracite/icons/robot.svg')
++    assert QtCore.QFile.exists(':/Anthracite/icons/hexagon.svg')
 +    icon_map = QtCore.QFile(':/Anthracite/icons/map.json')
 +    assert icon_map.open(QtCore.QIODevice.ReadOnly)
 +    icons = json.loads(bytes(icon_map.readAll()))['icons']
 +    from PySide6 import QtSvg
-+    for alias in icons + ['robot']:
++    for alias in icons:
 +        assert QtSvg.QSvgRenderer(':/Anthracite/icons/' + alias + '.svg').isValid(), alias
 +    assert not QtCore.QDir.searchPaths('iconOverrides'), 'Native icons must not be overridden'
 +    assert not Gui.getIcon('PartDesign_Pad').isNull()
@@ -4145,7 +4165,47 @@
 +    chrome.changed.disconnect(console_changed)
 +    assert any('Anthracite console status probe' in message for message in console_updates), (chrome.property('latestMessage'), console_updates)
 +    console_dock = main_window.findChild(QtWidgets.QDockWidget, 'Report view')
++    console_button = status.rootObject().findChild(QtCore.QObject, 'AnthraciteConsoleToggle')
++    console_preview = status.rootObject().findChild(QtCore.QObject, 'AnthraciteConsolePreview')
++    console_width = console_button.property('width')
++    for message in ('Short', 'Long console message ' * 80):
++        App.Console.PrintMessage(message + '\n')
++        QtTest.QTest.qWait(100)
++        assert abs(console_button.property('width') - console_width) <= 1
++    assert console_width > 260, 'Console preview should fill available status-bar space'
++    assert console_preview.property('truncated'), 'Long console preview must end in an ellipsis'
++    for name in ('AnthraciteConsoleDivider', 'AnthraciteAgentDivider'):
++        divider = status.rootObject().findChild(QtCore.QObject, name)
++        assert divider is not None and divider.property('visible')
++        assert divider.property('width') == 1 and divider.property('height') == 18
 +    assert console_dock is not None
++    tabs = console_dock.findChild(QtWidgets.QTabWidget, 'AnthraciteConsoleTabs')
++    assert tabs is not None and tabs.count() == 2
++    assert tabs.tabBar().isHidden()
++    assert console_dock.titleBarWidget() is not None and console_dock.titleBarWidget().height() == 0
++    navigation = console_dock.findChild(QtQuickWidgets.QQuickWidget, 'AnthraciteConsoleNavigation')
++    assert navigation is not None and navigation.status() == QtQuickWidgets.QQuickWidget.Ready
++    assert navigation.width() == 150
++    assert console_button.property('leftPadding') == 16
++    assert console_button.property('rightPadding') == 16
++    assert console_preview.property('opacity') < 0.7
++    notifications_view = tabs.widget(1)
++    assert notifications_view.status() == QtQuickWidgets.QQuickWidget.Ready
++    notification_model = notifications_view.findChild(QtCore.QStringListModel, 'AnthraciteUserNotifications')
++    before = notification_model.rowCount()
++    App.Console.PrintMessage('console-only panel probe\n')
++    App.Console.PrintWarning('console-only warning probe\n')
++    QtTest.QTest.qWait(100)
++    assert notification_model.rowCount() == before
++    App.Console.PrintNotification('user-only panel probe')
++    QtTest.QTest.qWait(100)
++    assert notification_model.rowCount() == before + 1
++    assert 'user-only panel probe' in notification_model.data(notification_model.index(before, 0))
++    tabs.setCurrentIndex(1)
++    console_dock.show()
++    QtTest.QTest.qWait(100)
++    assert notifications_view.isVisible()
++    tabs.setCurrentIndex(0)
 +    console_dock.hide()
 +    chrome.toggleConsole()
 +    assert console_dock.isVisible() and main_window.dockWidgetArea(console_dock) == QtCore.Qt.BottomDockWidgetArea
@@ -4812,6 +4872,10 @@
 +
 +run_smoke_test()
 +def finish():
++    # Cocoa can terminate Qt before deferred Start-page destruction runs.
++    # Close test-created views while Qt/PySide thread storage is still alive.
++    for view in Gui.getMainWindow().findChildren(QtWidgets.QWidget, 'StartView'):
++        view.close()
 +    # Drain deferred native-widget destruction before Cocoa tears down Qt thread storage.
 +    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
 +    QtWidgets.QApplication.instance().quit()
@@ -5410,7 +5474,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Chrome.cpp
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,359 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +#include "Chrome.h"
 +#include "Sidebar.h"
@@ -5432,6 +5496,12 @@
 +#include <QToolTip>
 +#include <QTextDocument>
 +#include <QScreen>
++#include <QStringListModel>
++#include <QTabWidget>
++#include <QTabBar>
++#include <QHBoxLayout>
++#include <QDateTime>
++#include <Base/Console.h>
 +#include <App/Application.h>
 +#include <Gui/Application.h>
 +#include <Gui/MainWindow.h>
@@ -5445,6 +5515,38 @@
 +using namespace AnthraciteGui;
 +
 +namespace {
++// Adapt FreeCAD's native user-message stream to QML; ReportOutput owns console logs.
++class UserNotifications final: public QStringListModel, public Base::ILogger {
++public:
++    explicit UserNotifications(QObject* parent) : QStringListModel(parent) {
++        setObjectName(QStringLiteral("AnthraciteUserNotifications"));
++        bNotification = true;
++        Base::Console().attachObserver(this);
++    }
++    ~UserNotifications() override { Base::Console().detachObserver(this); }
++    const char* name() override { return "AnthraciteUserNotifications"; }
++    void sendLog(const std::string& notifier, const std::string& message,
++                 Base::LogStyle level, Base::IntendedRecipient recipient,
++                 Base::ContentType content) override {
++        if (recipient != Base::IntendedRecipient::User && content != Base::ContentType::Translated)
++            return;
++        QString text = content == Base::ContentType::Translated
++            ? QString::fromStdString(message)
++            : QCoreApplication::translate("Notifications", message.c_str());
++        if (text.trimmed().isEmpty()) return;
++        const QString severity = level == Base::LogStyle::Error || level == Base::LogStyle::Critical
++            ? tr("Error") : level == Base::LogStyle::Warning ? tr("Warning") : tr("Notification");
++        const QString entry = QStringLiteral("%1 · %2 · %3\n%4")
++            .arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss")), severity,
++                 QString::fromStdString(notifier), text.trimmed());
++        QMetaObject::invokeMethod(this, [this, entry]() {
++            const int row = rowCount();
++            insertRow(row);
++            setData(index(row), entry);
++        }, Qt::QueuedConnection);
++    }
++};
++
 +class HiddenTitleBar: public QWidget {
 +public:
 +    using QWidget::QWidget;
@@ -5484,6 +5586,13 @@
 +
 +bool Chrome::eventFilter(QObject* watched, QEvent* event)
 +{
++    if ((event->type() == QEvent::FontChange || event->type() == QEvent::Show
++         || event->type() == QEvent::ParentChange || event->type() == QEvent::Polish)
++        && watched->inherits("Gui::DimensionWidget")) {
++        auto* widget = static_cast<QWidget*>(watched);
++        const auto style = QStringLiteral("min-width:%1px;").arg(widget->fontMetrics().horizontalAdvance(QStringLiteral("9999.99 mm x 9999.99 mm")) + 32);
++        if (widget->styleSheet() != style) widget->setStyleSheet(style);
++    }
 +    if (event->type() == QEvent::ToolTip) {
 +        if (auto* button = qobject_cast<QAbstractButton*>(watched); button && !button->toolTip().isEmpty()) {
 +            QString text = button->toolTip();
@@ -5537,7 +5646,9 @@
 +        window->addDockWidget(Qt::BottomDockWidgetArea, dock);
 +        dock->show();
 +        dock->raise();
-+        output->setFocus();
++        if (auto* tabs = dock->findChild<QTabWidget*>(QStringLiteral("AnthraciteConsoleTabs")))
++            tabs->currentWidget()->setFocus();
++        else output->setFocus();
 +    } else dock->hide();
 +}
 +
@@ -5575,6 +5686,15 @@
 +    auto* window = Gui::getMainWindow();
 +    if (window->findChild<Chrome*>()) return;
 +    auto preferences = App::GetApplication().GetParameterGroupByPath("User parameter:BaseApp/Preferences/Mod/Anthracite");
++    // Hide the indicator, not the notification observer: user-only messages
++    // are intentionally excluded from FreeCAD's Report view.
++    auto statusPreferences = App::GetApplication().GetParameterGroupByPath("User parameter:BaseApp/MainWindow/StatusBar");
++    if (!preferences->GetBool("NotificationIndicatorDefaultInitialized", false)) {
++        statusPreferences->SetBool("notificationArea", false);
++        preferences->SetBool("NotificationIndicatorDefaultInitialized", true);
++    }
++    if (auto* notifications = window->findChild<QWidget*>(QStringLiteral("notificationArea")))
++        notifications->setVisible(statusPreferences->GetBool("notificationArea", false));
 +    auto windowPreferences = App::GetApplication().GetParameterGroupByPath("User parameter:BaseApp/Preferences/MainWindow");
 +    if (preferences->GetBool("UseAnthraciteTheme", true)) {
 +        // Native cube settings update existing views and remain user-editable.
@@ -5618,7 +5738,7 @@
 +        Gui::Application::Instance->setStyleSheet(QStringLiteral("FreeCAD.qss"), false);
 +        qApp->setStyleSheet(qApp->styleSheet() + QStringLiteral(
 +            "\nQStatusBar{background:palette(window);border-top:1px solid palette(mid);}"
-+            "QStatusBar::item{border:0;} QToolBar{border:0;spacing:4px;}"
++            "QStatusBar::item{border:0;border-right:1px solid palette(mid);} QToolBar{border:0;spacing:4px;}"
 +            "QMainWindow,QMenuBar,QMenu,QToolBar,QDockWidget{background:palette(window);color:palette(window-text);}"
 +            "QTreeView{background:transparent;color:palette(text);selection-background-color:palette(highlight);selection-color:palette(highlighted-text);}"
 +            "QDockWidget::title{padding:5px;} QMenu{padding:4px;}"
@@ -5626,6 +5746,9 @@
 +            "QDockWidget::float-button{image:url(qss:overlay/icons/float.svg);}"
 +            "QToolButton:hover{background:palette(mid);border-radius:4px;}"
 +            "QToolButton:checked{background:palette(highlight);color:palette(highlighted-text);border-radius:4px;}"));
++        qApp->setStyleSheet(qApp->styleSheet() + QStringLiteral(
++            "#WbTabBar QTabBar::tab:selected{color:palette(highlight);border-bottom:2px solid palette(highlight);}"
++            "#WbTabBar QTabBar::tab:!selected{border-bottom:2px solid transparent;}"));
 +        // Tooltips use their own palette roles (including the inactive group).
 +        qApp->setStyleSheet(qApp->styleSheet() + QStringLiteral(
 +            "QToolTip{background:palette(tool-tip-base);color:palette(tool-tip-text);"
@@ -5649,6 +5772,44 @@
 +        Gui::OverlayManager::instance()->reload();
 +    }
 +    auto* dock = qobject_cast<QDockWidget*>(ensureSidebar()->parentWidget());
++    // Keep the original Report view and its observer alive under a native tab host.
++    if (auto* report = window->findChild<QDockWidget*>(QStringLiteral("Report view"))) {
++        if (!report->findChild<QTabWidget*>(QStringLiteral("AnthraciteConsoleTabs"))) {
++            auto* original = report->widget();
++            if (original) {
++                original->setParent(nullptr);
++                auto* panel = new QWidget(report);
++                auto* layout = new QHBoxLayout(panel);
++                layout->setContentsMargins(0, 0, 0, 0);
++                layout->setSpacing(0);
++                auto* tabs = new QTabWidget(panel);
++                tabs->setObjectName(QStringLiteral("AnthraciteConsoleTabs"));
++                tabs->setDocumentMode(true);
++                tabs->addTab(original, QObject::tr("Console"));
++                auto* notifications = new QQuickWidget(tabs);
++                notifications->setObjectName(QStringLiteral("AnthraciteNotificationsView"));
++                notifications->setResizeMode(QQuickWidget::SizeRootObjectToView);
++                auto* model = new UserNotifications(notifications);
++                notifications->rootContext()->setContextProperty(QStringLiteral("userNotifications"), model);
++                notifications->setSource(QUrl(QStringLiteral("qrc:/Anthracite/" ANTHRACITE_QML_VERSION "/qml/UserNotifications.qml")));
++                tabs->addTab(notifications, QObject::tr("User notifications"));
++                tabs->tabBar()->hide();
++                auto* navigation = new QQuickWidget(panel);
++                navigation->setObjectName(QStringLiteral("AnthraciteConsoleNavigation"));
++                navigation->setFixedWidth(150);
++                navigation->setResizeMode(QQuickWidget::SizeRootObjectToView);
++                navigation->rootContext()->setContextProperty(QStringLiteral("consolePages"), tabs);
++                navigation->setSource(QUrl(QStringLiteral("qrc:/Anthracite/" ANTHRACITE_QML_VERSION "/qml/ConsoleNavigation.qml")));
++                layout->addWidget(navigation);
++                layout->addWidget(tabs, 1);
++                report->setWidget(panel);
++                auto* title = new HiddenTitleBar(report);
++                title->setObjectName(QStringLiteral("AnthraciteConsoleHiddenTitleBar"));
++                title->setFixedHeight(0);
++                report->setTitleBarWidget(title);
++            }
++        }
++    }
 +    auto* chrome = new Chrome(dock);
 +    auto* bar = new QQuickWidget(window->statusBar());
 +    bar->setObjectName(QStringLiteral("AnthraciteStatusBar"));
@@ -5666,7 +5827,12 @@
 +            window->statusBar()->addWidget(label, 0);
 +        }
 +    }
-+    window->statusBar()->insertPermanentWidget(0, bar, 1);
++    window->statusBar()->addPermanentWidget(bar, 1);
++    for (auto* widget : QApplication::allWidgets()) {
++        if (widget->inherits("Gui::DimensionWidget")) {
++            widget->setStyleSheet(QStringLiteral("min-width:%1px;").arg(widget->fontMetrics().horizontalAdvance(QStringLiteral("9999.99 mm x 9999.99 mm")) + 32));
++        }
++    }
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Chrome.h
@@ -5714,7 +5880,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/StatusBar.qml
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,107 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
@@ -5724,36 +5890,93 @@
 +Rectangle {
 +    color: palette.window
 +    SystemPalette { id: palette }
++    component Divider: Rectangle {
++        Layout.preferredWidth: 1
++        Layout.preferredHeight: 18
++        Layout.alignment: Qt.AlignVCenter
++        color: palette.mid
++    }
 +    RowLayout {
 +        anchors.fill: parent
 +        spacing: 8
 +        ToolButton {
++            id: consoleButton
 +            objectName: "AnthraciteConsoleToggle"
-+            Layout.fillWidth: true
 +            Layout.minimumWidth: 60
++            Layout.fillWidth: true
 +            Layout.fillHeight: true
 +            text: chrome.latestMessage
 +            icon.source: "qrc:/Anthracite/icons/terminal.svg"
 +            icon.width: 16; icon.height: 16
 +            icon.color: "transparent"
 +            font.pixelSize: 12
++            leftPadding: 16
++            rightPadding: 16
++            contentItem: RowLayout {
++                spacing: 6
++                Image {
++                    source: consoleButton.icon.source
++                    sourceSize.width: 16; sourceSize.height: 16
++                    Layout.preferredWidth: 16
++                    Layout.preferredHeight: 16
++                }
++                Text {
++                    objectName: "AnthraciteConsolePreview"
++                    Layout.fillWidth: true
++                    Layout.minimumWidth: 0
++                    text: consoleButton.text
++                    font: consoleButton.font
++                    color: palette.windowText
++                    opacity: 0.62
++                    elide: Text.ElideRight
++                    wrapMode: Text.NoWrap
++                    maximumLineCount: 1
++                }
++            }
 +            onClicked: chrome.toggleConsole()
 +            Hint { hovered: parent.hovered; text: qsTr("Show or hide console") }
 +            Accessible.name: qsTr("Toggle console")
 +        }
-+        Label {
++        Divider { objectName: "AnthraciteConsoleDivider" }
++        RowLayout {
++            id: coordinateLabel
++            objectName: "AnthraciteCoordinates"
 +            visible: parent.width > 640
-+            text: chrome.coordinates
-+            color: palette.windowText
-+            font.pixelSize: 12
++            spacing: 8
++            readonly property var parts: chrome.coordinates.trim().split(/\s+/)
++            FontMetrics { id: coordinateFont; font.pixelSize: 12 }
++            Repeater {
++                model: ["x", "y", "z"]
++                RowLayout {
++                    required property int index
++                    required property string modelData
++                    spacing: 6
++                    Label {
++                        objectName: "AnthraciteAxis" + parent.index
++                        text: parent.modelData
++                        color: palette.highlight
++                        font.pixelSize: 12
++                    }
++                    Label {
++                        objectName: "AnthraciteCoordinateValue" + parent.index
++                        text: coordinateLabel.parts[parent.index * 2 + 1] || "—"
++                        Layout.minimumWidth: Math.ceil(coordinateFont.advanceWidth("-9999.99"))
++                        horizontalAlignment: Text.AlignRight
++                        color: palette.windowText
++                        font.pixelSize: 12
++                    }
++                }
++            }
++            Label { text: "mm"; color: palette.windowText; opacity: 0.62; font.pixelSize: 12 }
 +            Hint { hovered: coordinateHover.hovered; text: chrome.coordinateSource }
 +            HoverHandler { id: coordinateHover }
 +        }
++        Divider { objectName: "AnthraciteAgentDivider" }
 +        ToolButton {
 +            objectName: "AnthraciteChatToggle"
 +            Layout.fillHeight: true
 +            Layout.preferredWidth: 34
-+            icon.source: "qrc:/Anthracite/icons/robot.svg"
++            icon.source: "qrc:/Anthracite/icons/hexagon.svg"
 +            icon.width: 18; icon.height: 18
 +            icon.color: "transparent"
 +            Accessible.name: qsTr("Show or hide agent")
@@ -5894,20 +6117,15 @@
 +</svg>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/icons/map.json
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,19 @@
 +{
 +  "source": "https://github.com/iconoir-icons/iconoir",
 +  "version": "v7.12.1",
 +  "commit": "d7dfa4d0341df0670bfed9fc24221c9d7ef2112e",
 +  "license": "MIT",
-+  "phosphorFallback": {
-+    "icon": "robot",
-+    "source": "https://github.com/phosphor-icons/core/blob/main/assets/regular/robot.svg",
-+    "license": "MIT",
-+    "licenseFile": "LICENSE-Phosphor"
-+  },
 +  "adaptation": "currentColor replaced with #E5E1DE for native Qt SVG rendering; paths unchanged",
 +  "icons": [
++    "hexagon",
 +    "plus",
 +    "nav-arrow-down",
 +    "nav-arrow-left",
@@ -6077,30 +6295,112 @@
 +<path d="M6.75827 17.2426L12.0009 12M17.2435 6.75736L12.0009 12M12.0009 12L6.75827 6.75736M12.0009 12L17.2435 17.2426" stroke="#E5E1DE" stroke-linecap="round" stroke-linejoin="round"/>
 +</svg>
 --- /dev/null
-+++ b/src/Mod/Anthracite/Gui/Resources/icons/LICENSE-Phosphor
-@@ -0,0 +1,21 @@
-+MIT License
-+
-+Copyright (c) 2023 Phosphor Icons
-+
-+Permission is hereby granted, free of charge, to any person obtaining a copy
-+of this software and associated documentation files (the "Software"), to deal
-+in the Software without restriction, including without limitation the rights
-+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-+copies of the Software, and to permit persons to whom the Software is
-+furnished to do so, subject to the following conditions:
-+
-+The above copyright notice and this permission notice shall be included in all
-+copies or substantial portions of the Software.
-+
-+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-+SOFTWARE.
++++ b/src/Mod/Anthracite/Gui/Resources/icons/hexagon.svg
+@@ -0,0 +1,3 @@
++<svg width="24" height="24" stroke-width="1.5" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
++<path d="M11.7 1.1732C11.8856 1.06603 12.1144 1.06603 12.3 1.17321L21.2263 6.3268C21.4119 6.43397 21.5263 6.63205 21.5263 6.84641V17.1536C21.5263 17.3679 21.4119 17.566 21.2263 17.6732L12.3 22.8268C12.1144 22.934 11.8856 22.934 11.7 22.8268L2.77372 17.6732C2.58808 17.566 2.47372 17.3679 2.47372 17.1536V6.84641C2.47372 6.63205 2.58808 6.43397 2.77372 6.32679L11.7 1.1732Z" stroke="#E5E1DE" stroke-linecap="round" stroke-linejoin="round"/>
++</svg>
 --- /dev/null
-+++ b/src/Mod/Anthracite/Gui/Resources/icons/robot.svg
-@@ -0,0 +1 @@
-+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="#E5E1DE"><path d="M200,48H136V16a8,8,0,0,0-16,0V48H56A32,32,0,0,0,24,80V192a32,32,0,0,0,32,32H200a32,32,0,0,0,32-32V80A32,32,0,0,0,200,48Zm16,144a16,16,0,0,1-16,16H56a16,16,0,0,1-16-16V80A16,16,0,0,1,56,64H200a16,16,0,0,1,16,16Zm-52-56H92a28,28,0,0,0,0,56h72a28,28,0,0,0,0-56Zm-24,16v24H116V152ZM80,164a12,12,0,0,1,12-12h8v24H92A12,12,0,0,1,80,164Zm84,12h-8V152h8a12,12,0,0,1,0,24ZM72,108a12,12,0,1,1,12,12A12,12,0,0,1,72,108Zm88,0a12,12,0,1,1,12,12A12,12,0,0,1,160,108Z"/></svg>
++++ b/src/Mod/Anthracite/Gui/Resources/qml/UserNotifications.qml
+@@ -0,0 +1,34 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++import QtQuick
++import QtQuick.Controls.Basic
++
++Rectangle {
++    color: colors.window
++    SystemPalette { id: colors }
++    Label {
++        anchors.centerIn: parent
++        visible: messages.count === 0
++        text: qsTr("No user notifications this session")
++        color: colors.windowText
++    }
++    ListView {
++        id: messages
++        objectName: "AnthraciteUserNotificationsList"
++        anchors.fill: parent
++        anchors.margins: 8
++        clip: true
++        spacing: 8
++        model: userNotifications
++        ScrollBar.vertical: ScrollBar {}
++        delegate: TextEdit {
++            required property string display
++            width: ListView.view.width - 16
++            text: display
++            color: colors.windowText
++            readOnly: true
++            selectByMouse: true
++            textFormat: TextEdit.PlainText
++            wrapMode: TextEdit.Wrap
++        }
++    }
++}
+--- a/src/Gui/NotificationArea.cpp
++++ b/src/Gui/NotificationArea.cpp
+@@ -946,7 +946,7 @@ NotificationArea::NotificationArea(QWidg
+         qApp->sendEvent(pImp->menu, &re);
+ 
+         // This corrects the position of the menu
+-        QTimer::singleShot(0, [&] {
++        QTimer::singleShot(0, this, [&] {
+             QWidget* statusbar = static_cast<QWidget*>(this->parent());
+             QPoint statusbar_top_right = statusbar->mapToGlobal(statusbar->rect().topRight());
+             QSize menusize = pImp->menu->size();
+@@ -1243,6 +1243,7 @@ void NotificationArea::showInNotificatio
+                 if (!item->isShown()) {
+                     QTimer::singleShot(
+                         pImp->notificationExpirationTime,
++                        this,
+                         [this, item, repetitions = item->getRepetitions()]() {
+                             // guard to avoid modifying the notification
+                             // start index while creating the tooltip
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Resources/qml/ConsoleNavigation.qml
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++import QtQuick
++import QtQuick.Controls.Basic
++
++Rectangle {
++    SystemPalette { id: colors }
++    color: colors.window
++    Rectangle {
++        anchors.right: parent.right
++        height: parent.height
++        width: 1
++        color: colors.mid
++    }
++    Column {
++        anchors.fill: parent
++        anchors.margins: 6
++        spacing: 4
++        Repeater {
++            model: [qsTr("Console"), qsTr("User notifications")]
++            ToolButton {
++                required property int index
++                required property string modelData
++                objectName: "AnthraciteConsolePage" + index
++                width: parent.width
++                height: Math.max(32, implicitContentHeight + 12)
++                padding: 6
++                text: modelData
++                Accessible.name: modelData
++                checked: consolePages.currentIndex === index
++                onClicked: consolePages.currentIndex = index
++                contentItem: Text {
++                    text: parent.text
++                    color: colors.windowText
++                    verticalAlignment: Text.AlignVCenter
++                    wrapMode: Text.WordWrap
++                }
++                background: Rectangle {
++                    radius: 4
++                    color: parent.checked ? colors.highlight : parent.hovered ? colors.alternateBase : "transparent"
++                    opacity: parent.down ? 0.8 : 1
++                }
++            }
++        }
++    }
++}

@@ -13,7 +13,10 @@ try:
 
     # Native notification widgets can re-enter Qt logging/accessibility on
     # macOS. Keep diagnostics in the report/log, not transient test widgets.
-    from PySide6 import QtCore
+    from PySide6 import QtCore, QtTest, QtWidgets
+    QtTest.QTest.qWait(100)
+    notifications = Gui.getMainWindow().findChild(QtWidgets.QWidget, 'notificationArea')
+    assert notifications is not None and notifications.isHidden(), 'Hide only the notification indicator'
     App.ParamGet("User parameter:BaseApp/Preferences/NotificationArea").SetBool(
         "NotificationAreaEnabled", False)
     QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
