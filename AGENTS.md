@@ -144,8 +144,10 @@ just test
 - Python remains the model-facing FreeCAD API. Do not create a large Rust
   binding layer where a direct FreeCAD Python call is clearer.
 - Keep the Rust/native boundary narrow and stable.
-- Use embedded [Turso](https://github.com/tursodatabase/turso) for conversation
-  and session state. Keep Anthracite identity and session associations outside
+- Use SQLite through `rusqlite` (bundled engine, cached statements, WAL, and
+  `synchronous=FULL`) for conversation/session state and the operation journal.
+  Keep its single connection in the Rust runtime, never on the GUI thread.
+  Keep Anthracite identity and session associations outside
   `.FCStd` by default. If document metadata is ever necessary, use only normal
   upstream-supported FreeCAD extension or property mechanisms and require
   verified open/save round-trip compatibility with unmodified FreeCAD.

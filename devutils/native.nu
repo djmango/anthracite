@@ -13,7 +13,6 @@ def --wrapped main [mode: string, ...arguments: string] {
         hide-env -i PYTHONHOME PYTHONPATH QT_PLUGIN_PATH QML_IMPORT_PATH QML2_IMPORT_PATH CMAKE_PREFIX_PATH NIXPKGS_QT6_QML_IMPORT_PATH
         let prefix = $source | path join .pixi envs default
         $env.ANTHRACITE_PYTHON = $prefix | path join bin python
-        $env.CARGO_ENCODED_RUSTFLAGS = ["-L" $"native=($prefix)/lib" "-C" $"link-arg=-Wl,-rpath,($prefix)/lib"] | str join (char -u 001f)
         cd $source
         match $mode {
             build => {

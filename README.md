@@ -39,7 +39,7 @@ The working vertical slice is implemented end to end:
   and dynamic tool calls
 - a provider-neutral, line-delimited interaction protocol for approvals, requested input, plans,
   usage, activity and robust interleaved streaming
-- embedded Turso persistence for external document identities, normalized event history and
+- embedded SQLite persistence for external document identities, normalized event history and
   resuming the same Codex thread across FreeCAD sessions
 - document-scoped conversation creation and navigation with per-thread persistent drafts
 - safe session switching when the active FreeCAD document changes, including Save and Save As
@@ -103,7 +103,7 @@ a normal `.FCStd` copy plus integrity/provenance metadata under
 `$XDG_STATE_HOME/anthracite/checkpoints`. `cad.checkpoints()` lists them;
 `cad.restore_checkpoint(checkpoint="id", revision=N)` opens a separate recovered
 copy and preserves the original document. Checkpoints are retained until explicitly
-removed; session/event records remain in Turso.
+removed; session/event records remain in SQLite.
 
 Visual inspection also supports `focus="Name"`, `highlight=["Name"]`, and
 `section=("z", 5)` on viewport renders. Sections clip to the positive half-space
@@ -194,9 +194,12 @@ Anthracite changes are explicit GNU Quilt patches under `patches/`, applied in t
 - A thin Qt bridge exposes Rust state/actions to QML. C++ is limited to FreeCAD registration,
   docking/restoration hooks, GUI-thread scheduling and native integration—not application logic.
 - Python remains the model-facing FreeCAD action language.
-- Embedded [Turso](https://github.com/tursodatabase/turso) stores conversation events, provider
+- SQLite through [rusqlite](https://github.com/rusqlite/rusqlite) stores conversation events, provider
   thread state and document/session associations outside `.FCStd`. Any future in-document metadata
   must use upstream-supported FreeCAD mechanisms and round-trip safely through unmodified FreeCAD.
+- The SQLite engine is bundled and pinned by Cargo, not supplied by the host. One Rust-owned
+  connection uses cached statements, WAL, explicit transactions and `synchronous=FULL` for durable
+  operation records. No database async runtime or connection pool is needed.
 - CAD calls also have durable `operations` records: exact Python, document/thread/tool identity,
   prepared revision, status, and executor results (changes, validation and errors). FreeCAD sends
   read-only context; Rust persists the running state before authorizing execution. Revisions are
@@ -277,11 +280,12 @@ The packaged app and development launcher share `devutils/launch.nu` and these l
 
 - `$XDG_CONFIG_HOME/anthracite`: FreeCAD preferences, dock layout, optional `qml/Main.qml`
 - `$XDG_DATA_HOME/anthracite`: FreeCAD user data
-- `$XDG_STATE_HOME/anthracite`: `anthracite.db` and a readable `anthracite.events.jsonl` projection
+- `$XDG_STATE_HOME/anthracite`: `anthracite.sqlite3` and a readable `anthracite.events.jsonl` projection
 - `$XDG_CACHE_HOME/anthracite`: disposable FreeCAD temporary data
 
-Turso is authoritative for sessions; the JSONL projection is for live inspection and is not a
-recovery log. Existing `build/profile` and legacy databases are left untouched. Bundled preferences
+SQLite is authoritative for sessions; the JSONL projection is for live inspection and is not a
+recovery log. The SQLite store starts fresh; older databases are not imported and remain untouched.
+Existing `build/profile` is also left untouched. Bundled preferences
 apply only when creating a new profile; updates never replace the user's current dock layout.
 
 To customize the sidebar, place a copy of the bundled `Main.qml` at the config path above and run

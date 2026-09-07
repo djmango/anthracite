@@ -752,7 +752,7 @@
 +    if (root.isEmpty() || !QDir::isAbsolutePath(root)) {
 +        root = QDir::home().filePath(QStringLiteral(".local/state"));
 +    }
-+    return QDir(root).filePath(QStringLiteral("anthracite/anthracite.db"));
++    return QDir(root).filePath(QStringLiteral("anthracite/anthracite.sqlite3"));
 +}
 +
 +QJsonObject AgentBridge::documentContext()
@@ -1020,7 +1020,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,96 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +find_package(
@@ -1030,7 +1030,6 @@
 +)
 +
 +find_program(CARGO_EXECUTABLE cargo REQUIRED)
-+find_package(ZLIB REQUIRED)
 +
 +set(AnthraciteRuntime_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../Runtime)
 +set(AnthraciteRuntime_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/runtime-target)
@@ -1040,22 +1039,10 @@
 +set(AnthraciteRuntime_BINARY
 +    ${CMAKE_BINARY_DIR}/Mod/Anthracite/anthracite-runtime${CMAKE_EXECUTABLE_SUFFIX}
 +)
-+get_filename_component(AnthraciteRuntime_LIBRARY_DIR ${ZLIB_LIBRARY} DIRECTORY)
-+set(AnthraciteRuntime_CARGO_ENV)
-+if(UNIX)
-+    # Let Cargo's native dependencies use the platform toolchain at build
-+    # time. At runtime, also search FreeCAD's packaged native libraries.
-+    set(
-+        AnthraciteRuntime_CARGO_ENV
-+        "RUSTFLAGS=-C link-arg=-Wl,-rpath,${AnthraciteRuntime_LIBRARY_DIR}"
-+    )
-+endif()
 +
 +add_custom_command(
 +    OUTPUT ${AnthraciteRuntime_BINARY}
 +    COMMAND
-+        ${CMAKE_COMMAND} -E env
-+        ${AnthraciteRuntime_CARGO_ENV}
 +        ${CARGO_EXECUTABLE} build
 +        --locked
 +        --release
