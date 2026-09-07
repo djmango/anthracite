@@ -136,7 +136,8 @@ disables the application palette override.
 Native controls and the Start page share Anthracite's FreeCAD theme parameters, with flat dark
 surfaces. Existing FreeCAD UI keeps its native icons. Anthracite's added agent panel and
 status-bar controls use bundled, MIT-licensed Iconoir icons, even when FreeCAD has an
-equivalent. FreeCAD's icons are not overridden. No icons are downloaded at runtime.
+equivalent; the robot uses the Phosphor fallback. FreeCAD's icons are not overridden.
+No icons are downloaded at runtime.
 
 Long prompts and individual work entries expand on demand. History arrives in 60-message pages,
 with work details in 20-entry pages and bounded render thumbnails. Paging changes only the chat
