@@ -95,7 +95,8 @@ just test
 
 - The interface and agent experience live inside FreeCAD.
 - The UI is QML-first, with Qt Quick where useful. It must be a normal FreeCAD
-  dock/sidebar: movable, resizable, closable, floatable, and restorable.
+  dock/sidebar: resizable, showable/hideable, and restorable, fixed to the right
+  side of the main window. Chat must not float or undock.
 - The native 3D viewport and ordinary FreeCAD interactions remain first class.
 - Integrate the user's existing Codex and OpenCode installations and preserve
   their authentication, configuration, models, skills, and normal tools. Do not

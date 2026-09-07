@@ -125,7 +125,9 @@ def --wrapped main [command: string, ...arguments: string] {
                     checked git -C $checkout apply --check ($patches | path join $name)
                     checked git -C $checkout apply ($patches | path join $name)
                 }
-                checked git -C $checkout diff --check
+                # Preserve upstream CRLF files without treating their line endings
+                # as whitespace errors; trailing spaces and blank EOF lines still fail.
+                checked git -c core.whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol -C $checkout diff --check
             } catch { |err|
                 error make {msg: $"Patch validation failed; checkout retained at ($directory): ($err.msg)"}
             }
