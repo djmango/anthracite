@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
-@@ -0,0 +1,889 @@
+@@ -0,0 +1,897 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "AgentBridge.h"
@@ -127,7 +127,6 @@
 +void AgentBridge::submit(const QString& prompt)
 +{
 +    queuedPrompt = prompt;
-+    assistantMessageStarted = false;
 +    stopping = false;
 +
 +    if (runtimeReady) {
@@ -371,7 +370,6 @@
 +    pendingRestartSaveId = 0;
 +    selectedLocalThreadId = threadId;
 +    createNewThread = createThread;
-+    assistantMessageStarted = false;
 +    documentRevision.reset();
 +    standardOutputBuffer.clear();
 +    sidebar->clearInteraction();
@@ -431,12 +429,11 @@
 +    else if (type == QLatin1String("history.snapshot")) {
 +        const QJsonArray events = payload.value("events").toArray();
 +        sidebar->resetHistory();
-+        assistantMessageStarted = false;
 +        for (const auto& value : events) {
 +            const QJsonObject event = value.toObject();
 +            if (event.value("type").toString() == QLatin1String("content.user")) {
 +                sidebar->appendUserMessage(event.value("payload").toObject().value("text").toString());
-+                assistantMessageStarted = false;
++                sidebar->restoreTurnStart(event.value("payload").toObject().value("timestampMs").toVariant().toLongLong());
 +            }
 +            else {
 +                handleMessage(event);
@@ -501,16 +498,33 @@
 +    else if (type == QLatin1String("content.delta")
 +             && payload.value("streamKind").toString() == QLatin1String("assistant_text")) {
 +        sidebar->updateStatus(tr("Responding"));
-+        if (!assistantMessageStarted) {
-+            sidebar->beginAssistantMessage();
-+            assistantMessageStarted = true;
-+        }
++        sidebar->beginAssistantMessage(payload.value("messageId").toString());
 +        sidebar->appendAssistantDelta(payload.value("text").toString());
 +    }
-+    else if (type == QLatin1String("item.started")) {
++    else if (type == QLatin1String("content.delta")) {
++        sidebar->appendReasoningDelta(payload.value("text").toString(), payload.value("messageId").toString());
++    }
++    else if (type == QLatin1String("tool.activity")) {
++        sidebar->appendActivity(QStringLiteral("freecad\n") + payload.value("arguments").toObject().value("code").toString());
++    }
++    else if (type == QLatin1String("tool.observation")) {
++        sidebar->appendActivity(QStringLiteral("FreeCAD result\n") + payload.value("result").toString());
++        for (const auto& image : payload.value("images").toArray()) {
++            const auto value = image.toObject();
++            sidebar->appendImage(image.isString() ? image.toString() : value.value("dataUrl").toString(), value.value("view").toString(tr("Model image")));
++        }
++    }
++    else if (type == QLatin1String("item.started") || type == QLatin1String("item.completed")) {
 +        const QString title = payload.value("title").toString();
 +        const QString detail = payload.value("detail").toString();
 +        sidebar->appendActivity(detail.isEmpty() ? title : tr("%1: %2").arg(title, detail));
++        for (const QString field : {QStringLiteral("input"), QStringLiteral("output")}) {
++            const auto value = payload.value(field);
++            if (!value.isNull() && !value.isUndefined()) {
++                sidebar->appendActivity(value.isString() ? value.toString()
++                    : QString::fromUtf8(QJsonDocument::fromVariant(value.toVariant()).toJson(QJsonDocument::Indented)));
++            }
++        }
 +    }
 +    else if (type == QLatin1String("tool.call")) {
 +        // Inspect without executing model code. The runtime must durably acknowledge
@@ -571,10 +585,15 @@
 +    else if (type == QLatin1String("turn.completed")) {
 +        const QString status = payload.value("status").toString();
 +        if (status == QLatin1String("failed")) {
-+            fail(payload.value("error").toString(tr("The provider turn failed.")));
++            queuedPrompt.clear();
++            sidebar->failTurn(payload.value("error").toString(tr("The provider turn failed.")),
++                              payload.value("timestampMs").toVariant().toLongLong());
 +        }
 +        else {
-+            sidebar->completeTurn();
++            if (status == QLatin1String("interrupted")) {
++                sidebar->appendActivity(tr("Interrupted"));
++            }
++            sidebar->completeTurn(payload.value("timestampMs").toVariant().toLongLong(), status == QLatin1String("completed"));
 +        }
 +    }
 +    else if (type == QLatin1String("runtime.error")) {
@@ -608,7 +627,6 @@
 +        return;
 +    }
 +    sidebar->updateStatus(tr("Editing"));
-+    sidebar->appendActivity(tr("Running FreeCAD Python"));
 +
 +    const auto context = payload.value("context").toObject();
 +    if (!context.value("revision").isDouble()) {
@@ -631,16 +649,6 @@
 +        result = QString::fromUtf8(resultDocument.toJson(QJsonDocument::Compact));
 +        if (resultObject.value("revision").isDouble()) {
 +            documentRevision = resultObject.value("revision").toInt();
-+        }
-+        const auto observation = resultObject.value("observation").toObject();
-+        const int created = observation.value("created").toArray().size();
-+        const int changed = observation.value("changed").toArray().size();
-+        const int deleted = observation.value("deleted").toArray().size();
-+        sidebar->appendActivity(
-+            tr("FreeCAD: %1 created, %2 changed, %3 deleted").arg(created).arg(changed).arg(deleted)
-+        );
-+        if (!images.isEmpty()) {
-+            sidebar->appendActivity(tr("Attached %n viewport render(s)", nullptr, images.size()));
 +        }
 +    }
 +
@@ -892,7 +900,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AgentBridge.h
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,105 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_AGENTBRIDGE_H
@@ -973,7 +981,6 @@
 +    QByteArray standardOutputBuffer;
 +    QString queuedPrompt;
 +    bool runtimeReady = false;
-+    bool assistantMessageStarted = false;
 +    bool stopping = false;
 +    bool createNewThread = false;
 +    bool draftDirty = false;
@@ -1242,12 +1249,13 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/ConversationModel.cpp
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,147 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "ConversationModel.h"
 +
 +#include <utility>
++#include <QDateTime>
 +
 +
 +using namespace AnthraciteGui;
@@ -1275,6 +1283,8 @@
 +            return message.body;
 +        case KindRole:
 +            return message.kind;
++        case EntriesRole:
++            return message.entries;
 +        default:
 +            return {};
 +    }
@@ -1286,6 +1296,7 @@
 +        {AuthorRole, "author"},
 +        {BodyRole, "body"},
 +        {KindRole, "kind"},
++        {EntriesRole, "entries"},
 +    };
 +}
 +
@@ -1303,22 +1314,55 @@
 +    messages.clear();
 +    assistantRow = -1;
 +    planRow = -1;
++    turnStart = -1;
++    reasoningRow = -1;
 +    endResetModel();
 +}
 +
-+void ConversationModel::beginTurn()
++void ConversationModel::beginTurn(qint64 timestamp)
 +{
 +    assistantRow = -1;
 +    planRow = -1;
++    assistantId.clear();
++    reasoningRow = -1;
++    turnStart = static_cast<int>(messages.size());
++    startedAt = timestamp > 0 ? timestamp : QDateTime::currentMSecsSinceEpoch();
 +}
 +
-+void ConversationModel::beginAssistantMessage()
++void ConversationModel::beginAssistantMessage(const QString& id)
 +{
-+    if (assistantRow >= 0) {
++    if (assistantRow >= 0 && id == assistantId) {
 +        return;
 +    }
++    assistantId = id;
 +    assistantRow = static_cast<int>(messages.size());
 +    append(QStringLiteral("Anthracite"), {}, QStringLiteral("assistant"));
++}
++
++void ConversationModel::completeTurn(qint64 timestamp, bool success)
++{
++    if (turnStart < 0) {
++        return;
++    }
++    const qint64 elapsed = qMax<qint64>(0,
++        ((timestamp > 0 ? timestamp : QDateTime::currentMSecsSinceEpoch()) - startedAt) / 1000);
++    QVariantList entries;
++    const QString answer = success && assistantRow >= turnStart ? messages[assistantRow].body : QString();
++    for (int row = turnStart; row < static_cast<int>(messages.size()); ++row) {
++        if (success && row == assistantRow) {
++            continue;
++        }
++        const auto& message = messages[row];
++        entries.append(QVariantMap {{"author", message.author}, {"body", message.body},
++                                    {"kind", message.kind}});
++    }
++    beginResetModel();
++    messages.resize(turnStart);
++    messages.push_back({tr("Worked for %1m %2s").arg(elapsed / 60).arg(elapsed % 60),
++                        answer, QStringLiteral("work"), entries});
++    turnStart = assistantRow = planRow = -1;
++    reasoningRow = -1;
++    endResetModel();
 +}
 +
 +void ConversationModel::appendAssistantDelta(const QString& delta)
@@ -1342,9 +1386,20 @@
 +    messages.at(static_cast<std::size_t>(planRow)).body = body;
 +    Q_EMIT dataChanged(index(planRow), index(planRow), {BodyRole});
 +}
++
++void ConversationModel::appendReasoningDelta(const QString& delta, const QString& id)
++{
++    if (reasoningRow < 0 || reasoningId != id) {
++        reasoningId = id;
++        reasoningRow = static_cast<int>(messages.size());
++        append(tr("Thinking"), {}, QStringLiteral("activity"));
++    }
++    messages[reasoningRow].body += delta;
++    Q_EMIT dataChanged(index(reasoningRow), index(reasoningRow), {BodyRole});
++}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/ConversationModel.h
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,61 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_CONVERSATIONMODEL_H
@@ -1366,7 +1421,8 @@
 +    {
 +        AuthorRole = Qt::UserRole + 1,
 +        BodyRole,
-+        KindRole
++        KindRole,
++        EntriesRole
 +    };
 +
 +    explicit ConversationModel(QObject* parent = nullptr);
@@ -1377,9 +1433,11 @@
 +
 +    void append(QString author, QString body, QString kind);
 +    void clear();
-+    void beginTurn();
-+    void beginAssistantMessage();
++    void beginTurn(qint64 timestamp = 0);
++    void beginAssistantMessage(const QString& id = {});
++    void completeTurn(qint64 timestamp = 0, bool success = true);
 +    void appendAssistantDelta(const QString& delta);
++    void appendReasoningDelta(const QString& delta, const QString& id);
 +    void upsertPlan(const QString& body);
 +
 +private:
@@ -1388,11 +1446,17 @@
 +        QString author;
 +        QString body;
 +        QString kind;
++        QVariantList entries;
 +    };
 +
 +    std::vector<Message> messages;
 +    int assistantRow = -1;
 +    int planRow = -1;
++    int turnStart = -1;
++    qint64 startedAt = 0;
++    QString assistantId;
++    QString reasoningId;
++    int reasoningRow = -1;
 +};
 +}  // namespace AnthraciteGui
 +
@@ -1408,7 +1472,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,551 @@
+@@ -0,0 +1,650 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
@@ -1419,6 +1483,34 @@
 +    id: root
 +
 +    padding: 0
++
++    Popup {
++        id: imagePreview
++        property url imageSource
++        parent: Overlay.overlay
++        anchors.centerIn: parent
++        width: parent.width * 0.95
++        height: parent.height * 0.9
++        modal: true
++        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
++        ScrollView {
++            anchors.fill: parent
++            clip: true
++            contentWidth: previewImage.width
++            contentHeight: previewImage.height
++            Image {
++                id: previewImage
++                source: imagePreview.imageSource
++                width: sourceSize.width
++                height: sourceSize.height
++            }
++        }
++        Button {
++            anchors.right: parent.right
++            text: "Close"
++            onClicked: imagePreview.close()
++        }
++    }
 +
 +    SystemPalette {
 +        id: systemPalette
@@ -1536,8 +1628,10 @@
 +            onCountChanged: positionViewAtEnd()
 +
 +            delegate: Item {
++                objectName: isWork ? "workSummary" : "timelineEntry"
 +                property bool activityExpanded: false
 +                property bool isActivity: kind === "activity"
++                property bool isWork: kind === "work"
 +
 +                width: timeline.width
 +                height: bubble.implicitHeight
@@ -1547,7 +1641,7 @@
 +                    width: parent.width
 +                    implicitHeight: messageColumn.implicitHeight + (isActivity ? 12 : 18)
 +                    radius: 8
-+                    color: kind === "user"
++                    color: isWork ? "transparent" : kind === "user"
 +                           ? Qt.rgba(0.30, 0.52, 0.95, 0.16)
 +                             : kind === "error"
 +                             ? Qt.rgba(0.90, 0.25, 0.25, 0.15)
@@ -1563,10 +1657,10 @@
 +                        anchors.right: parent.right
 +                        anchors.top: parent.top
 +                        anchors.margins: isActivity ? 6 : 9
-+                        spacing: 5
++                        spacing: isWork ? 12 : 5
 +
 +                        Label {
-+                            visible: !isActivity
++                            visible: !isActivity && !isWork
 +                            text: author
 +                            font.pixelSize: 11
 +                            font.weight: Font.DemiBold
@@ -1575,12 +1669,81 @@
 +                        }
 +
 +                        Label {
++                            visible: isWork
++                            text: author + (activityExpanded ? "  ⌄" : "  ›")
++                            color: systemPalette.windowText
 +                            width: parent.width
-+                            text: isActivity ? (activityExpanded ? "⌄  " : "›  ") + body : body
++                            padding: 4
++                            MouseArea {
++                                anchors.fill: parent
++                                cursorShape: Qt.PointingHandCursor
++                                onClicked: activityExpanded = !activityExpanded
++                            }
++                        }
++
++                        Repeater {
++                            model: isWork && activityExpanded ? entries : []
++                            delegate: Column {
++                                width: messageColumn.width
++                                spacing: 5
++                                Label {
++                                    width: parent.width
++                                    text: modelData.author
++                                    opacity: 0.65
++                                    color: systemPalette.windowText
++                                }
++                                Label {
++                                    visible: modelData.kind !== "image"
++                                    width: parent.width
++                                    text: visible ? modelData.body : ""
++                                    wrapMode: Text.Wrap
++                                    textFormat: Text.PlainText
++                                    color: systemPalette.windowText
++                                }
++                                Image {
++                                    objectName: "workImage"
++                                    visible: modelData.kind === "image"
++                                    width: parent.width
++                                    height: visible && sourceSize.width > 0 ? width * sourceSize.height / sourceSize.width : 0
++                                    source: visible ? modelData.body : ""
++                                    fillMode: Image.PreserveAspectFit
++                                    MouseArea {
++                                        anchors.fill: parent
++                                        onClicked: { imagePreview.imageSource = parent.source; imagePreview.open() }
++                                    }
++                                }
++                            }
++                        }
++
++                        Rectangle {
++                            visible: isWork
++                            width: parent.width
++                            height: 1
++                            color: systemPalette.windowText
++                            opacity: 0.18
++                        }
++
++                        Image {
++                            objectName: "chatImage"
++                            visible: kind === "image"
++                            width: parent.width
++                            height: visible && sourceSize.width > 0 ? width * sourceSize.height / sourceSize.width : 0
++                            source: visible ? body : ""
++                            fillMode: Image.PreserveAspectFit
++                            MouseArea {
++                                anchors.fill: parent
++                                onClicked: { imagePreview.imageSource = parent.source; imagePreview.open() }
++                            }
++                        }
++
++                        Label {
++                            visible: kind !== "image" && body.length > 0
++                            width: parent.width
++                            text: kind === "image" ? "" : isActivity ? (activityExpanded ? "⌄  " : "›  ") + body : body
 +                            wrapMode: Text.Wrap
 +                            maximumLineCount: isActivity && !activityExpanded ? 1 : 1000
 +                            elide: isActivity && !activityExpanded ? Text.ElideRight : Text.ElideNone
-+                            textFormat: Text.PlainText
++                            textFormat: kind === "assistant" || isWork ? Text.MarkdownText : Text.PlainText
 +                            color: systemPalette.windowText
 +                            opacity: isActivity ? 0.78 : 1.0
 +                        }
@@ -1962,7 +2125,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,709 @@
+@@ -0,0 +1,740 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "Sidebar.h"
@@ -1972,6 +2135,8 @@
 +#include <QDockWidget>
 +#include <QDir>
 +#include <QFileInfo>
++#include <QFile>
++#include <QQmlComponent>
 +#include <QQmlError>
 +#include <QQmlContext>
 +#include <QQuickWidget>
@@ -2304,14 +2469,29 @@
 +    conversation.beginTurn();
 +}
 +
-+void SidebarController::beginAssistantMessage()
++void SidebarController::restoreTurnStart(qint64 timestamp)
 +{
-+    conversation.beginAssistantMessage();
++    conversation.beginTurn(timestamp);
++}
++
++void SidebarController::appendImage(const QString& source, const QString& caption)
++{
++    conversation.append(caption, source, QStringLiteral("image"));
++}
++
++void SidebarController::beginAssistantMessage(const QString& id)
++{
++    conversation.beginAssistantMessage(id);
 +}
 +
 +void SidebarController::appendAssistantDelta(const QString& delta)
 +{
 +    conversation.appendAssistantDelta(delta);
++}
++
++void SidebarController::appendReasoningDelta(const QString& delta, const QString& id)
++{
++    conversation.appendReasoningDelta(delta, id);
 +}
 +
 +void SidebarController::updatePlan(const QString& explanation, const QVariantList& steps)
@@ -2387,17 +2567,19 @@
 +    }
 +}
 +
-+void SidebarController::completeTurn()
++void SidebarController::completeTurn(qint64 timestamp, bool success)
 +{
++    conversation.completeTurn(timestamp, success);
 +    clearInteraction();
 +    setBusy(false);
 +    setStatus(QStringLiteral("Ready"));
 +}
 +
-+void SidebarController::failTurn(const QString& error)
++void SidebarController::failTurn(const QString& error, qint64 timestamp)
 +{
 +    clearInteraction();
 +    conversation.append(QStringLiteral("Error"), error, QStringLiteral("error"));
++    conversation.completeTurn(timestamp, false);
 +    setBusy(false);
 +    setStatus(QStringLiteral("Error"));
 +}
@@ -2608,14 +2790,26 @@
 +        QStringLiteral("anthraciteController"),
 +        &sidebarController
 +    );
-+    replacement->setSource(source);
++    // RCC timestamps are fixed in reproducible builds. Compile this small
++    // surface from its actual bytes so Qt cannot reuse stale disk-cached QML.
++    const auto load = [replacement](const QUrl& url) {
++        QFile file(url.isLocalFile() ? url.toLocalFile() : QStringLiteral(":") + url.path());
++        if (!file.open(QIODevice::ReadOnly)) {
++            replacement->setSource(url);
++            return;
++        }
++        auto* component = new QQmlComponent(replacement->engine(), replacement);
++        component->setData(file.readAll(), url);
++        replacement->setContent(url, component, component->isReady() ? component->create() : nullptr);
++    };
++    load(source);
 +    if (replacement->status() != QQuickWidget::Ready) {
 +        for (const auto& error : replacement->errors()) {
 +            Base::Console().error("Anthracite QML: %s\n", error.toString().toUtf8().constData());
 +        }
 +        if (!quickView && source.isLocalFile()) {
 +            source = QUrl(QStringLiteral("qrc:/Anthracite/qml/Main.qml"));
-+            replacement->setSource(source);
++            load(source);
 +        }
 +        if (quickView || replacement->status() != QQuickWidget::Ready) {
 +            delete replacement;
@@ -2674,7 +2868,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,189 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_SIDEBAR_H
@@ -2768,8 +2962,11 @@
 +    void resetHistory();
 +    void showWelcome();
 +    void appendUserMessage(const QString& text);
-+    void beginAssistantMessage();
++    void beginAssistantMessage(const QString& id = {});
++    void appendImage(const QString& source, const QString& caption);
++    void restoreTurnStart(qint64 timestamp);
 +    void appendAssistantDelta(const QString& delta);
++    void appendReasoningDelta(const QString& delta, const QString& id);
 +    void updatePlan(const QString& explanation, const QVariantList& steps);
 +    void showApproval(
 +        const QString& requestId,
@@ -2779,8 +2976,8 @@
 +    );
 +    void showUserInput(const QString& requestId, const QVariantList& questions);
 +    void clearInteraction();
-+    void completeTurn();
-+    void failTurn(const QString& error);
++    void completeTurn(qint64 timestamp = 0, bool success = true);
++    void failTurn(const QString& error, qint64 timestamp = 0);
 +    void updateStatus(const QString& status);
 +    void updateThreads(const QString& currentThreadId, const QVariantList& threads);
 +    void loadDraft(const QString& body);

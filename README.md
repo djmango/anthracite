@@ -16,6 +16,9 @@ requests and observations.
 - a native, dockable QML sidebar alongside the 3D viewport
 - existing coding-agent installations instead of a new agent harness
 - streaming chat and CAD activity with approvals, requested input, plans and durable replay
+- completed runs show only the final answer beneath an expandable “Worked for Xm Ys”
+  summary; expand it for intermediate updates, tool calls/results, and the exact model-bound
+  images. Click an image to enlarge it. These observations persist with conversation history.
 - transactional, undoable changes with recompute, validation and structured diagnostics
 
 FreeCAD's normal selection, commands, properties, task panels and viewport remain first class.

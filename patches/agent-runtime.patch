@@ -2455,7 +2455,7 @@
 +tempfile = "3"
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/main.rs
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,220 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +mod process;
@@ -2540,6 +2540,7 @@
 +                    &payload.get("requestId").cloned().unwrap_or(Value::Null),
 +                    payload.get("result").and_then(Value::as_str).unwrap_or(""),
 +                )?;
++                provider.emitter().emit("tool.observation", payload.clone());
 +                provider.return_tool_result(
 +                    payload.get("requestId").cloned().unwrap_or(Value::Null),
 +                    payload.get("result").and_then(Value::as_str).unwrap_or(""),
@@ -3046,7 +3047,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/protocol.rs
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,233 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use serde_json::{Value, json};
@@ -3138,6 +3139,7 @@
 +            .map_err(|e| format!("FreeCAD was not executed: could not persist operation: {e}"))?;
 +        payload["operationId"] = json!(id);
 +        self.operations.borrow_mut().insert(key, payload.clone());
++        self.emit("tool.activity", payload.clone());
 +        emit_raw("tool.call", payload);
 +        Ok(())
 +    }
@@ -3175,7 +3177,9 @@
 +        })
 +    }
 +
-+    pub fn emit(&self, message_type: &str, payload: Value) {
++    pub fn emit(&self, message_type: &str, mut payload: Value) {
++        payload["timestampMs"] = json!(std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64);
 +        if let Err(error) = self.store.record(message_type, &payload) {
 +            emit_warning(format!("Could not persist runtime event: {error}"));
 +        }
@@ -3279,7 +3283,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/store.rs
-@@ -0,0 +1,1232 @@
+@@ -0,0 +1,1256 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use serde_json::{Value, json};
@@ -4104,18 +4108,21 @@
 +                let mut rows = self
 +                    .connection
 +                    .query(
-+                        "SELECT event_type, payload_json
++                        "SELECT event_type, payload_json, created_at_ms
 +                         FROM events
 +                         WHERE thread_id = ?1
 +                           AND event_type IN (
 +                               'content.user',
 +                               'content.delta',
 +                               'item.started',
++                               'item.completed',
++                               'tool.activity',
++                               'tool.observation',
++                               'turn.completed',
 +                               'plan.updated',
 +                               'runtime.warning'
 +                           )
-+                         ORDER BY id DESC
-+                         LIMIT 500",
++                         ORDER BY id DESC",
 +                        params![self.thread_id.clone()],
 +                    )
 +                    .await?;
@@ -4123,9 +4130,11 @@
 +                while let Some(row) = rows.next().await? {
 +                    let event_type = row.get::<String>(0)?;
 +                    let payload = row.get::<String>(1)?;
++                    let mut payload = serde_json::from_str::<Value>(&payload).unwrap_or(json!({}));
++                    payload["timestampMs"] = json!(row.get::<i64>(2)?);
 +                    events.push(json!({
 +                        "type": event_type,
-+                        "payload": serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null)
++                        "payload": payload
 +                    }));
 +                }
 +                Ok::<_, turso::Error>(events)
@@ -4147,6 +4156,25 @@
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
++
++    #[test]
++    fn replays_complete_work_with_images_and_timing_but_never_execution_requests() {
++        let directory = tempfile::tempdir().unwrap();
++        let store = open_test_store(&directory.path().join("history.db"));
++        store.record("content.user", &json!({"text": "Render"})).unwrap();
++        for _ in 0..510 {
++            store.record("content.delta", &json!({"messageId": "progress", "text": "."})).unwrap();
++        }
++        store.record("tool.call", &json!({"arguments": {"code": "do_not_replay()"}})).unwrap();
++        store.record("tool.observation", &json!({"images": ["data:image/png;base64,exact"]})).unwrap();
++        store.record("turn.completed", &json!({"status": "completed"})).unwrap();
++        let history = store.history().unwrap();
++        assert_eq!(history.len(), 513);
++        assert_eq!(history[0]["type"], "content.user");
++        assert_eq!(history[511]["payload"]["images"][0], "data:image/png;base64,exact");
++        assert_eq!(history[512]["type"], "turn.completed");
++        assert!(history.iter().all(|event| event["payload"]["timestampMs"].as_i64().unwrap() > 0));
++    }
 +
 +    fn open_test_store(path: &Path) -> Store {
 +        Store::open(

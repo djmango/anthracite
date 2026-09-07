@@ -30,6 +30,8 @@ def provider_fixture():
                     "cad.verify([{'object':'BridgeBox','metric':'size_mm','expected':[12,8,5],'tolerance':0.001}])\n"
                     "cad.render_views(width=640, height=480, labels=True, axes=True, dimensions=True, highlight_changed=True)"}}})
         elif request == 9001:
+            send({"method": "item/agentMessage/delta", "params": {
+                "itemId": "progress", "delta": "Intermediate update: checking the box."}})
             result = json.loads(message["result"]["contentItems"][0]["text"])
             assert result["ok"], result
             assert result['verification'][0]['status'] == 'pass', result
@@ -59,6 +61,8 @@ def provider_fixture():
         elif request == 9005:
             result = json.loads(message["result"]["contentItems"][0]["text"])
             assert result["ok"], result
+            send({"method": "item/agentMessage/delta", "params": {
+                "itemId": "final", "delta": "Created the editable box."}})
             send({"method": "turn/completed", "params": {
                 "turn": {"id": "smoke-turn", "status": "completed"}}})
 
@@ -86,15 +90,25 @@ try:
     preferences.SetString("CodexBinary", str(fixture))
     document = App.newDocument("AnthraciteBridgeSmoke")
     dock = Gui.getMainWindow().findChild(QtWidgets.QDockWidget, "AnthraciteSidebar")
+    dock.show()
     quick = dock.findChild(QtQuickWidgets.QQuickWidget)
     controller = quick.rootContext().contextProperty("anthraciteController")
     controller.selectProvider("codex")
     submitted = False
+    expanded = False
+    replay_phase = "live"
+    saved_thread = ""
+    saved_work = None
     journal = Path(os.environ["XDG_STATE_HOME"]) / "anthracite/anthracite.events.jsonl"
 
     def check_result():
-        global submitted
+        global submitted, expanded, replay_phase, saved_thread, saved_work
         try:
+            if replay_phase == "new":
+                if controller.property("currentThreadId") != saved_thread and controller.property("status") == "Ready":
+                    controller.selectThread(saved_thread)
+                    replay_phase = "replay"
+                return
             if not submitted:
                 if controller.property("status") == "Ready" and controller.property("currentThreadId"):
                     controller.submit("Run the deterministic native bridge test")
@@ -110,19 +124,75 @@ try:
                        if record["type"] == "tool.result"]
             if len(results) < 5:
                 return
+            model = controller.property("messages")
+            roles = {bytes(name).decode(): role for role, name in model.roleNames().items()}
+            rows = [{name: model.data(model.index(row, 0), role) for name, role in roles.items()}
+                    for row in range(model.rowCount())]
+            work = [row for row in rows if row['kind'] == 'work']
+            if not work:
+                return
+            assert len(work) == 1, rows
+            assert work[0]['body'] == 'Created the editable box.', work
+            assert work[0]['author'].startswith('Worked for ') and work[0]['author'].endswith('s'), work
+            entries = work[0]['entries']
+            assert any(entry['body'] == 'Intermediate update: checking the box.' for entry in entries)
+            assert any(entry['body'].startswith('freecad\n') for entry in entries)
+            images = [entry['body'] for entry in entries if entry['kind'] == 'image']
+            observations = [record['payload'] for record in map(json.loads, lines)
+                            if record['type'] == 'tool.observation']
+            assert len(images) == 4 and images == observations[0]['images']
+            def visual_items(item):
+                yield item
+                for child in item.childItems():
+                    yield from visual_items(child)
+            items = list(visual_items(quick.rootObject()))
+            summaries = [item for item in items if item.objectName() == 'workSummary']
+            if not summaries:
+                return
+            if not expanded:
+                assert not summaries[0].property('activityExpanded')
+                summaries[0].setProperty('activityExpanded', True)
+                expanded = True
+                return
+            rendered = [item for item in items if item.objectName() == 'workImage'
+                        and item.property('source').toString()]
+            assert len(rendered) == 4
+            assert [item.property('source').toString() for item in rendered] == images
+            assert all(item.property('height') > 0 for item in rendered)
+            if replay_phase == "live":
+                saved_thread = controller.property("currentThreadId")
+                saved_work = work[0]
+                replay_phase = "new"
+                expanded = False
+                controller.newThread()
+                return
+            assert work[0]['body'] == saved_work['body']
+            assert work[0]['entries'] == saved_work['entries']
             assert [result["status"] for result in results] == ["committed", "rolled_back", "committed", "committed", "committed"], results
             assert document.getObject("MustRollback") is None
             box = document.getObject("BridgeBox")
             assert box.Shape.isValid() and abs(box.Shape.Volume - 800) < 1e-6
             timer.stop()
             App.closeDocument(document.Name)
-            print("ANTHRACITE_BRIDGE_SMOKE_OK", flush=True)
-            QtWidgets.QApplication.instance().quit()
+            # Release the inspected QML delegates while PySide is still alive,
+            # not during macOS's late QApplication/Python teardown.
+            def finish():
+                Gui.runCommand("Anthracite_ReloadSidebar")
+                QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+                print("ANTHRACITE_BRIDGE_SMOKE_OK", flush=True)
+                QtWidgets.QApplication.instance().quit()
+            QtCore.QTimer.singleShot(0, finish)
         except BaseException:
             traceback.print_exc()
             os._exit(1)
 
     def timeout():
+        os.write(2, f"Bridge phase: {replay_phase}; status: {controller.property('status')}; expanded: {expanded}\n".encode())
+        model = controller.property("messages")
+        rows = [(model.data(model.index(row, 0), 259),
+                              str(model.data(model.index(row, 0), 257)))
+                             for row in range(model.rowCount())]
+        os.write(2, f"Chat rows: {rows}; QML: {quick.source().toString()}; visible: {dock.isVisible()}\n".encode())
         print("Native bridge smoke test timed out", file=sys.stderr, flush=True)
         os._exit(1)
 

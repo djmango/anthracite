@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
-@@ -0,0 +1,991 @@
+@@ -0,0 +1,992 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
@@ -509,7 +509,7 @@
 +                if let Some(delta) = params.get("delta").and_then(Value::as_str) {
 +                    self.emitter.emit(
 +                        "content.delta",
-+                        json!({"streamKind": "assistant_text", "text": delta}),
++                        json!({"streamKind": "assistant_text", "text": delta, "messageId": params["itemId"]}),
 +                    );
 +                }
 +            }
@@ -526,7 +526,8 @@
 +                            "itemId": item.get("id"),
 +                            "kind": kind,
 +                            "title": title,
-+                            "detail": detail
++                            "detail": detail,
++                            "output": item.get("aggregatedOutput").or_else(|| item.get("result"))
 +                        }),
 +                    );
 +                }
@@ -1056,7 +1057,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/opencode.rs
-@@ -0,0 +1,888 @@
+@@ -0,0 +1,892 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
@@ -1302,7 +1303,8 @@
 +                    } else {
 +                        "assistant_text"
 +                    },
-+                    "text": delta
++                    "text": delta,
++                    "messageId": part["messageID"]
 +                }),
 +            );
 +        }
@@ -1337,7 +1339,9 @@
 +                        "itemId": part.get("callID"),
 +                        "kind": "mcp_tool_call",
 +                        "title": part.get("tool").and_then(Value::as_str).unwrap_or("Tool"),
-+                        "detail": part.pointer("/state/title").or_else(|| part.pointer("/state/error"))
++                        "detail": part.pointer("/state/title").or_else(|| part.pointer("/state/error")),
++                        "output": part.pointer("/state/output"),
++                        "input": part.pointer("/state/input")
 +                    }),
 +                );
 +            }
@@ -1536,7 +1540,8 @@
 +                            } else {
 +                                "assistant_text"
 +                            },
-+                            "text": delta
++                            "text": delta,
++                            "messageId": properties["messageID"]
 +                        }),
 +                    );
 +                }
