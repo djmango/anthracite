@@ -1644,7 +1644,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,913 @@
+@@ -0,0 +1,940 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
@@ -1662,6 +1662,12 @@
 +        }
 +    }
 +    property string pendingThreadId: ""
++    function observeWheel(position) {
++        if (agentSettings.visible || imagePreview.visible) return
++        const point = timeline.mapFromItem(root, position.x, position.y)
++        if (point.x >= 0 && point.y >= 0 && point.x < timeline.width && point.y < timeline.height)
++            timeline.navigate()
++    }
 +    function refreshMotion() {
 +        reducedMotion = anthraciteController.reducedMotion()
 +    }
@@ -1837,9 +1843,20 @@
 +
 +            function remember() {
 +                if (settling || moving) return
-+                const row = indexAt(1, contentY + 2)
-+                const item = itemAtIndex(row)
++                // The top can fall in ListView spacing. Do not keep a stale
++                // anchor from another screen merely because indexAt misses it.
++                let item = itemAtIndex(indexAt(1, contentY + 2))
++                if (!item) {
++                    const children = contentItem.children
++                    for (let i = 0; i < children.length; ++i) {
++                        const candidate = children[i]
++                        if (candidate.rowId && candidate.y + candidate.height > contentY
++                            && candidate.y < contentY + height
++                            && (!item || candidate.y < item.y)) item = candidate
++                    }
++                }
 +                if (item) { anchorId = item.rowId; anchorOffset = item.y - contentY }
++                else anchorId = ""
 +            }
 +            function pauseAt(item) {
 +                latestMotion.stop()
@@ -1897,7 +1914,10 @@
 +                } else if (anchorId.length) {
 +                    const row = model.indexOfId(anchorId)
 +                    if (row >= 0) {
-+                        positionViewAtIndex(row, ListView.Visible)
++                        // Never scroll to instantiate an old reading anchor.
++                        // With variable-height delegates that changes ListView's
++                        // size estimate, schedules another correction, and can
++                        // oscillate between distant screens after a fast flick.
 +                        const item = itemAtIndex(row)
 +                        if (item) contentY = item.y - anchorOffset
 +                    }
@@ -1912,7 +1932,10 @@
 +                if (atYEnd) { newTurnId = ""; scrollMode = "following" }
 +                remember()
 +            }
-+            onContentHeightChanged: schedule()
++            // ListView estimates total height from the delegates currently in
++            // view. Scrolling changes that estimate even when no message changed.
++            // Feeding it back into reading-anchor restoration fights the gesture.
++            onContentHeightChanged: { if (scrollMode !== "reading") schedule() }
 +            onHeightChanged: schedule()
 +            onWidthChanged: schedule()
 +            onCountChanged: schedule()
@@ -1955,6 +1978,7 @@
 +                        timeline.scrollMode = "new-turn"
 +                    }
 +                }
++                function onDataChanged() { timeline.schedule() }
 +                function onModelReset() {
 +                    timeline.anchorId = ""
 +                    timeline.expandedRows = ({})
@@ -1987,6 +2011,9 @@
 +
 +            delegate: Item {
 +                id: timelineRow
++                // Actual message layout changes (wrapping, streamed text, or
++                // expansion) can need repair; estimated total height does not.
++                onHeightChanged: timeline.schedule()
 +                property string rowId: entryId || ""
 +                objectName: isWork ? "workSummary" : "timelineEntry"
 +                property bool activityExpanded: timeline.expandedRows[rowId] || false
@@ -2560,7 +2587,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,962 @@
+@@ -0,0 +1,978 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "Sidebar.h"
@@ -2582,6 +2609,7 @@
 +#include <QUuid>
 +#include <QKeyEvent>
 +#include <QMouseEvent>
++#include <QWheelEvent>
 +#include <QtConcurrent/QtConcurrentRun>
 +#include <QFutureWatcher>
 +#include <QTextDocument>
@@ -3429,6 +3457,20 @@
 +    }, Qt::QueuedConnection);
 +}
 +
++bool Sidebar::eventFilter(QObject* watched, QEvent* event)
++{
++    // Observe, never consume: mouse wheels can change Flickable.contentY
++    // without movementStarted. Qt Quick still owns the actual scrolling.
++    if (watched == quickView && event->type() == QEvent::Wheel) {
++        auto* root = quickView->rootObject();
++        if (root && root->metaObject()->indexOfMethod("observeWheel(QVariant)") >= 0) {
++            QMetaObject::invokeMethod(root, "observeWheel", Qt::DirectConnection,
++                Q_ARG(QVariant, QVariant(static_cast<QWheelEvent*>(event)->position())));
++        }
++    }
++    return QWidget::eventFilter(watched, event);
++}
++
 +void Sidebar::reloadUi()
 +{
 +    QString configRoot = qEnvironmentVariable("XDG_CONFIG_HOME");
@@ -3441,6 +3483,7 @@
 +        ? QUrl::fromLocalFile(overridePath)
 +        : QUrl(QStringLiteral("qrc:/Anthracite/qml/Main.qml"));
 +    auto* replacement = new QQuickWidget(this);
++    replacement->installEventFilter(this);
 +    replacement->setResizeMode(QQuickWidget::SizeRootObjectToView);
 +    replacement->engine()->addUrlInterceptor(new SidebarQmlUrls(replacement));
 +    replacement->rootContext()->setContextProperty(
@@ -3525,7 +3568,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,234 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_SIDEBAR_H
@@ -3745,6 +3788,9 @@
 +    SidebarController* controller();
 +    void reloadUi();
 +
++protected:
++    bool eventFilter(QObject* watched, QEvent* event) override;
++
 +private:
 +    SidebarController sidebarController;
 +    AgentBridge* agentBridge;
@@ -3759,7 +3805,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,768 @@
+@@ -0,0 +1,811 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -4051,6 +4097,7 @@
 +    timeline.setProperty('scrollMode', 'reading')
 +    timeline.setProperty('anchorId', '40')
 +    timeline.setProperty('anchorOffset', 0)
++    timeline.positionViewAtIndex(40, 0)  # Explicit navigation, not anchor repair.
 +    timeline.reconcile()
 +    QtTest.QTest.qWait(100)
 +    anchor = timeline.property('anchorId')
@@ -4125,6 +4172,7 @@
 +    timeline.setProperty('scrollMode', 'reading')
 +    timeline.setProperty('anchorId', anchor)
 +    timeline.setProperty('anchorOffset', offset)
++    timeline.positionViewAtIndex(model.indexOfId(anchor), 0)
 +    timeline.reconcile()
 +    QtTest.QTest.qWait(100)
 +    # Simulate the native wheel path, not a direct scroll-mode assignment.
@@ -4140,13 +4188,15 @@
 +        return value[0] if isinstance(value, tuple) else value
 +    before_wheel = anchor_position()
 +    QtWidgets.QApplication.sendEvent(quick_widget, wheel)
++    assert timeline.property('userScrolling'), 'Wheel input did not pause anchor correction'
 +    QtTest.QTest.qWait(200)
 +    after_wheel = anchor_position()
 +    assert after_wheel > before_wheel, ('Wheel did not scroll the transcript', before_wheel, after_wheel,
 +                                       timeline.property('scrollMode'), timeline.property('userScrolling'))
 +    apply_edit({'op': 'update', 'row': dict(rows[-1], kind='assistant', body='More streaming\n' * 25)})
 +    QtTest.QTest.qWait(100)
-+    assert abs(anchor_position() - after_wheel) < 3, 'Streaming snapped back after a wheel gesture'
++    assert abs(anchor_position() - after_wheel) < 3, ('Streaming snapped back after a wheel gesture', after_wheel, anchor_position(),
++        anchor, timeline.property('anchorId'), timeline.property('anchorOffset'), timeline.property('scrollMode'))
 +    anchor = timeline.property('anchorId')
 +    offset = timeline.property('anchorOffset')
 +    original_width = root.property('width')
@@ -4229,6 +4279,45 @@
 +    assert model.property('detailRequests')['work'] == 'loading', 'Stale page cleared a newer request'
 +    apply_edit(dict(details, offset=1))
 +    assert 'work' not in model.property('detailRequests')
++    # Mixed-height history reproduces the estimate/anchor feedback path hidden
++    # by a list of equally short messages. No provider or private chat data.
++    mixed = [dict(rows[0], id='mixed-' + str(i), kind='assistant' if i % 3 else 'user',
++                  body=('| Tool | Description |\n| --- | --- |\n' + '| inspect | Native geometry and topology |\n' * 35)
++                  if i % 7 == 0 else ('Long reply\n\n' * 20 if i % 4 == 0 else 'Short message'))
++             for i in range(100)]
++    apply_edit({'op': 'reset', 'rows': mixed})
++    QtTest.QTest.qWait(100)
++    timeline.setProperty('scrollMode', 'reading')
++    timeline.positionViewAtIndex(50, 0)
++    QtTest.QTest.qWait(200)
++    timeline.remember()
++    # An evicted anchor must never cause navigation to a different screen.
++    def timeline_value(source):
++        expression = QtQml.QQmlExpression(quick_widget.rootContext(), timeline, source)
++        value = expression.evaluate()
++        assert not expression.hasError(), expression.error().toString()
++        return value[0] if isinstance(value, tuple) else value
++    assert timeline_value('itemAtIndex(0) === null')
++    visible_before = timeline_value('itemAtIndex(50).y - contentY')
++    timeline.setProperty('anchorId', 'mixed-0')
++    timeline.reconcile()
++    assert abs(timeline_value('itemAtIndex(50).y - contentY') - visible_before) < 3, 'Stale anchor teleported the viewport'
++    center = timeline.mapToScene(QtCore.QPointF(timeline.width() / 2, timeline.height() / 2))
++    for direction in (-1, 1, -1, 1):
++        for _ in range(12):
++            wheel = QtGui.QWheelEvent(center, center, QtCore.QPoint(), QtCore.QPoint(0, direction * 480),
++                                     QtCore.Qt.NoButton, QtCore.Qt.NoModifier, QtCore.Qt.NoScrollPhase, False)
++            QtWidgets.QApplication.sendEvent(quick_widget, wheel)
++            QtTest.QTest.qWait(10)
++        QtTest.QTest.qWait(350)
++        timeline.remember()
++        stable_id = timeline.property('anchorId')
++        assert stable_id, 'Fast scrolling lost the visible anchor'
++        position = 'itemAtIndex(model.indexOfId(' + json.dumps(stable_id) + ')).y - contentY'
++        settled = timeline_value(position)
++        for _ in range(15):
++            QtTest.QTest.qWait(25)
++            assert abs(timeline_value(position) - settled) < 3, 'Transcript oscillated after fast scrolling'
 +    apply_edit({'op': 'reset', 'rows': original})
 +    Gui.runCommand("Anthracite_ReloadSidebar")
 +    quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
