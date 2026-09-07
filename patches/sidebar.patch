@@ -2863,7 +2863,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,198 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -2969,6 +2969,33 @@
 +        image = QtGui.QImage.fromData(base64.b64decode(data.split(",", 1)[1]))
 +        assert not image.isNull() and image.width() == 256 and image.height() == 192
 +    assert view.getCamera() == camera, "Rendering moved the user's camera"
++    annotated = AnthraciteExecutor.execute(
++        "cad.render(view='front', width=640, height=480, labels=True, axes=True, dimensions=True, highlight_changed=True)"
++    )
++    assert annotated['ok'], annotated
++    metadata = annotated['observation']['renders'][0]
++    assert 'RenderBox' in metadata['highlight']
++    assert metadata['annotations']['items'][0]['reference']['object'] == 'RenderBox'
++    assert metadata['annotations']['revision'] == annotated['revision']
++    assert view.getCamera() == camera
++    faces = AnthraciteExecutor.execute("cad.topology('RenderBox')")['result']['items']
++    reference = faces[0]['reference']
++    called_out = AnthraciteExecutor.execute(
++        f"cad.render(view='front', width=640, height=480, references=[{reference!r}])"
++    )
++    assert called_out['ok'], called_out
++    assert called_out['observation']['renders'][0]['annotations']['items'][0]['reference'] == reference
++    assert view.getCamera() == camera
++    render_document.openTransaction('User rename')
++    render_document.getObject('RenderBox').Label = 'User renamed box'
++    render_document.commitTransaction()
++    stale = AnthraciteExecutor.execute(
++        f"cad.render(view='front', width=640, height=480, references=[{reference!r}])"
++    )
++    assert not stale['ok'] and stale['rolledBack'], stale
++    assert 'nextActions' in stale
++    forgotten = AnthraciteExecutor.execute("cad.render(highlight_changed=True)")
++    assert not forgotten['ok'], forgotten
 +    render_view = AnthraciteExecutor._render_view
 +    def fail_second(spec):
 +        if spec["view"] == "front":

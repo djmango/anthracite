@@ -26,10 +26,14 @@ def provider_fixture():
             send({"id": request, "result": {"turn": {"id": "smoke-turn"}}})
             send({"id": 9001, "method": "item/tool/call", "params": {
                 "tool": "freecad", "arguments": {"code":
-                    "box = doc.addObject('Part::Box', 'BridgeBox')\nbox.Length = 12\nbox.Width = 8\nbox.Height = 5\ncad.render_views(width=256, height=192)"}}})
+                    "box = doc.addObject('Part::Box', 'BridgeBox')\nbox.Length = 12\nbox.Width = 8\nbox.Height = 5\n"
+                    "cad.verify([{'object':'BridgeBox','metric':'size_mm','expected':[12,8,5],'tolerance':0.001}])\n"
+                    "cad.render_views(width=640, height=480, labels=True, axes=True, dimensions=True, highlight_changed=True)"}}})
         elif request == 9001:
             result = json.loads(message["result"]["contentItems"][0]["text"])
             assert result["ok"], result
+            assert result['verification'][0]['status'] == 'pass', result
+            assert result['observation']['renders'][0]['annotations']['items'][0]['reference']['object'] == 'BridgeBox'
             images = message["result"]["contentItems"][1:]
             assert len(images) == 4, images
             assert all(image["type"] == "inputImage" and image["imageUrl"].startswith("data:image/png;base64,") for image in images)

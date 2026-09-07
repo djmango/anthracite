@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,1032 @@
+@@ -0,0 +1,1208 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -38,6 +38,8 @@
 +_MAX_RENDER_BYTES = 8_000_000
 +_revisions: dict[str, int] = {}
 +_executing_docs: set[str] = set()
++_last_changes = {}
++_recompute_writes = {}
 +
 +
 +def _bump_revision(doc: Any) -> None:
@@ -45,6 +47,7 @@
 +        return
 +    name = str(doc.Name)
 +    if name not in _executing_docs:
++        _last_changes.pop(name, None)
 +        _revisions[name] = _revisions.get(name, 0) + 1
 +        History.invalidate(doc)
 +
@@ -63,6 +66,8 @@
 +        _bump_object_revision(obj)
 +
 +    def slotChangedObject(self, obj, _property):
++        if obj.Document.Name in _recompute_writes:
++            _recompute_writes[obj.Document.Name].add((obj.Name, _property))
 +        _bump_object_revision(obj)
 +
 +    def slotChangedDocument(self, doc, _property):
@@ -75,6 +80,8 @@
 +        _bump_revision(doc)
 +
 +    def slotDeletedDocument(self, doc):
++        Inspect.forget(doc)
++        _last_changes.pop(str(doc.Name), None)
 +        _revisions.pop(str(doc.Name), None)
 +        History.forget(doc)
 +
@@ -391,6 +398,8 @@
 +    try:
 +        with _visual_scene(active_view, spec):
 +            active_view.saveImage(path, spec["width"], spec["height"], "Current")
++            if any(spec.get(key) for key in ("labels", "axes", "dimensions", "references")):
++                spec = {**spec, "annotations": _annotate_view(path, active_view, spec)}
 +        with open(path, "rb") as image_file:
 +            image = image_file.read(_MAX_RENDER_BYTES + 1)
 +    finally:
@@ -411,6 +420,78 @@
 +        "dataUrl": "data:image/png;base64,"
 +        + base64.b64encode(image).decode("ascii"),
 +    }
++
++
++def _annotate_view(path, view, spec):
++    """Pixel overlays only: no document objects, camera edits or persistent styling."""
++    from PySide6 import QtCore, QtGui
++    from pivy import coin
++    doc = App.ActiveDocument
++    revision = spec.get("revision", _revisions.get(doc.Name, 0))
++    width, height = spec["width"], spec["height"]
++    image = QtGui.QImage(path)
++    if image.isNull():
++        raise RuntimeError("Cannot annotate an empty viewport image.")
++    volume = view.getCameraNode().getViewVolume(width / height)
++    def project(point):
++        screen = volume.projectToScreen(coin.SbVec3f(point.x, point.y, point.z))
++        return QtCore.QPointF(float(screen[0]) * width, (1 - float(screen[1])) * height)
++    targets = []
++    candidates = [obj for obj in doc.Objects if hasattr(obj, "Shape") and not obj.Shape.isNull()
++                  and obj.ViewObject.Visibility and not obj.isDerivedFrom("PartDesign::Body")]
++    if spec.get("focus"):
++        candidates = [Inspect.resolve(doc, spec["focus"])]
++    if spec.get("labels"):
++        for obj in candidates[:12]:
++            # Projection uses the same global placement as native measurements.
++            shape = Inspect.native_shape(doc, obj, revision)
++            targets.append((obj.Name, shape.BoundBox.Center, {"document": doc.Name, "documentToken": Inspect.document_token(doc), "object": obj.Name, "revision": revision}))
++    for ref in spec.get("references", []):
++        shape = Inspect.native_shape(doc, ref, revision)
++        targets.append((f"{ref['object']}.{ref['subelement']}", shape.CenterOfMass, ref))
++    painter = QtGui.QPainter(image)
++    annotations = []
++    try:
++        painter.setFont(QtGui.QFont("Helvetica", 10))
++        for index, (label, center, reference) in enumerate(targets):
++            point = project(center)
++            visible = 0 <= point.x() < width and 0 <= point.y() < height
++            text = f"{index + 1}: {label}"
++            y = 18 + index * 19
++            painter.fillRect(4, y - 13, min(width - 8, len(text) * 8 + 12), 18, QtGui.QColor(255, 255, 255, 220))
++            painter.setPen(QtGui.QColor("#111111"))
++            painter.drawText(8, y, text)
++            if visible:
++                painter.setPen(QtGui.QColor("#e08000"))
++                painter.drawLine(QtCore.QPointF(min(width - 8, len(text) * 8 + 12), y - 4), point)
++                painter.drawEllipse(point, 3, 3)
++            annotations.append({"label": text, "reference": reference,
++                                "pixel": [point.x(), point.y()], "inFrame": visible,
++                                "occlusion": "not tested; label points at geometric center, not a selectable pixel"})
++        if spec.get("axes"):
++            rotation = view.getCameraOrientation().inverted()
++            origin = QtCore.QPointF(width - 50, height - 50)
++            for axis, vector, color in [("X", App.Vector(1, 0, 0), "#e44"), ("Y", App.Vector(0, 1, 0), "#2b2"), ("Z", App.Vector(0, 0, 1), "#48f")]:
++                direction = rotation.multVec(vector)
++                end = origin + QtCore.QPointF(direction.x * 30, -direction.y * 30)
++                painter.setPen(QtGui.QColor(color))
++                painter.drawLine(origin, end)
++                painter.drawText(end, axis)
++        if spec.get("dimensions"):
++            bounds = App.BoundBox()
++            for obj in candidates:
++                bounds.add(Inspect.native_shape(doc, obj, revision).BoundBox)
++            if candidates:
++                text = f"World-axis bounds (mm): X {bounds.XLength:.4g} × Y {bounds.YLength:.4g} × Z {bounds.ZLength:.4g}"
++                painter.fillRect(0, height - 22, width, 22, QtGui.QColor("white"))
++                painter.setPen(QtGui.QColor("black"))
++                painter.drawText(6, height - 6, text)
++    finally:
++        painter.end()
++    if not image.save(path, "PNG"):
++        raise RuntimeError("Could not save annotated viewport image.")
++    return {"items": annotations, "omittedObjects": max(0, len(candidates) - 12) if spec.get("labels") else 0,
++            "document": doc.Name, "revision": revision, "units": "mm"}
 +
 +
 +@contextlib.contextmanager
@@ -539,7 +620,7 @@
 +        active_view.setCamera(camera)
 +
 +
-+def _visual_options(focus, highlight, section):
++def _visual_options(focus, highlight, section, labels=False, axes=False, dimensions=False, highlight_changed=False, references=()):
 +    options = {}
 +    if focus is not None:
 +        if not isinstance(focus, str):
@@ -554,6 +635,10 @@
 +                or section[0] not in ("x", "y", "z") or not math.isfinite(float(section[1]))):
 +            raise ValueError("section must be (axis, offset_mm), e.g. ('z', 5); keeps the positive half-space.")
 +        options["section"] = [section[0], float(section[1])]
++    if not isinstance(references, (list, tuple)) or len(references) > 8 or not all(isinstance(ref, dict) for ref in references):
++        raise ValueError("references must contain at most eight revision-bound topology references.")
++    options.update({key: value for key, value in dict(labels=bool(labels), axes=bool(axes), dimensions=bool(dimensions),
++                   highlightChanged=bool(highlight_changed), references=list(references)).items() if value})
 +    return options
 +
 +
@@ -574,8 +659,15 @@
 +    def __init__(self, doc: Any):
 +        self.doc = doc
 +        self.events: list[dict[str, Any]] = []
++        self.check_requests = []
 +        self.render_request: dict[str, Any] | None = None
 +        self.render_views_request: list[dict[str, Any]] = []
++        self.reference_baseline = None
++
++    def _reference_revision(self):
++        if self.reference_baseline is not None and _document_snapshot(self.doc) != self.reference_baseline:
++            raise ValueError("Topology changed within this action; finish the action and inspect topology in a new call.")
++        return _revisions.get(self.doc.Name, 0)
 +
 +    def find(
 +        self,
@@ -612,6 +704,24 @@
 +
 +    def diagnostics(self, obj=None):
 +        return Inspect.diagnostics(self.doc, None if obj is None else [Inspect.resolve(self.doc, obj)])
++
++    def topology(self, obj, *, kind="faces", surface=None, offset=0, limit=25):
++        return Inspect.topology(self.doc, obj, self._reference_revision(),
++                                kind=kind, surface=surface, offset=offset, limit=limit)
++
++    def resolve_ref(self, reference):
++        return Inspect.native_shape(self.doc, reference, self._reference_revision())
++
++    def measure(self, obj, other=None):
++        if isinstance(obj, dict) or isinstance(other, dict):
++            self._reference_revision()
++        return Inspect.measure(self.doc, obj, _revisions.get(self.doc.Name, 0), other)
++
++    def verify(self, checks):
++        if self.doc.Name in _executing_docs:
++            self.check_requests.append(checks)
++            return {"scheduled": True, "note": "Checks run after final recompute; see verification in the result."}
++        return Inspect.verify(self.doc, checks, _revisions.get(self.doc.Name, 0))
 +
 +    def history(self):
 +        return History.describe(self.doc, _revisions.get(self.doc.Name, 0))
@@ -666,11 +776,12 @@
 +        focus=None,
 +        highlight=(),
 +        section=None,
++        labels=False, axes=False, dimensions=False, highlight_changed=False, references=(),
 +    ) -> dict[str, Any]:
 +        """Attach one bounded viewport render to this tool observation."""
 +
 +        self.render_request = _render_spec(width, height, view, fit)
-+        self.render_request.update(_visual_options(focus, highlight, section))
++        self.render_request.update(_visual_options(focus, highlight, section, labels, axes, dimensions, highlight_changed, references))
 +        self.render_views_request = []
 +        return {"scheduled": True, **self.render_request}
 +
@@ -685,6 +796,7 @@
 +        highlight=(),
 +        section=None,
 +        compare: bool = False,
++        labels=False, axes=False, dimensions=False, highlight_changed=False, references=(),
 +    ) -> dict[str, Any]:
 +        """Attach up to six ordered views of the final model; restore the user's camera.
 +
@@ -694,7 +806,7 @@
 +        if not isinstance(views, (list, tuple)) or not 1 <= len(views) <= 6:
 +            raise ValueError("views must be a list or tuple of one to six view names.")
 +        specs = [_render_spec(width, height, view, fit) for view in views]
-+        options = _visual_options(focus, highlight, section)
++        options = _visual_options(focus, highlight, section, labels, axes, dimensions, highlight_changed, references)
 +        for spec in specs:
 +            spec.update(options)
 +        if len({spec["view"] for spec in specs}) != len(specs):
@@ -726,7 +838,7 @@
 +    })
 +
 +
-+_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints"}
++_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify"}
 +_HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint"}
 +
 +
@@ -778,11 +890,21 @@
 +        getattr(doc, method)()
 +        immediate = _document_snapshot(doc)
 +        target = entry["before" if method == "undo" else "after"]
-+        if immediate != target:
++        immediate_equivalent, _ = History.equivalent(target, immediate)
++        if not immediate_equivalent:
 +            doc.recompute()
 +        after = _document_snapshot(doc)
 +        target = entry["before" if method == "undo" else "after"]
 +        equivalent, remapped = History.equivalent(target, after)
++        if not equivalent:
++            # Rebuild dependency geometry as well: an incremental Pad recompute
++            # may retain location chains on a reused sketch's native BRep.
++            for obj in doc.Objects:
++                if hasattr(obj, "Shape"):
++                    obj.touch()
++            doc.recompute(None, True)
++            after = _document_snapshot(doc)
++            equivalent, remapped = History.equivalent(target, after)
 +        if not equivalent:
 +            raise RuntimeError("Native history did not restore the recorded parameters and native geometry.")
 +        revision += 1
@@ -811,7 +933,7 @@
 +        _executing_docs.discard(doc.Name)
 +
 +
-+def execute(source: str, expected_revision: int | None = None) -> dict[str, Any]:
++def _execute_impl(source: str, expected_revision: int | None = None) -> dict[str, Any]:
 +    """Execute source once, returning a structured result suitable for an LLM."""
 +
 +    if not isinstance(source, str) or not source.strip():
@@ -900,6 +1022,7 @@
 +    stdout = io.StringIO()
 +    stderr = io.StringIO()
 +    cad = Cad(doc)
++    cad.reference_baseline = before
 +    namespace = {
 +        "__builtins__": __builtins__,
 +        "App": App,
@@ -938,11 +1061,33 @@
 +        if App.getDocument(document_name) is not doc:
 +            raise RuntimeError("The active document was closed during the tool call.")
 +
-+        doc.recompute()
++        # A lightweight parameter receipt does not need another serialized BRep.
++        authored = {obj.Name: {key: Inspect.value(getattr(obj, key)) for key in obj.PropertiesList
++                              if obj.getTypeIdOfProperty(key) != "Part::PropertyPartShape"}
++                    for obj in doc.Objects}
++        _recompute_writes[document_name] = set()
++        try:
++            doc.recompute()
++        finally:
++            recompute_writes = _recompute_writes.pop(document_name)
 +        cad.assert_valid()
 +        after = _document_snapshot(doc)
++        final_revision = revision + int(before != after)
++        touched = sorted(name for name in after if name not in before or before[name] != after[name])
++        specs = [cad.render_request] if cad.render_request is not None else cad.render_views_request
++        for spec in specs:
++            spec["revision"] = final_revision
++            if spec.get("highlightChanged") and not spec.get("highlight"):
++                names = touched if before != after else _last_changes.get(document_name, {}).get("names", [])
++                if before == after and _last_changes.get(document_name, {}).get("revision") != revision:
++                    names = []
++                spec["highlight"] = [name for name in names if doc.getObject(name) is not None
++                                     and hasattr(doc.getObject(name), "Shape") and not doc.getObject(name).Shape.isNull()]
++                if not spec["highlight"]:
++                    raise ValueError("No current changed geometry to highlight; make an edit or specify highlight explicitly.")
++        verification = [Inspect.verify(doc, checks, final_revision) for checks in cad.check_requests]
 +        rendered = _render_views(
-+            [cad.render_request] if cad.render_request is not None else cad.render_views_request
++            specs
 +        )
 +        if baseline_images:
 +            rendered = baseline_images + [{**image, "phase": "after"} for image in rendered]
@@ -999,8 +1144,20 @@
 +    _revisions[document_name] = revision
 +    _executing_docs.discard(document_name)
 +    if changed:
++        _last_changes[document_name] = {"revision": revision, "names": touched}
 +        History.record(doc, action_id, label, before, after, revision)
 +    observation = _observation(doc, before, after)
++    observation["editReceipt"] = {
++        "beforeFinalRecompute": {name: [key for key, value in item.items()
++                                         if before.get(name, {}).get("properties", {}).get(key, {}).get("value") != value]
++                                 for name, item in authored.items()
++                                 if any(before.get(name, {}).get("properties", {}).get(key, {}).get("value") != value for key, value in item.items())},
++        "geometryChangedByFinalRecompute": sorted({name for name, prop in recompute_writes if prop == "Shape"}),
++        "topologyChangedObjects": [name for name in after if after[name].get("properties", {}).get("Shape")
++                                   != before.get(name, {}).get("properties", {}).get("Shape")],
++        "referencePolicy": "All previously issued topology references expire when the document revision changes.",
++        "note": "Before-recompute writes include native side effects during Python execution; they are not asserted to be direct assignments.",
++    }
 +    images = []
 +    if rendered:
 +        observation["renders"] = [
@@ -1019,10 +1176,29 @@
 +        "result": _json_safe(namespace.get("_result")),
 +        "observation": observation,
 +        "events": cad.events,
++        "verification": verification,
 +        "images": images,
 +        "action": {"id": action_id, "label": label} if changed else None,
 +        "history": History.describe(doc, revision),
 +    }
++
++
++def execute(source: str, expected_revision: int | None = None) -> dict[str, Any]:
++    result = _execute_impl(source, expected_revision)
++    if not result.get("ok"):
++        error_type = result.get("error", {}).get("type")
++        if result.get("conflict") or "topology" in result.get("error", {}).get("message", "").lower():
++            actions = [{"code": "cad.tree()", "reason": "Refresh current object names and revision; then query cad.topology('Name') for new references. Never reuse guessed face/edge indices."}]
++        elif error_type in ("SyntaxError", "IndentationError"):
++            actions = [{"reason": "Correct the Python syntax; the rejected source was not executed."}]
++        elif error_type in ("AttributeError", "TypeError"):
++            actions = [{"code": "cad.api()", "reason": "Inspect installed native APIs and argument types before retrying."}]
++        else:
++            actions = [{"code": "cad.diagnostics()", "reason": "Inspect native status and dependencies; do not retry the same failing edit blindly."}]
++        if result.get("requiresInspection"):
++            actions.insert(0, {"code": "cad.history()", "reason": "Restoration or topology identity requires inspection. Check recovery state before another mutation."})
++        result["nextActions"] = actions
++    return result
 +
 +
 +def execute_json(source: str, expected_revision: int | None = None) -> str:
@@ -1035,7 +1211,7 @@
 +    )
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthracite.py
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,398 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import unittest
@@ -1053,6 +1229,82 @@
 +
 +
 +class ExecutorTest(unittest.TestCase):
++    def test_reference_cannot_cross_document_recreation(self):
++        self.run_code("doc.addObject('Part::Box', 'Box')")
++        ref = self.run_code("cad.topology('Box')")['result']['items'][0]['reference']
++        name = self.doc.Name
++        App.closeDocument(name)
++        self.doc = App.newDocument(name)
++        self.run_code("doc.addObject('Part::Box', 'Box')")
++        rejected = AnthraciteExecutor.execute(f"cad.measure({ref!r})")
++        self.assertFalse(rejected['ok'])
++        self.assertIn('Stale topology', rejected['error']['message'])
++
++    def test_native_measurements_and_revision_bound_topology(self):
++        self.run_code("doc.addObject('Part::Cylinder', 'Pin')\ndoc.getObject('Pin').Radius = 3\n"
++                      "doc.addObject('Part::Box', 'Other')\ndoc.getObject('Other').Placement.Base.x = 20")
++        faces = self.run_code("cad.topology('Pin', surface='Cylinder', limit=1)")['result']
++        self.assertEqual(faces['total'], 1)
++        self.assertAlmostEqual(faces['items'][0]['Radius'], 3)
++        ref = faces['items'][0]['reference']
++        self.assertTrue(self.run_code(f"cad.measure({ref!r})")['readOnly'])
++        distance = self.run_code("cad.measure('Pin', 'Other')")['result']
++        self.assertAlmostEqual(distance['distance_mm'], 17)
++        self.assertEqual(distance['overlapVolume_mm3'], 0)
++        self.run_code("doc.getObject('Pin').Radius = 4")
++        rejected = AnthraciteExecutor.execute(f"cad.measure({ref!r})")
++        self.assertFalse(rejected['ok'])
++        self.assertIn('nextActions', rejected)
++        current = self.run_code("cad.topology('Pin')")['result']['items'][0]['reference']
++        rejected = AnthraciteExecutor.execute(f"doc.getObject('Pin').Radius = 5\ndoc.recompute()\ncad.resolve_ref({current!r})")
++        self.assertFalse(rejected['ok'])
++        self.assertTrue(rejected['rolledBack'])
++
++    def test_topology_paging_and_edges(self):
++        self.run_code("doc.addObject('Part::Box', 'Box')")
++        result = self.run_code("cad.topology('Box', limit=2)")['result']
++        self.assertEqual(result['total'], 6)
++        self.assertEqual(result['nextOffset'], 2)
++        second = self.run_code("cad.topology('Box', offset=2, limit=2)")['result']
++        self.assertNotEqual(result['items'][0]['reference'], second['items'][0]['reference'])
++        edges = self.run_code("cad.topology('Box', kind='edges')")['result']
++        self.assertEqual(edges['total'], 12)
++
++    def test_declared_checks_fail_closed_and_measure_after_recompute(self):
++        self.run_code("doc.addObject('Part::Box', 'Box')")
++        self.assertEqual(self.run_code("cad.verify([])")['result']['status'], 'unverifiable')
++        unknown = self.run_code("cad.verify([{'object':'Box', 'metric':'imaginary', 'expected':3}])")
++        self.assertEqual(unknown['result']['status'], 'unverifiable')
++        edited = self.run_code("doc.getObject('Box').Length = 25\n"
++            "cad.verify([{'object':'Box','metric':'size_mm','expected':[25,10,10],'tolerance':0.001}])")
++        self.assertEqual(edited['verification'][0]['status'], 'pass')
++        failed = self.run_code("cad.verify([{'object':'Box','metric':'size_mm','expected':[10,10,10],'tolerance':0.001}])")
++        self.assertEqual(failed['result']['status'], 'fail')
++        self.assertTrue(failed['readOnly'])
++        self.assertIn('Box', edited['observation']['editReceipt']['beforeFinalRecompute'])
++        self.assertIn('Box', edited['observation']['editReceipt']['topologyChangedObjects'])
++
++    def test_edit_verify_undo_and_intervening_user_edit(self):
++        self.run_code(AnthraciteInspect.guide('partdesign')['code'])
++        edited = self.run_code("cad.action('Resize pad')\ndoc.getObject('BasePad').Length = 18\n"
++            "cad.verify([{'object':'BasePad','metric':'type','expected':'PartDesign::Pad'},"
++            "{'object':'BaseSketch','metric':'fullyConstrained','expected':True}])")
++        self.assertEqual(edited['verification'][0]['status'], 'pass')
++        undo = edited['history']['undo']
++        undone = self.run_code(f"cad.undo(action={undo['action']!r}, revision={undo['revision']})")
++        redo = undone['history']['redo']
++        redone = self.run_code(f"cad.redo(action={redo['action']!r}, revision={redo['revision']})")
++        self.assertEqual(self.doc.getObject('BasePad').Length.Value, 18)
++        undo = redone['history']['undo']
++        undone = self.run_code(f"cad.undo(action={undo['action']!r}, revision={undo['revision']})")
++        redo = undone['history']['redo']
++        self.doc.getObject('BasePad').Length = 19
++        self.doc.recompute()
++        blocked = AnthraciteExecutor.execute(f"cad.redo(action={redo['action']!r}, revision={redo['revision']})")
++        self.assertFalse(blocked['ok'])
++        self.assertIn('nextActions', blocked)
++        self.assertEqual(self.doc.getObject('BasePad').Length.Value, 19)
++
 +    def test_read_helpers_do_not_create_documents_or_change_undo_mode(self):
 +        self.doc.UndoMode = 0
 +        revision = AnthraciteExecutor._revisions.get(self.doc.Name, 0)
@@ -1545,10 +1797,161 @@
 +            "checkpoint": identity, "originalDocumentPreserved": True}
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteInspect.py
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,362 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Readable, bounded native CAD observations; never a replacement geometry API."""
 +import FreeCAD as App
++import math
++import re
++import uuid
++
++_reference_documents = {}
++
++
++def document_token(doc):
++    previous = _reference_documents.get(doc.Name)
++    if previous is None or previous[0] is not doc:
++        previous = (doc, str(uuid.uuid4()))
++        _reference_documents[doc.Name] = previous
++    return previous[1]
++
++
++def forget(doc):
++    _reference_documents.pop(doc.Name, None)
++
++
++def native_shape(doc, target, revision):
++    """Resolve an object or an explicitly revision-bound subelement. No fuzzy matching."""
++    subelement = None
++    if isinstance(target, dict):
++        if set(target) != {"document", "documentToken", "object", "subelement", "revision"}:
++            raise ValueError("Use the complete topology reference returned by cad.topology().")
++        if target["document"] != doc.Name or target["documentToken"] != document_token(doc) or target["revision"] != revision:
++            raise ValueError("Stale topology reference; inspect topology again at the current revision.")
++        subelement = target["subelement"]
++        if not isinstance(subelement, str) or not re.fullmatch(r"(Face|Edge)[1-9][0-9]*", subelement):
++            raise ValueError("Expected an explicit FaceN or EdgeN reference.")
++        target = target["object"]
++    obj = resolve(doc, target)
++    if not hasattr(obj, "Shape") or obj.Shape.isNull():
++        raise ValueError(f"{obj.Name} has no native shape.")
++    if "Touched" in obj.State:
++        raise ValueError("Geometry needs recompute before measurement.")
++    shape = obj.Shape.copy()
++    shape.Placement = obj.getGlobalPlacement().multiply(obj.Placement.inverse()).multiply(shape.Placement)
++    return shape.getElement(subelement) if subelement else shape
++
++
++def topology(doc, target, revision, *, kind="faces", surface=None, offset=0, limit=25):
++    if kind not in ("faces", "edges") or offset < 0 or not 1 <= limit <= 100:
++        raise ValueError("Use faces/edges, non-negative offset and limit 1..100.")
++    obj = resolve(doc, target)
++    shape = native_shape(doc, obj, revision)
++    entries = []
++    for index, part in enumerate(shape.Faces if kind == "faces" else shape.Edges, 1):
++        geometry = part.Surface if kind == "faces" else part.Curve
++        geometry_type = type(geometry).__name__
++        if surface is not None and geometry_type != surface:
++            continue
++        entries.append((index, part, geometry, geometry_type))
++    items = []
++    for index, part, geometry, geometry_type in entries[offset:offset + limit]:
++        ref = {"document": doc.Name, "documentToken": document_token(doc), "object": obj.Name,
++               "subelement": f"{'Face' if kind == 'faces' else 'Edge'}{index}", "revision": revision}
++        item = {"reference": ref, "geometryType": geometry_type,
++                "centerOfMass_mm": value(part.CenterOfMass),
++                "area_mm2" if kind == "faces" else "length_mm": part.Area if kind == "faces" else part.Length,
++                "tolerance_mm": part.getTolerance(1)}
++        for name in ("Radius", "MajorRadius", "MinorRadius", "Axis", "Center"):
++            if hasattr(geometry, name):
++                item[name] = value(getattr(geometry, name))
++        items.append(item)
++    return {"document": doc.Name, "revision": revision, "object": obj.Name,
++            "items": items, "total": len(entries),
++            "nextOffset": offset + limit if offset + limit < len(entries) else None,
++            "provenance": "FreeCAD/OCC native BRep; analytic surface/curve parameters where available; kernel-tolerance numerical integrals otherwise",
++            "units": {"length": "mm", "area": "mm^2"},
++            "referencePolicy": "Every reference expires on a document revision change. Multiple matches are candidates, not a selection."}
++
++
++def measure(doc, target, revision, other=None):
++    shape = native_shape(doc, target, revision)
++    result = {"document": doc.Name, "revision": revision,
++              "provenance": "FreeCAD/OCC BRep, not viewport tessellation",
++              "tolerance_mm": shape.getTolerance(1)}
++    if other is not None:
++        second = native_shape(doc, other, revision)
++        distance, points, _ = shape.distToShape(second)
++        result.update(distance_mm=distance, closestPoints_mm=[
++            [value(a), value(b)] for a, b in points[:10]], closestPointCount=len(points),
++            tolerance_mm=max(result["tolerance_mm"], second.getTolerance(1)))
++        if shape.Solids and second.Solids:
++            result["overlapVolume_mm3"] = shape.common(second).Volume
++        else:
++            result["overlapVolume_mm3"] = None
++        result["note"] = "Zero distance alone does not distinguish touching from overlap. Null overlap volume means this check is unavailable for non-solids."
++    else:
++        b = shape.BoundBox
++        result.update(valid=shape.isValid(), solids=len(shape.Solids), volume_mm3=shape.Volume,
++                      area_mm2=shape.Area, centerOfMass_mm=value(shape.CenterOfMass),
++                      size_mm=[b.XLength, b.YLength, b.ZLength])
++    return result
++
++
++def verify(doc, checks, revision):
++    """Evaluate only caller-declared claims. Unknown or unavailable evidence never passes."""
++    if not isinstance(checks, list) or len(checks) > 50:
++        raise ValueError("checks must be a list of at most 50 explicit claims.")
++    results = []
++    for check in checks:
++        claim = {"expected": check.get("expected") if isinstance(check, dict) else None,
++                 "measured": None, "status": "unverifiable"}
++        try:
++            if not isinstance(check, dict) or set(check) - {"object", "metric", "expected", "tolerance", "other"}:
++                raise ValueError("Claim fields: object, metric, expected, tolerance, optional other.")
++            claim.update(check)
++            metric = check["metric"]
++            expected = check["expected"]
++            if metric == "fullyConstrained":
++                obj = resolve(doc, check["object"])
++                if "Touched" in obj.State:
++                    raise ValueError("Sketch needs recompute before reading solver status.")
++                if not obj.isDerivedFrom("Sketcher::SketchObject"):
++                    raise ValueError("fullyConstrained requires a native sketch.")
++                measured = obj.DoF == 0 and not obj.ConflictingConstraints and not obj.RedundantConstraints
++                measured = bool(measured)
++            elif metric == "type":
++                measured = resolve(doc, check["object"]).TypeId
++            else:
++                measurements = measure(doc, check["object"], revision, check.get("other"))
++                if metric not in measurements or metric in {"document", "revision", "provenance", "note"}:
++                    raise ValueError("Unsupported measurement metric.")
++                measured = measurements[metric]
++                claim["provenance"] = measurements["provenance"]
++            claim["measured"] = measured
++            if measured is None:
++                raise ValueError("Measurement unavailable for this geometry.")
++            if isinstance(measured, (bool, str)):
++                if type(measured) is not type(expected):
++                    raise ValueError("Expected value has the wrong type.")
++                passed = measured == expected
++            else:
++                tolerance = check["tolerance"]
++                if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or not math.isfinite(tolerance) or tolerance < 0:
++                    raise ValueError("Declare a finite non-negative tolerance in the metric's units.")
++                actual = measured if isinstance(measured, list) else [measured]
++                wanted = expected if isinstance(expected, list) else [expected]
++                if len(actual) != len(wanted) or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in actual + wanted):
++                    raise ValueError("Expected finite numeric values matching measurement dimensions.")
++                passed = all(abs(a - b) <= tolerance for a, b in zip(actual, wanted))
++            claim["status"] = "pass" if passed else "fail"
++        except Exception as error:
++            claim["reason"] = str(error)
++        results.append(claim)
++    status = "fail" if any(c["status"] == "fail" for c in results) else (
++        "pass" if results and all(c["status"] == "pass" for c in results) else "unverifiable")
++    return {"document": doc.Name, "revision": revision, "status": status, "claims": results,
++            "scope": "Only the declared checks; not certification of overall design correctness."}
 +
 +
 +def value(item, depth=0):

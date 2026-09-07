@@ -112,6 +112,41 @@ use one such request as the final top-level statement, with literal arguments re
 to objects that exist before the edit.
 Camera and temporary render styling are restored afterward.
 
+Add `labels=True`, `axes=True`, and `dimensions=True` to viewport renders for
+object-name callouts, orientation, and world-axis bounding dimensions in mm.
+`highlight_changed=True` highlights geometry from the current edit or the last
+recorded edit at the same revision. User edits invalidate that remembered set.
+Labels carry native names and document revisions in `observation.renders`;
+their projected centers are not pixel-selection targets or proof of visibility.
+
+`cad.topology('Name', kind='faces', surface='Cylinder', offset=0, limit=25)`
+returns paged native geometry candidates (`kind='edges'` queries curves).
+Omit `surface` to see every geometry type. Each candidate has an explicit
+document/object/subelement/revision reference with a document-lifetime token.
+Pass the complete returned reference to
+`cad.resolve_ref(reference)` inside Python, `cad.measure(reference)`, or a render's
+`references=[reference]` for a callout. References expire on **any** document
+revision change; finish an edit and inspect again rather than guessing a new index.
+
+`cad.measure('Name')` reports native BRep size, volume, area and center of mass.
+`cad.measure('A', 'B')` reports minimum distance and, for solids, common volume.
+Results identify units, native provenance and shape tolerance. Zero distance
+alone does not prove overlap; unavailable non-solid overlap is reported as null.
+
+`cad.verify([{'object': 'BasePad', 'metric': 'size_mm',
+'expected': [20, 20, 18], 'tolerance': 0.01}])` checks caller-declared expectations.
+Numeric claims require an explicit tolerance in the metric's units. `type` and
+`fullyConstrained` check native feature identity and sketch constraints separately.
+Each result reports expected/measured values and pass/fail/unverifiable; an empty
+or unsupported claim never passes. Standalone checks are read-only. Checks within
+an edit run after final recompute and appear under `verification`; a failed design
+check does not automatically undo an otherwise valid edit. Inspect and use guarded
+undo when appropriate. `ok` means execution succeeded, not that all design checks passed.
+
+Edit receipts distinguish changes observed before the executor's final recompute
+from geometry changed by that recompute; they do not claim every early write was a
+direct Python assignment. Errors include `nextActions` for inspection/recovery.
+
 The model writes normal FreeCAD Python using `App`, `Gui`, workbench modules and a thin `cad`
 helper. Each call runs on the GUI thread inside a named transaction, recomputes and validates the
 document, then commits or rolls back and returns the result, CAD changes and diagnostics.
